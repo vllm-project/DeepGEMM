@@ -33,7 +33,10 @@ template <
     uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
+    bool kSitu,
     float kActivationClamp,
+    float kActivationBeta,
+    float kActivationLinearBeta,
     bool kFastMath,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -990,7 +993,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply gated activation.
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1004,18 +1007,33 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            // SwiGLU
-                            auto gate = __bfloat1622float2(bf16_gate);
+                            const auto raw_gate = __bfloat1622float2(bf16_gate);
                             auto neg_gate_exp = make_float2(
-                                kFastMath ? __expf(-gate.x) : expf(-gate.x),
-                                kFastMath ? __expf(-gate.y) : expf(-gate.y));
+                                kFastMath ? __expf(-raw_gate.x) : expf(-raw_gate.x),
+                                kFastMath ? __expf(-raw_gate.y) : expf(-raw_gate.y));
                             const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                            float2 sigmoid;
                             if constexpr (kFastMath) {
-                                gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                sigmoid = {math::fast_rcp(denom.x), math::fast_rcp(denom.y)};
                             } else {
-                                gate = {gate.x / denom.x, gate.y / denom.y};
+                                sigmoid = {1.0f / denom.x, 1.0f / denom.y};
                             }
-                            const auto up = __bfloat1622float2(bf16_up);
+                            auto up = __bfloat1622float2(bf16_up);
+                            float2 gate;
+                            if constexpr (kSitu) {
+                                const auto tanh_gate = make_float2(
+                                    kFastMath ? __tanhf(raw_gate.x / kActivationBeta) : tanhf(raw_gate.x / kActivationBeta),
+                                    kFastMath ? __tanhf(raw_gate.y / kActivationBeta) : tanhf(raw_gate.y / kActivationBeta));
+                                gate = __fmul2_rn(sigmoid, __fmul2_rn(tanh_gate, {kActivationBeta, kActivationBeta}));
+                                if constexpr (kActivationLinearBeta > 0.0f) {
+                                    const auto tanh_up = make_float2(
+                                        kFastMath ? __tanhf(up.x / kActivationLinearBeta) : tanhf(up.x / kActivationLinearBeta),
+                                        kFastMath ? __tanhf(up.y / kActivationLinearBeta) : tanhf(up.y / kActivationLinearBeta));
+                                    up = __fmul2_rn(tanh_up, {kActivationLinearBeta, kActivationLinearBeta});
+                                }
+                            } else {
+                                gate = __fmul2_rn(raw_gate, sigmoid);
+                            }
                             activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
                         }
 

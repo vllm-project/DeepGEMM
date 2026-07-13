@@ -23,7 +23,10 @@ public:
         int hidden, intermediate_hidden;
         int num_experts, num_topk;
         int num_ranks;
+        bool is_situ;
         float activation_clamp;
+        float activation_beta;
+        float activation_linear_beta;
         bool fast_math;
         MegaMoEConfig config;
 
@@ -69,8 +72,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {}, {},
-        {},
-        {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -86,7 +88,10 @@ static void __instantiate_kernel() {{
     args.config.num_bytes_per_pull,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
+    args.is_situ ? "true" : "false",
     to_string(args.activation_clamp),
+    to_string(args.activation_beta),
+    to_string(args.activation_linear_beta),
     args.fast_math ? "true" : "false");
     }
 
@@ -122,7 +127,10 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
+    const bool& is_situ,
     const float& activation_clamp,
+    const float& activation_beta,
+    const float& activation_linear_beta,
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -201,7 +209,10 @@ static void sm100_fp8_fp4_mega_moe(
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts, .num_topk = num_topk,
         .num_ranks = num_ranks,
+        .is_situ = is_situ,
         .activation_clamp = activation_clamp,
+        .activation_beta = activation_beta,
+        .activation_linear_beta = activation_linear_beta,
         .fast_math = fast_math,
         .config = config,
         .y = y.data_ptr(),
