@@ -82,16 +82,59 @@ static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     SM100PagedMQALogitsMetadataRuntime::launch(runtime, args);
 }
 
-// Unified contiguous-KV runtime for FP4/FP8; FP8 reuses the unused `sf_q` descriptor slot
+// Sizes `MQALogitsSharedStorage` for a runtime (is_mx_sf, qk_dtype, num_heads, head_dim)
+// BLOCK_Q = 128 / num_heads keeps UMMA_N = 128 for all supported head counts
+static int get_mqa_logits_smem_size(const int& num_heads, const int& head_dim,
+                                    const bool& is_mx_sf, const at::ScalarType& qk_dtype) {
+    const auto get_smem_size = [&]<typename qk_dtype_t>(auto is_mx_sf_c, auto h, auto d) {
+        constexpr bool kIsMXSF = decltype(is_mx_sf_c)::value;
+        constexpr int H = decltype(h)::value, D = decltype(d)::value;
+        constexpr int kNumKVStages = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t> ? 10 : 5;
+        return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<H, D, kIsMXSF, 128 / H, 256, 3, kNumKVStages, 3, qk_dtype_t>));
+    };
+    const auto dispatch_heads = [&](auto&& fn) {
+        switch (num_heads) {
+            case 8:  return fn(cute::C<8>{});
+            case 16: return fn(cute::C<16>{});
+            case 32: return fn(cute::C<32>{});
+            case 64: return fn(cute::C<64>{});
+            default: DG_HOST_UNREACHABLE("Unsupported num_heads for MQA logits");
+        }
+    };
+    const auto dispatch_head_dim = [&](auto&& fn) {
+        switch (head_dim) {
+            case 32:  return fn(cute::C<32>{});
+            case 64:  return fn(cute::C<64>{});
+            case 128: return fn(cute::C<128>{});
+            default:  DG_HOST_UNREACHABLE("Unsupported head_dim for MQA logits");
+        }
+    };
+    const auto compute_smem_size = [&](auto is_mx_sf_c) {
+        return dispatch_heads([&](auto h) {
+            return dispatch_head_dim([&](auto d) {
+                switch (qk_dtype) {
+                    case torch::kFloat8_e4m3fn: return get_smem_size.template operator()<cutlass::float_e4m3_t>(is_mx_sf_c, h, d);
+                    case kPackedFP4:            return get_smem_size.template operator()<cutlass::float_e2m1_t>(is_mx_sf_c, h, d);
+                    default: DG_HOST_UNREACHABLE("Unsupported MQA logits QK dtype");
+                }
+            });
+        });
+    };
+
+    const int smem_size = is_mx_sf ? compute_smem_size(cute::C<true>{}) : compute_smem_size(cute::C<false>{});
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    return smem_size;
+}
+
+// Unified contiguous-KV runtime for FP8 / MXFP4 / MXFP8; FP8 reuses the unused `sf_q` descriptor slot
 class SM100MQALogitsRuntime final: public LaunchRuntime<SM100MQALogitsRuntime> {
 public:
     struct Args {
-        bool is_fp4;
         int num_q_tokens;
         int num_kv_tokens;
         int stride_logits;
         int num_heads, head_dim;
-        bool is_compressed_logits;
+        bool is_mx_sf, is_compressed_logits;
 
         int num_q_stages;
         int num_kv_stages;
@@ -107,6 +150,7 @@ public:
         CUtensorMap tensor_map_kv;
         CUtensorMap tensor_map_sf_kv;
         CUtensorMap tensor_map_weights;
+        at::ScalarType qk_dtype;
         at::ScalarType logits_dtype;
         at::ScalarType weights_dtype;
 
@@ -126,23 +170,24 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_mqa_logits<
-        {},
         {}, {},
         {},
         {}, {},
         {}, {},
         {},
+        {}, {},
         {}, {},
         {}, {}
     >);
 }};
-)", args.is_fp4 ? "true" : "false",
-    args.num_heads, args.head_dim,
+)", args.num_heads, args.head_dim,
+    args.is_mx_sf ? "true" : "false",
     args.is_compressed_logits,
     args.block_q, args.split_kv,
     args.num_q_stages, args.num_kv_stages,
     args.launch_args.grid_dim.first,
     args.num_specialized_threads, args.num_math_threads,
+    args.qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
     to_string(args.logits_dtype),
     args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
     }
@@ -160,8 +205,7 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm100_mqa_logits(const bool& is_fp4,
-                             const torch::Tensor& q, const std::optional<torch::Tensor>& sf_q,
+static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::Tensor>& sf_q,
                              const torch::Tensor& kv, const torch::Tensor& sf_kv,
                              const torch::Tensor& weights,
                              const torch::Tensor& cu_seq_len_k_start,
@@ -171,92 +215,57 @@ static void sm100_mqa_logits(const bool& is_fp4,
                              const int& num_q_tokens, const int& num_kv_tokens,
                              const int& max_seqlen_k, const int& stride_logits,
                              const int& num_heads, const int& head_dim,
-                             const int& block_q, const int& split_kv) {
+                             const int& block_q, const int& split_kv,
+                             const bool& is_mx_sf,
+                             const at::ScalarType& qk_dtype) {
+    const bool is_fp4 = qk_dtype == kPackedFP4;
+
     constexpr int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
     const int num_q_stages = 3;
-    // Use the deepest KV pipeline that fits with headroom: FP4 10 stages, FP8 5
+    // Use the deepest KV pipeline that fits with headroom.
     const int num_kv_stages = is_fp4 ? 10 : 5;
 
     const bool is_compressed_logits = (max_seqlen_k > 0);
 
-    // FP4 consumes `sf_q`; FP8 fills that descriptor slot with KV scales
+    // MX SF formats consume `sf_q`; FP8 fills that descriptor slot with KV scales
     CUtensorMap tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv;
-    if (is_fp4) {
+    if (is_fp4)
         DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
-        tensor_map_q = make_tma_2d_desc(q, head_dim, num_q_tokens * num_heads,
-                                        head_dim, block_q * num_heads,
-                                        static_cast<int>(q.stride(1)),
-                                        head_dim / 2, 0, false, false);
+    else
+        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
+
+    const int swizzle_mode = is_fp4 ? head_dim / 2 : head_dim;
+    tensor_map_q = make_tma_2d_desc(q, head_dim, num_q_tokens * num_heads,
+                                    head_dim, block_q * num_heads,
+                                    static_cast<int>(q.stride(1)),
+                                    swizzle_mode, 0, false, not is_fp4);
+    tensor_map_kv = make_tma_2d_desc(kv, head_dim, num_kv_tokens,
+                                     head_dim, split_kv,
+                                     static_cast<int>(kv.stride(0)),
+                                     swizzle_mode, 0, false, not is_fp4);
+    tensor_map_sf_kv = make_tma_2d_desc(sf_kv,
+                                        get_tma_aligned_size(num_kv_tokens, static_cast<int>(sf_kv.element_size())), 1,
+                                        split_kv, 1, 0, 0);
+    if (is_mx_sf) {
         tensor_map_sf_q = make_tma_2d_desc(sf_q.value(), num_heads, num_q_tokens,
                                            num_heads, block_q,
                                            static_cast<int>(sf_q.value().stride(0)), 0);
-        tensor_map_kv = make_tma_2d_desc(kv, head_dim, num_kv_tokens,
-                                         head_dim, split_kv,
-                                         static_cast<int>(kv.stride(0)),
-                                         head_dim / 2, 0, false, false);
-        tensor_map_sf_kv = make_tma_2d_desc(sf_kv,
-                                            get_tma_aligned_size(num_kv_tokens, static_cast<int>(sf_kv.element_size())), 1,
-                                            split_kv, 1, 0, 0);
     } else {
-        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
-        tensor_map_q = make_tma_2d_desc(q, head_dim, num_q_tokens * num_heads,
-                                        head_dim, block_q * num_heads, head_dim, head_dim);
-        tensor_map_kv = make_tma_2d_desc(kv, head_dim, num_kv_tokens,
-                                         head_dim, split_kv, head_dim, head_dim);
-        tensor_map_sf_kv = make_tma_2d_desc(sf_kv,
-                                            get_tma_aligned_size(num_kv_tokens, static_cast<int>(sf_kv.element_size())),
-                                            1, split_kv, 1, 0, 0);
         tensor_map_sf_q = tensor_map_sf_kv;  // unused by FP8
     }
     const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, num_q_tokens,
                                                      num_heads, block_q,
                                                      static_cast<int>(weights.stride(0)), 0);
 
-    // BLOCK_Q = 128 / num_heads keeps UMMA_N = 128 for all supported head counts
-    const auto get_fp4_smem_size = [&](auto h, auto d) {
-        constexpr int H = decltype(h)::value, D = decltype(d)::value;
-        return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<true, H, D, 128 / H, 256, 3, 10, 3>));
-    };
-    const auto get_fp8_smem_size = [&](auto h, auto d) {
-        constexpr int H = decltype(h)::value, D = decltype(d)::value;
-        return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<false, H, D, 128 / H, 256, 3, 5, 3>));
-    };
-    const auto dispatch_heads = [&](auto&& fn) {
-        switch (num_heads) {
-            case 8:  return fn(cute::C<8>{});
-            case 16: return fn(cute::C<16>{});
-            case 32: return fn(cute::C<32>{});
-            case 64: return fn(cute::C<64>{});
-            default: DG_HOST_UNREACHABLE("Unsupported num_heads for MQA logits");
-        }
-    };
-
-    int smem_size;
-    if (is_fp4) {
-        DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
-        smem_size = dispatch_heads([&](auto h) {
-            return head_dim == 64 ? get_fp4_smem_size(h, cute::C<64>{}) : get_fp4_smem_size(h, cute::C<128>{});
-        });
-    } else {
-        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
-        smem_size = dispatch_heads([&](auto h) {
-            switch (head_dim) {
-                case 32:  return get_fp8_smem_size(h, cute::C<32>{});
-                case 64:  return get_fp8_smem_size(h, cute::C<64>{});
-                case 128: return get_fp8_smem_size(h, cute::C<128>{});
-                default:  DG_HOST_UNREACHABLE("Unsupported head_dim for FP8 MQA logits");
-            }
-        });
-    }
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    const int smem_size = get_mqa_logits_smem_size(num_heads, head_dim, is_mx_sf, qk_dtype);
 
     const SM100MQALogitsRuntime::Args args = {
-        .is_fp4 = is_fp4,
         .num_q_tokens = num_q_tokens,
         .num_kv_tokens = num_kv_tokens,
         .stride_logits = stride_logits,
         .num_heads = num_heads, .head_dim = head_dim,
+        .is_mx_sf = is_mx_sf,
         .is_compressed_logits = is_compressed_logits,
         .num_q_stages = num_q_stages,
         .num_kv_stages = num_kv_stages,
@@ -270,6 +279,7 @@ static void sm100_mqa_logits(const bool& is_fp4,
         .tensor_map_kv = tensor_map_kv,
         .tensor_map_sf_kv = tensor_map_sf_kv,
         .tensor_map_weights = tensor_map_weights,
+        .qk_dtype = qk_dtype,
         .logits_dtype = logits_dtype,
         .weights_dtype = weights.scalar_type(),
         .num_specialized_threads = num_specialized_threads,
@@ -285,16 +295,16 @@ static void sm100_mqa_logits(const bool& is_fp4,
 
 // Paged variant: separate host/runtime path, shared device core
 
-// Unified paged runtime for FP4/FP8; FP8 reuses the unused `sf_q` descriptor slot
+// Unified paged runtime for FP8 / MXFP4 / MXFP8; FP8 reuses the unused `sf_q` descriptor slot
 class SM100PagedMQALogitsRuntime final: public LaunchRuntime<SM100PagedMQALogitsRuntime> {
 public:
     struct Args {
-        bool is_fp4;
         int num_q_tokens_total;
         int tokens_per_request;
         int num_heads;
         int head_dim;
         int page_kv;
+        bool is_mx_sf;
         bool is_context_lens_2d;
         bool is_varlen;
         int block_table_stride;
@@ -316,6 +326,7 @@ public:
         CUtensorMap tensor_map_kv;
         CUtensorMap tensor_map_sf_kv;
         CUtensorMap tensor_map_weights;
+        at::ScalarType qk_dtype;
         at::ScalarType logits_dtype;
         at::ScalarType weights_dtype;
 
@@ -333,23 +344,23 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<
-        {},
+        {}, {},
+        {}, {},
+        {}, {}, {},
         {}, {},
         {}, {},
         {}, {},
-        {}, {},
-        {}, {},
-        {}, {},
-        {}, {}
+        {}, {}, {}
     >);
 }};
-)", args.is_fp4 ? "true" : "false",
-    args.tokens_per_request, args.num_heads,
+)", args.tokens_per_request, args.num_heads,
     args.head_dim, args.page_kv,
+    args.is_mx_sf ? "true" : "false",
     args.is_context_lens_2d, args.is_varlen ? "true" : "false",
     args.num_q_stages, args.num_kv_stages,
     args.split_kv, args.splits_per_chunk,
     args.num_specialized_threads, args.num_math_threads,
+    args.qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
     to_string(args.logits_dtype),
     args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
     }
@@ -367,8 +378,7 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm100_paged_mqa_logits(const bool& is_fp4,
-                                   const torch::Tensor& q,
+static void sm100_paged_mqa_logits(const torch::Tensor& q,
                                    const std::optional<torch::Tensor>& sf_q,
                                    const torch::Tensor& kv_cache,
                                    const torch::Tensor& kv_cache_sf,
@@ -389,100 +399,62 @@ static void sm100_paged_mqa_logits(const bool& is_fp4,
                                    const int& block_table_stride,
                                    const int& num_sms,
                                    const int& split_kv,
-                                   const int& splits_per_chunk) {
+                                   const int& splits_per_chunk,
+                                   const bool& is_mx_sf,
+                                   const at::ScalarType& qk_dtype) {
+    const bool is_fp4 = qk_dtype == kPackedFP4;
+
     const int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
     DG_HOST_ASSERT(split_kv == 256 and logits_stride % split_kv == 0);
 
     const int num_q_stages = 3;
-    // Match contiguous-KV pipeline depth: FP4 10 stages, FP8 5
+    // Match contiguous-KV pipeline depth.
     const int num_kv_stages = is_fp4 ? 10 : 5;
     // BLOCK_Q = 128 / num_heads; a Q-block holds up to BLOCK_Q request tokens
     DG_HOST_ASSERT(128 % num_heads == 0);
     const int block_q = 128 / num_heads;
 
-    // FP4 consumes `sf_q`; FP8 fills that descriptor slot with KV scales
+    // MX SF formats consume `sf_q`; FP8 fills that descriptor slot with KV scales
     CUtensorMap tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv;
-    if (is_fp4) {
+    if (is_fp4)
         DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
-        tensor_map_q = make_tma_2d_desc(q, head_dim, num_requests * tokens_per_request * num_heads,
-                                        head_dim, block_q * num_heads,
-                                        static_cast<int>(q.stride(2)),
-                                        head_dim / 2, 0, false, false);
+    else
+        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
+
+    const int swizzle_mode = is_fp4 ? head_dim / 2 : head_dim;
+    tensor_map_q = make_tma_2d_desc(q, head_dim, num_requests * tokens_per_request * num_heads,
+                                    head_dim, block_q * num_heads,
+                                    static_cast<int>(q.stride(2)),
+                                    swizzle_mode, 0, false, not is_fp4);
+    tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, page_kv, num_kv_blocks,
+                                     head_dim, page_kv, 1,
+                                     static_cast<int>(kv_cache.stride(1)),
+                                     static_cast<int>(kv_cache.stride(0)),
+                                     swizzle_mode, 0, false, not is_fp4);
+    tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf, page_kv, num_kv_blocks,
+                                        page_kv, 1,
+                                        static_cast<int>(kv_cache_sf.stride(0)), 0);
+    if (is_mx_sf) {
         tensor_map_sf_q = make_tma_2d_desc(sf_q.value(), num_heads, num_requests * tokens_per_request,
                                            num_heads, block_q,
                                            static_cast<int>(sf_q.value().stride(1)), 0);
-        tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, page_kv, num_kv_blocks,
-                                         head_dim, page_kv, 1,
-                                         static_cast<int>(kv_cache.stride(1)),
-                                         static_cast<int>(kv_cache.stride(0)),
-                                         head_dim / 2, 0, false, false);
-        tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf, page_kv, num_kv_blocks,
-                                            page_kv, 1,
-                                            static_cast<int>(kv_cache_sf.stride(0)), 0);
     } else {
-        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
-        tensor_map_q = make_tma_2d_desc(q, head_dim, num_requests * tokens_per_request * num_heads,
-                                        head_dim, block_q * num_heads,
-                                        static_cast<int>(q.stride(2)),
-                                        head_dim);
-        tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, page_kv, num_kv_blocks,
-                                         head_dim, page_kv, 1,
-                                         static_cast<int>(kv_cache.stride(1)),
-                                         static_cast<int>(kv_cache.stride(0)),
-                                         head_dim);
-        tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf, page_kv, num_kv_blocks,
-                                            page_kv, 1,
-                                            static_cast<int>(kv_cache_sf.stride(0)), 0);
         tensor_map_sf_q = tensor_map_sf_kv;  // unused by FP8
     }
     const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, num_requests * tokens_per_request,
                                                      num_heads, block_q,
                                                      static_cast<int>(weights.stride(0)), 0);
 
-    int smem_size;
-    // Shared storage is sized per (H, D) via compile-time dispatch
-    const auto dispatch_heads = [&](auto&& fn) {
-        switch (num_heads) {
-            case 8:  return fn(cute::C<8>{});
-            case 16: return fn(cute::C<16>{});
-            case 32: return fn(cute::C<32>{});
-            case 64: return fn(cute::C<64>{});
-            default: DG_HOST_UNREACHABLE("Unsupported num_heads for paged MQA logits");
-        }
-    };
-
-    if (is_fp4) {
-        DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
-        smem_size = dispatch_heads([&](auto h) {
-            constexpr int H = decltype(h)::value;
-            const auto get_smem_size = [&](auto d) {
-                constexpr int D = decltype(d)::value;
-                return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<true, H, D, 128 / H, 256, 3, 10, 3>));
-            };
-            return head_dim == 64 ? get_smem_size(cute::C<64>{}) : get_smem_size(cute::C<128>{});
-        });
-    } else {
-        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
-        smem_size = dispatch_heads([&](auto h) {
-            constexpr int H = decltype(h)::value;
-            switch (head_dim) {
-                case 32:  return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<false, H, 32, 128 / H, 256, 3, 5, 3>));
-                case 64:  return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<false, H, 64, 128 / H, 256, 3, 5, 3>));
-                case 128: return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<false, H, 128, 128 / H, 256, 3, 5, 3>));
-                default:  DG_HOST_UNREACHABLE("Unsupported head_dim for FP8 paged MQA logits");
-            }
-        });
-    }
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    const int smem_size = get_mqa_logits_smem_size(num_heads, head_dim, is_mx_sf, qk_dtype);
 
     const SM100PagedMQALogitsRuntime::Args args = {
-        .is_fp4 = is_fp4,
         .num_q_tokens_total = num_q_tokens_total,
         .tokens_per_request = tokens_per_request,
         .num_heads = num_heads,
         .head_dim = head_dim,
         .page_kv = page_kv,
+        .is_mx_sf = is_mx_sf,
         .is_context_lens_2d = is_context_lens_2d,
         .is_varlen = is_varlen,
         .block_table_stride = block_table_stride,
@@ -501,6 +473,7 @@ static void sm100_paged_mqa_logits(const bool& is_fp4,
         .tensor_map_kv = tensor_map_kv,
         .tensor_map_sf_kv = tensor_map_sf_kv,
         .tensor_map_weights = tensor_map_weights,
+        .qk_dtype = qk_dtype,
         .logits_dtype = logits_dtype,
         .weights_dtype = weights.scalar_type(),
         .num_specialized_threads = num_specialized_threads,

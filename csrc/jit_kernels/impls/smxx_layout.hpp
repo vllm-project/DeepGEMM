@@ -293,7 +293,7 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
     constexpr int block_mn = 128;
     constexpr int block_packed_sf_k = 16;
     constexpr int num_threads = 512;
-    const PackFP32IntoUE8M0Runtime::Args& args = {
+    const PackFP32IntoUE8M0Runtime::Args args = {
         .num_groups = num_groups,
         .mn = mn,
         .sf_k = sf_k,

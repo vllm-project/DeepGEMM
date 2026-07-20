@@ -107,7 +107,8 @@ static void sm90_fp8_mqa_logits(const torch::Tensor& q,
                                                        get_tma_aligned_size(seq_len_kv, static_cast<int>(kv_scales.element_size())),
                                                        1, block_kv, 1, 0, 0);
     const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, seq_len,
-                                                     num_heads, block_q, num_heads, 0);
+                                                     num_heads, block_q,
+                                                     static_cast<int>(weights.stride(0)), 0);
 
     int smem_size = 0;
     const int smem_q_size_per_stage = block_q * num_heads * head_dim * static_cast<int>(q.element_size());

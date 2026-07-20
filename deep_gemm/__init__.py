@@ -70,6 +70,8 @@ try:
         tf32_hc_prenorm_gemm,
         # Layout kernels
         transform_sf_into_required_layout,
+        # MegaMoE
+        get_block_m_for_mega_moe,
     )
 
     # Some alias for legacy supports

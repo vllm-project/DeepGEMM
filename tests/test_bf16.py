@@ -7,6 +7,9 @@ from deep_gemm.testing import (
     bench_kineto,
     calc_diff, count_bytes
 )
+from utils import (
+    assert_psum_zero_padding,
+)
 from generators import (
     get_arch_major, layout_masked_to_psum, align,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
@@ -15,16 +18,6 @@ from generators import (
     generate_k_grouped_contiguous_psum,
     get_mk_alignment_for_contiguous_layout
 )
-
-
-def check_bf16_psum_zero_padding(a: torch.Tensor, d: torch.Tensor, grouped_layout: torch.Tensor) -> None:
-    for group_idx, current_m in enumerate(grouped_layout.cpu().tolist()):
-        aligned_m = align(current_m, get_mk_alignment_for_contiguous_layout())
-        if current_m < aligned_m:
-            a_padding = a[current_m: aligned_m]
-            d_padding = d[current_m: aligned_m]
-            assert torch.equal(a_padding, torch.zeros_like(a_padding)), f'{group_idx=}, nonzero BF16 input padding'
-            assert torch.equal(d_padding, torch.zeros_like(d_padding)), f'{group_idx=}, nonzero BF16 output padding'
 
 
 def test_gemm() -> None:
@@ -90,7 +83,7 @@ def test_m_grouped_gemm_contiguous() -> None:
                     assert diff < 1e-5, (f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, '
                                          f'alias={test_alias}, {ensure_zero_padding=}')
                 if ensure_zero_padding:
-                    check_bf16_psum_zero_padding(a, d, grouped_layout)
+                    assert_psum_zero_padding(a, d, grouped_layout, 'BF16')
             else:
                 diff = calc_diff(d, ref_d)
                 assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'

@@ -6,7 +6,10 @@ import deep_gemm
 from deep_gemm.testing import (
     bench_kineto,
     calc_diff, count_bytes,
-    ignore_env, get_arch_major
+    get_arch_major
+)
+from utils import (
+    assert_psum_zero_padding,
 )
 
 from generators import (
@@ -15,18 +18,8 @@ from generators import (
     enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
     generate_k_grouped_contiguous_psum,
-    get_mk_alignment_for_contiguous_layout, set_mk_alignment_for_contiguous_layout
+    get_mk_alignment_for_contiguous_layout
 )
-
-
-def check_fp8_fp4_psum_zero_padding(a: tuple, d: torch.Tensor, grouped_layout: torch.Tensor) -> None:
-    for group_idx, current_m in enumerate(grouped_layout.cpu().tolist()):
-        aligned_m = align(current_m, get_mk_alignment_for_contiguous_layout())
-        if current_m < aligned_m:
-            data_padding = a[0][current_m: aligned_m]
-            d_padding = d[current_m: aligned_m]
-            assert torch.equal(data_padding, torch.zeros_like(data_padding)), f'{group_idx=}, nonzero FP8/FP4 input padding'
-            assert torch.equal(d_padding, torch.zeros_like(d_padding)), f'{group_idx=}, nonzero FP8/FP4 output padding'
 
 
 def test_gemm() -> None:
@@ -103,7 +96,7 @@ def test_m_grouped_gemm_contiguous() -> None:
                     assert diff < quant_config.max_diff(), (f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, '
                                                             f'{diff:.5f}, alias={test_alias}, {ensure_zero_padding=}')
                 if ensure_zero_padding:
-                    check_fp8_fp4_psum_zero_padding(a, d, grouped_layout)
+                    assert_psum_zero_padding(a, d, grouped_layout, 'FP8/FP4')
             else:
                 diff = calc_diff(d, ref_d)
                 assert diff < quant_config.max_diff(), f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, {diff:.5f}, alias={test_alias}'

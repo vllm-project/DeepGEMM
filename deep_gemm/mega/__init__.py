@@ -20,7 +20,7 @@ class SymmBuffer:
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
-                 num_ring_tokens: int,
+                 num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu'):
         assert activation in ('swiglu', 'situ'), f'Unsupported activation `{activation}`'
@@ -30,7 +30,6 @@ class SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
-        self.num_ring_tokens = num_ring_tokens
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
@@ -38,7 +37,7 @@ class SymmBuffer:
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
             mma_type, activation,
-            num_ring_tokens
+            num_shared_experts
         )
         allocator = torch if group.size() == 1 else symm_mem
         self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -54,6 +53,8 @@ class SymmBuffer:
         # Create input buffer views
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
+         self.shared_l1_acts, self.shared_l1_acts_sf,
+         self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
 
@@ -69,31 +70,12 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
                                  hidden: int, intermediate_hidden: int,
+                                 num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu') -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
-
-    # To save buffer size, we enable ring buffer
-    # TODO: move the wave concept into kernel and dynamically schedule
-    # TODO: currently decoding may consume more memory than prefill
-    # TODO: finer-grained wave
-    num_min_ring_tokens, num_max_ring_tokens = \
-        _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
-    if num_max_tokens_per_rank >= 6144:
-        # We assume must be prefill (decode cannot have such size)
-        # We try to give ~8 GB budget (within V4 Pro config)
-        # And batch size is mostly stable, to save buffer size, we use 1 expert per wave
-        num_ring_tokens = align(768 * 1024, _C.get_token_alignment_for_mega_moe())
-    else:
-        # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
-        # the wave heuristics can select the best number of experts per wave
-        # In this case, the budget is roughly ~18 GB
-        num_ring_tokens = _C.get_ring_limit_for_mega_moe(
-            align(4096, _C.get_token_alignment_for_mega_moe()), 432 // 72, 6, 72)[1]
-    num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
-    num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
 
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
@@ -107,27 +89,43 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        num_ring_tokens,
+        num_shared_experts,
         mma_type=mma_type, activation=activation
     )
 
 
 def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...] instead of [gate | up]
+    # Unsqueeze for 2D
+    assert t.dim() in (2, 3)
+    squeeze_group_dim = t.dim() == 2
+    if squeeze_group_dim:
+        t = t.unsqueeze(0)
+
+    # Transpose
     g, n, *rest = t.shape
     half = n // 2
     gate = t[:, :half].reshape(g, half // gran, gran, *rest)
     up = t[:, half:].reshape(g, half // gran, gran, *rest)
-    return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    result = torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    return result.squeeze(0) if squeeze_group_dim else result
 
 
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+    # Unsqueeze for 2D
+    assert sf.dtype == torch.int and sf.dim() in (2, 3)
+    squeeze_group_dim = sf.dim() == 2
+    if squeeze_group_dim:
+        sf = sf.unsqueeze(0)
+
+    # Transpose
     num_groups, mn, packed_sf_k = sf.shape
-    assert sf.dtype == torch.int and mn % 128 == 0
+    assert mn % 128 == 0
     result = (sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
                 .transpose(2, 3)
                 .reshape(num_groups, mn, packed_sf_k))
-    return torch.empty_like(sf).copy_(result)
+    result = torch.empty_like(sf).copy_(result)
+    return result.squeeze(0) if squeeze_group_dim else result
 
 
 def transform_weights_for_mega_moe(
@@ -156,6 +154,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
                      sym_buffer: SymmBuffer,
+                     shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                     shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
@@ -166,6 +166,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
@@ -173,14 +174,15 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp, activation_beta, activation_linear_beta,
-        fast_math,
-        sym_buffer.num_ring_tokens
+        fast_math
     )
 
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,
                   sym_buffer: SymmBuffer,
+                  shared_l1_weights: Optional[torch.Tensor] = None,
+                  shared_l2_weights: Optional[torch.Tensor] = None,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
@@ -189,6 +191,8 @@ def bf16_mega_moe(y: torch.Tensor,
         y,
         l1_weights,
         l2_weights,
+        shared_l1_weights,
+        shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs,
@@ -197,6 +201,5 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math,
-        sym_buffer.num_ring_tokens
+        fast_math
     )

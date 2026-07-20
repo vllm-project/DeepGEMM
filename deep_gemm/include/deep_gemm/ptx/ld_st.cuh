@@ -5,6 +5,7 @@
 
 #include <deep_gemm/common/exception.cuh>
 
+#if defined(DG_IN_CUDA_COMPILATION)
 namespace deep_gemm::ptx {
 
 // Compatibility: 256 bits LD/ST instructions
@@ -152,6 +153,32 @@ CUTLASS_DEVICE void st_shared(const __int128_t* ptr, __int128_t val) {
     asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "q"(val));
 }
 
+CUTLASS_DEVICE uint32_t mapa_shared(const uint32_t& ptr, const uint32_t& dst_cta_idx) {
+    uint32_t mapped;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mapped) : "r"(ptr), "r"(dst_cta_idx));
+    return mapped;
+}
+
+template <class T, class Barrier>
+CUTLASS_DEVICE void st_async_cluster(T* dst, const T& src, const uint32_t& dst_cta_idx, Barrier& barrier) {
+    DG_STATIC_ASSERT(sizeof(T) % 16 == 0, "Invalid cluster shared store size");
+
+    // Map address
+    const auto mapped_barrier_ptr = mapa_shared(static_cast<uint32_t>(__cvta_generic_to_shared(&barrier)), dst_cta_idx);
+    const auto mapped_dst_ptr = mapa_shared(static_cast<uint32_t>(__cvta_generic_to_shared(dst)), dst_cta_idx);
+
+    // Move
+    const auto u32_view = reinterpret_cast<const uint32_t*>(&src);
+    for (int i = 0; i < sizeof(T) / 16; ++ i) {
+        asm volatile(
+            "st.async.shared::cluster.mbarrier::complete_tx::bytes.u32.v4 [%0], {%1, %2, %3, %4}, [%5];" ::
+            "r"(mapped_dst_ptr + i * 16),
+            "r"(u32_view[i * 4]), "r"(u32_view[i * 4 + 1]), "r"(u32_view[i * 4 + 2]), "r"(u32_view[i * 4 + 3]),
+            "r"(mapped_barrier_ptr)
+        );
+    }
+}
+
 CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
     // `size` must be 64-bit before PTX ISA 9.0
     DG_DEVICE_ASSERT(num_bytes % 8 == 0);
@@ -163,6 +190,12 @@ CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
 CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    return ret;
+}
+
+CUTLASS_DEVICE uint32_t ld_volatile(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
     return ret;
 }
 
@@ -183,6 +216,12 @@ CUTLASS_DEVICE void st_relaxed_sys(const uint64_t* ptr, const uint64_t& value) {
 }
 
 /// Atomics
+CUTLASS_DEVICE uint32_t atomic_add(const uint32_t* ptr, const uint32_t& value) {
+    uint32_t ret;
+    asm volatile("atom.global.add.u32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+    return ret;
+}
+
 CUTLASS_DEVICE uint64_t atomic_add(const uint64_t* ptr, const uint64_t& value) {
     uint64_t ret;
     asm volatile("atom.global.add.u64 %0, [%1], %2;" : "=l"(ret) : "l"(ptr), "l"(value));
@@ -264,3 +303,4 @@ CUTLASS_DEVICE void prefetch_l1(void *ptr) {
 }
 
 } // namespace deep_gemm::ptx
+#endif

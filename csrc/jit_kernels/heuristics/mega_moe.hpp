@@ -31,9 +31,6 @@ struct MegaMoEConfig {
     // Swizzle modes for TMA descriptors
     int swizzle_acts_mode, swizzle_weights_mode;
 
-    // Number of experts to process per wave
-    int num_experts_per_wave;
-
     // Pipeline stages and shared memory
     int num_stages, smem_size;
 
@@ -52,7 +49,6 @@ struct MegaMoEConfig {
            << ", num_ring_tokens=" << config.num_ring_tokens
            << ", num_sf_ring_tokens=" << config.num_sf_ring_tokens
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
-           << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -76,21 +72,6 @@ static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::MXFP8FP4;
 }
-
-static int get_num_wave_pool_tokens(
-    const int& num_ranks, const int& num_topk, const int& num_max_tokens_per_rank, const int& num_experts_per_wave, const int& block_m) {
-    DG_HOST_ASSERT(num_max_tokens_per_rank % block_m == 0);
-    const auto num_tokens_from_all_ranks = num_max_tokens_per_rank * num_ranks;
-    if (num_experts_per_wave == 1)
-        return num_tokens_from_all_ranks;
-
-    return std::min(
-        // All tokens come to all local experts in the wave
-        num_tokens_from_all_ranks * num_experts_per_wave,
-        // All routed tokens come to this local wave, and each expert needs a padding
-        math::align(num_tokens_from_all_ranks * num_topk + num_experts_per_wave * (block_m - 1), block_m)
-    );
-};
 
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
@@ -131,59 +112,6 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     return {cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups * 128};
 }
 
-static int get_num_experts_per_wave_for_mega_moe(
-    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
-    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
-    
-    // Get max experts per wave limitation
-    int num_max_experts_per_wave = num_experts_per_rank;
-    while (num_max_experts_per_wave > 0 and
-           get_num_wave_pool_tokens(num_ranks, num_topk, num_max_tokens_per_rank, num_max_experts_per_wave, block_m) > num_ring_tokens)
-        num_max_experts_per_wave --;
-    DG_HOST_ASSERT(num_max_experts_per_wave > 0 and "Buffer size is too small");
-
-    // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens
-    constexpr int kImbalanceFactor = 2;
-
-    // Count L1 blocks per expert assuming tokens are evenly spread across experts
-    const float num_expected_tokens_per_expert = static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
-    const int num_expected_m_blocks = std::max(ceil_div(static_cast<int>(std::ceil(num_expected_tokens_per_expert)), block_m), 1);
-    const int num_l1_n_blocks = (2 * intermediate_hidden) / block_n;
-    const int num_expected_l1_blocks_per_expert = num_expected_m_blocks * num_l1_n_blocks;
-
-    // Pick the smallest value whose total blocks (after imbalance reduction) can keep all SMs busy
-    int num_min_expected_experts_to_fill_sms = ceil_div(kImbalanceFactor * num_sms, num_expected_l1_blocks_per_expert);
-
-    // Most experts don't have tokens, calculate all experts at once
-    if (num_expected_tokens_per_expert < 1)
-        num_min_expected_experts_to_fill_sms = num_experts_per_rank;
-
-    // Ring capacity is the bottleneck
-    if (num_min_expected_experts_to_fill_sms >= num_max_experts_per_wave)
-        return num_max_experts_per_wave;
-
-    // When each expert nearly fills all SMs, use the smallest wave to maximize L2 cache reuse
-    if (num_expected_l1_blocks_per_expert >= num_sms) 
-        return num_min_expected_experts_to_fill_sms;
-
-    // Search to 2 * num_min_expected_experts_to_fill_sms for a value where the last partial
-    // wave has as many experts as possible relative to a full wave
-    const int num_sweep_max_experts_per_wave = std::min(num_max_experts_per_wave, num_min_expected_experts_to_fill_sms * 2);
-    int best_num_experts_per_wave = num_min_expected_experts_to_fill_sms;
-    float best_tail_ratio = -1.0f;
-    for (int num_experts_per_wave = num_min_expected_experts_to_fill_sms; 
-             num_experts_per_wave <= num_sweep_max_experts_per_wave; ++ num_experts_per_wave) {
-        int remainder = num_experts_per_rank % num_experts_per_wave;
-        float tail_ratio = (remainder == 0) ? 1.0f : static_cast<float>(remainder) / num_experts_per_wave;
-        if (tail_ratio > best_tail_ratio) {
-            best_tail_ratio = tail_ratio;
-            best_num_experts_per_wave = num_experts_per_wave;
-        }
-    }
-    return best_num_experts_per_wave;
-}
-
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
@@ -214,8 +142,13 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
+    // Schedule task payloads
+    constexpr int kNumScheduleStages = 2;
+    const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(sched::TaskInfo<true>));
+
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
+    // + schedule task publish full/empty barriers.
+    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
@@ -228,13 +161,17 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ? sf_block_m * (block_k / gran_k) : 0;
     const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ? sf_block_n * (block_k / gran_k) : 0;
 
-    // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers
+    // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
     const int smem_a_size_per_stage = load_block_m * block_k * num_mma_elem_bytes;
     const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bytes;
-    const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
+    DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
+    DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
+    const int smem_stage_barriers = 2 * 8;
+    const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + smem_stage_barriers;
 
     // Fixed total
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers +
+        smem_task_info + smem_tmem_ptr;
 
     // Select maximum number of stages
     const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
@@ -264,14 +201,6 @@ static MegaMoEConfig get_mega_moe_config(
     const int swizzle_weights_mode = 128;
     const int gran_k = 32;
 
-    // Waves: clamp by pool capacity
-    // TODO: more delicated wave calculation for BF16
-    const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms,
-        num_ring_tokens, num_max_tokens_per_rank, num_ranks);
-
     // Thread layout
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
@@ -299,7 +228,6 @@ static MegaMoEConfig get_mega_moe_config(
         sf_block_m, sf_block_n,
         num_ring_tokens, is_mma_with_sf(mma_kind) ? num_sf_ring_tokens : 0,
         swizzle_acts_mode, swizzle_weights_mode,
-        num_experts_per_wave,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
         num_bytes_per_pull

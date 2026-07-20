@@ -5,6 +5,7 @@
 
 #include <deep_gemm/common/exception.cuh>
 
+#if defined(DG_IN_CUDA_COMPILATION)
 namespace deep_gemm::ptx {
 
 CUTLASS_DEVICE uint32_t get_sm_idx() {
@@ -61,3 +62,4 @@ CUTLASS_DEVICE void accumulate(float2& a, nv_bfloat162 b) {
 }
 
 } // namespace deep_gemm::ptx
+#endif

@@ -2,7 +2,7 @@ import torch
 import random
 from deep_gemm.testing import bench_kineto, count_bytes, get_arch_major
 from deep_gemm.utils import (
-    align, ceil_div,
+    align, ceil_div, ceil_to_ue8m0,
     per_token_cast_to_fp8, per_channel_cast_to_fp8,
     get_tma_aligned_size,
     get_mn_major_tma_aligned_tensor,
@@ -113,16 +113,15 @@ def test_k_grouped_psum_sf_layout_kernels() -> None:
 
     for mn, real_ks_cpu, aligned_ks_cpu, psum_layout, num_groups, gran_k, k_alignment in enumerate_k_grouped_psum_sf_layout():
         grouped_layout = torch.tensor(psum_layout, dtype=torch.int, device='cuda')
-        fp32_sf_groups = []
-        for i, k in enumerate(real_ks_cpu):
-            x_group = torch.randn((align(k, gran_k), mn), dtype=torch.bfloat16, device='cuda')
-            _, group_sf = per_channel_cast_to_fp8(x_group, use_ue8m0=True, gran_k=gran_k)
-            fp32_sf_groups.append(group_sf)
-        fp32_sf = torch.cat(fp32_sf_groups)
+
+        # The pack kernel only consumes SF values, so generate random UE8M0 SF directly
+        # (compact layout: `ceil_div(k, gran_k)` rows per group)
+        num_sf_rows = sum(ceil_div(k, gran_k) for k in real_ks_cpu)
+        fp32_sf = ceil_to_ue8m0(torch.rand((num_sf_rows, mn), dtype=torch.float, device='cuda') + 0.5)
 
         ref_packed_sf = []
         sf_start = 0
-        for i, k in enumerate(real_ks_cpu):
+        for k in real_ks_cpu:
             sf_end = sf_start + ceil_div(k, gran_k)
             ref_packed_sf.append(get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(fp32_sf[sf_start:sf_end].T).T)
             sf_start = sf_end
