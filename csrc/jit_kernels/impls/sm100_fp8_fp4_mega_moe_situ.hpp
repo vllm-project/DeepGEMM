@@ -15,7 +15,7 @@
 
 namespace deep_gemm {
 
-class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoERuntime> {
+class SM100FP8FP4MegaMoESituRuntime final : public LaunchRuntime<SM100FP8FP4MegaMoESituRuntime> {
 public:
     struct Args {
         // Templated arguments
@@ -24,6 +24,8 @@ public:
         int num_experts, num_shared_experts, num_topk;
         int num_ranks;
         float activation_clamp;
+        float activation_beta;
+        float activation_linear_beta;
         bool fast_math;
         MegaMoEConfig config;
 
@@ -59,12 +61,12 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
+#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_situ.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_impl<
+    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_situ_impl<
         {},
         {}, {},
         {}, {},
@@ -79,7 +81,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}
+        {}, {}, {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -96,6 +98,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
+    to_string(args.activation_beta),
+    to_string(args.activation_linear_beta),
     args.fast_math ? "true" : "false");
     }
 
@@ -146,6 +150,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
+    const float& activation_beta,
+    const float& activation_linear_beta,
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -275,13 +281,15 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
-    const SM100FP8FP4MegaMoERuntime::Args args = {
+    const SM100FP8FP4MegaMoESituRuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts, .num_shared_experts = num_shared_experts,
         .num_topk = num_topk,
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
+        .activation_beta = activation_beta,
+        .activation_linear_beta = activation_linear_beta,
         .fast_math = fast_math,
         .config = config,
         .y = y.data_ptr(),
@@ -311,9 +319,9 @@ static void sm100_fp8_fp4_mega_moe(
                                   config.smem_size, 2)
     };
 
-    const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
-    SM100FP8FP4MegaMoERuntime::launch(runtime, args);
+    const auto code = SM100FP8FP4MegaMoESituRuntime::generate(args);
+    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe_situ", code);
+    SM100FP8FP4MegaMoESituRuntime::launch(runtime, args);
 }
 
 } // namespace deep_gemm

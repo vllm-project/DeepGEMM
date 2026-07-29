@@ -34,6 +34,8 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
+    float kActivationBeta,
+    float kActivationLinearBeta,
     bool kFastMath,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -53,28 +55,28 @@ template <
     typename task_info_t = sched::TaskInfo<kHasShared>
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
-sm100_fp8_fp4_mega_moe_impl(void* y,
-                            int* cumulative_local_expert_recv_stats,
-                            const uint32_t num_tokens,
-                            const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_output,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf) {
+sm100_fp8_fp4_mega_moe_situ_impl(void* y,
+                                 int* cumulative_local_expert_recv_stats,
+                                 const uint32_t num_tokens,
+                                 const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts_sf,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights_sf,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_output,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
+                                 const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -84,6 +86,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(kActivationBeta > 0.0f, "SITU beta must be positive");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -591,7 +594,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
+                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
                     is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
                 );
             }
@@ -1042,7 +1045,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply SITU
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1056,18 +1059,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            // SwiGLU
-                            auto gate = __bfloat1622float2(bf16_gate);
+                            const auto raw_gate = __bfloat1622float2(bf16_gate);
                             auto neg_gate_exp = make_float2(
-                                kFastMath ? __expf(-gate.x) : expf(-gate.x),
-                                kFastMath ? __expf(-gate.y) : expf(-gate.y));
+                                kFastMath ? __expf(-raw_gate.x) : expf(-raw_gate.x),
+                                kFastMath ? __expf(-raw_gate.y) : expf(-raw_gate.y));
                             const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                            float2 sigmoid;
                             if constexpr (kFastMath) {
-                                gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                sigmoid = {math::fast_rcp(denom.x), math::fast_rcp(denom.y)};
                             } else {
-                                gate = {gate.x / denom.x, gate.y / denom.y};
+                                sigmoid = {1.0f / denom.x, 1.0f / denom.y};
                             }
-                            const auto up = __bfloat1622float2(bf16_up);
+
+                            const auto tanh_gate = make_float2(
+                                kFastMath ? __tanhf(raw_gate.x / kActivationBeta) : tanhf(raw_gate.x / kActivationBeta),
+                                kFastMath ? __tanhf(raw_gate.y / kActivationBeta) : tanhf(raw_gate.y / kActivationBeta));
+                            const auto gate = __fmul2_rn(
+                                sigmoid,
+                                __fmul2_rn(tanh_gate, {kActivationBeta, kActivationBeta}));
+
+                            auto up = __bfloat1622float2(bf16_up);
+                            if constexpr (kActivationLinearBeta > 0.0f) {
+                                const auto tanh_up = make_float2(
+                                    kFastMath ? __tanhf(up.x / kActivationLinearBeta) : tanhf(up.x / kActivationLinearBeta),
+                                    kFastMath ? __tanhf(up.y / kActivationLinearBeta) : tanhf(up.y / kActivationLinearBeta));
+                                up = __fmul2_rn(
+                                    tanh_up,
+                                    {kActivationLinearBeta, kActivationLinearBeta});
+                            }
                             activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
                         }
 

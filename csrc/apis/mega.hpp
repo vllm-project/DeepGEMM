@@ -13,6 +13,7 @@
 #include "../jit/device_runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 
 namespace deep_gemm::mega {
 
@@ -263,24 +264,31 @@ static void fp8_fp4_mega_moe(
 
     // Dispatch into different architectures
     if (arch_major == 10) {
-        sm100_fp8_fp4_mega_moe(y,
-                               l1_acts, l1_acts_sf,
-                               l2_acts, l2_acts_sf,
-                               shared_l1_acts, shared_l1_acts_sf,
-                               shared_l2_acts, shared_l2_acts_sf,
-                               l1_weights, l2_weights,
-                               l1_weights_sf, l2_weights_sf,
-                               shared_l1_weights, shared_l2_weights,
-                               shared_l1_weights_sf, shared_l2_weights_sf,
-                               cumulative_local_expert_recv_stats,
-                               sym_buffer_ptrs,
-                               rank_idx, num_max_tokens_per_rank,
-                               num_experts_per_rank,
-                               num_shared_experts,
-                               num_tokens, num_topk,
-                               hidden, intermediate_hidden,
-                               activation == "situ", activation_clamp,
-                               activation_beta, activation_linear_beta, fast_math);
+        const auto launch = [&](const auto&... activation_args) {
+            sm100_fp8_fp4_mega_moe(y,
+                                   l1_acts, l1_acts_sf,
+                                   l2_acts, l2_acts_sf,
+                                   shared_l1_acts, shared_l1_acts_sf,
+                                   shared_l2_acts, shared_l2_acts_sf,
+                                   l1_weights, l2_weights,
+                                   l1_weights_sf, l2_weights_sf,
+                                   shared_l1_weights, shared_l2_weights,
+                                   shared_l1_weights_sf, shared_l2_weights_sf,
+                                   cumulative_local_expert_recv_stats,
+                                   sym_buffer_ptrs,
+                                   rank_idx, num_max_tokens_per_rank,
+                                   num_experts_per_rank,
+                                   num_shared_experts,
+                                   num_tokens, num_topk,
+                                   hidden, intermediate_hidden,
+                                   activation_args...);
+        };
+        if (activation == "situ") {
+            launch(activation_clamp, activation_beta,
+                   activation_linear_beta, fast_math);
+        } else {
+            launch(activation_clamp, fast_math);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
