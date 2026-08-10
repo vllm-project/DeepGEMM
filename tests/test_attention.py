@@ -288,6 +288,35 @@ def get_cuda_peak_memory_gib():
     return peak_allocated, peak_reserved
 
 
+def test_paged_mqa_logits_empty_schedule():
+    if get_arch_major() != 9:
+        return
+
+    batch_size, num_heads, head_dim = 32, 32, 128
+    block_size = max_context_len = 64
+    for next_n in (1, 2):
+        q = torch.zeros((batch_size, next_n, num_heads, head_dim),
+                        device='cuda', dtype=torch.float8_e4m3fn)
+        kv_cache = torch.zeros((1, block_size, 1, head_dim + 4),
+                               device='cuda', dtype=torch.uint8)
+        weights = torch.zeros((batch_size * next_n, num_heads),
+                              device='cuda', dtype=torch.float)
+        block_table = torch.zeros((batch_size, 1), device='cuda', dtype=torch.int)
+
+        for nonzero_idx in (None, 0, batch_size - 1):
+            context_lens = torch.zeros((batch_size, next_n), device='cuda', dtype=torch.int)
+            if nonzero_idx is not None:
+                context_lens[nonzero_idx] = 1
+            schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+                context_lens, block_size, deep_gemm.get_num_sms())
+            logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                (q, None), kv_cache, weights, context_lens, block_table,
+                schedule_meta, max_context_len, clean_logits=False,
+                logits_dtype=torch.float)
+            torch.cuda.synchronize()
+            assert logits.shape == (batch_size * next_n, max_context_len)
+
+
 def test_paged_mqa_logits():
 
     # Helper functions
@@ -494,4 +523,5 @@ if __name__ == '__main__':
 
     test_gemm_skip_head_mid()
     test_mqa_logits()
+    test_paged_mqa_logits_empty_schedule()
     test_paged_mqa_logits()

@@ -110,7 +110,8 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
             }
             const uint32_t q_idx = lo;
             const uint32_t offset_in_q = (q_idx == 0 ? seg_starts : seg_starts - prefix_sum[q_idx - 1] * num_next_n_atoms);
-            const uint32_t num_segs_q = (q_idx == 0 ? prefix_sum[0] : prefix_sum[q_idx] - prefix_sum[q_idx - 1]);
+            const uint32_t num_segs_q = (q_idx == 0 ? prefix_sum[0] :
+                                         (q_idx == batch_size ? sum : prefix_sum[q_idx]) - prefix_sum[q_idx - 1]);
             const uint32_t atom_idx = num_segs_q > 0 ? offset_in_q / num_segs_q : 0;
             const uint32_t kv_split_idx = num_segs_q > 0 ? offset_in_q % num_segs_q : 0;
             const uint32_t q_atom_idx = q_idx * num_next_n_atoms + atom_idx;
@@ -205,8 +206,9 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
         current_q_atom_idx = current_pack.x, current_kv_idx = current_pack.y * kNumBlocksPerSplit;
         end_q_atom_idx = end_pack.x, end_kv_idx = end_pack.y * kNumBlocksPerSplit;
 
-        // NOTES: unconditional call is safe — reversed metadata allocation ensures `current_q_atom_idx` is always in-bounds.
-        refresh_num_kv_and_advance(current_q_atom_idx);
+        if (current_q_atom_idx != end_q_atom_idx or current_kv_idx != end_kv_idx) {
+            refresh_num_kv_and_advance(current_q_atom_idx);
+        }
     }
 
     // Whether num_kv should be refreshed after advancing to q_atom_idx.
@@ -221,13 +223,13 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
     }
 
     CUTLASS_DEVICE bool fetch_next_task(uint32_t &q_atom_idx, uint32_t &kv_idx, uint32_t &num_kv) {
+        if (current_q_atom_idx == end_q_atom_idx and current_kv_idx == end_kv_idx)
+            return false;
+
         q_atom_idx = current_q_atom_idx;
         kv_idx = current_kv_idx;
         num_kv = current_num_kv;
         last_advance = current_advance;
-
-        if (current_q_atom_idx == end_q_atom_idx and current_kv_idx == end_kv_idx)
-            return false;
 
         current_kv_idx += kNumBlocksPerSplit;
         if (current_kv_idx >= current_num_kv) {
