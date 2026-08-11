@@ -1,6 +1,6 @@
 import torch
 import types
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 from ..utils.math import align
 
 # noinspection PyBroadException
