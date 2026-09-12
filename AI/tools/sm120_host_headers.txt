@@ -1,2 +1,3 @@
 csrc/jit_kernels/heuristics/sm120.hpp
 csrc/jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp
+csrc/jit_kernels/impls/sm120_bf16_gemm.hpp
