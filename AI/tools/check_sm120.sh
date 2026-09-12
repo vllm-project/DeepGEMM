@@ -18,13 +18,14 @@ PASS=0; FAIL=0
 
 # --- 1. standalone header compiles (one path per line)
 HEADERS="$(cat "$REPO/AI/tools/sm120_headers.txt" 2>/dev/null || true)"
+[ -n "$(printf '%s' "$HEADERS" | tr -d '[:space:]')" ] || { echo "FATAL: AI/tools/sm120_headers.txt is missing, empty, or unreadable -- gate would verify nothing"; exit 2; }
 for h in $HEADERS; do
   [ -f "$REPO/deep_gemm/include/$h" ] || { printf '%-58s MISSING\n' "$h"; FAIL=$((FAIL+1)); continue; }
   echo "#include <$h>" > "$WORK/c.cu"
   if $NVCC $FLAGS $INC -o /dev/null "$WORK/c.cu" 2>"$WORK/e"; then
     printf '%-58s include OK\n' "$h"; PASS=$((PASS+1))
   else
-    printf '%-58s include FAIL\n' "$h"; sed -n '1,6p' "$WORK/e"; FAIL=$((FAIL+1))
+    printf '%-58s include FAIL\n' "$h"; sed -n '1,40p' "$WORK/e"; FAIL=$((FAIL+1))
   fi
 done
 
@@ -35,12 +36,12 @@ for tu in "$REPO"/AI/tools/sm120_tu/*.cu; do
   [ -e "$tu" ] || break
   n="$(basename "$tu" .cu)"; exp="$(cat "${tu%.cu}.expect" 2>/dev/null || true)"
   if ! $NVCC $FLAGS $INC -o "$WORK/$n.cubin" "$tu" 2>"$WORK/e"; then
-    printf '%-58s inst FAIL\n' "$n"; sed -n '1,6p' "$WORK/e"; FAIL=$((FAIL+1)); continue
+    printf '%-58s inst FAIL\n' "$n"; sed -n '1,40p' "$WORK/e"; FAIL=$((FAIL+1)); continue
   fi
   sass="$($CUOBJDUMP -sass "$WORK/$n.cubin" 2>/dev/null || true)"
   if [ -z "$exp" ]; then
     printf '%-58s inst OK (no MMA expected)\n' "$n"; PASS=$((PASS+1))
-  elif grep -q -- "$exp" <<<"$sass"; then
+  elif grep -qF -- "$exp" <<<"$sass"; then
     printf '%-58s inst OK [%s]\n' "$n" "$exp"; PASS=$((PASS+1))
   else
     printf '%-58s inst BAD SASS (want %s)\n' "$n" "$exp"
@@ -50,4 +51,5 @@ for tu in "$REPO"/AI/tools/sm120_tu/*.cu; do
 done
 
 echo "-----"; echo "pass=$PASS fail=$FAIL arch=$ARCH"
+[ "$PASS" -eq 0 ] && [ "$FAIL" -eq 0 ] && { echo "FATAL: gate ran zero checks (pass=0 fail=0) -- nothing was verified"; exit 2; }
 [ "$FAIL" -eq 0 ]
