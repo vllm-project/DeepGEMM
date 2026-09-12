@@ -339,7 +339,18 @@ struct SM120ArchSpec {
         const int kSFTileKBlocks = (4 * desc.max_gran_k) / layout.block_k;
         if (kSFTileKBlocks == 0)
             return 1;
-        while (split_k > 1 and (num_k_blocks % split_k != 0 or (num_k_blocks / split_k) % kSFTileKBlocks != 0))
+
+        // The split-K validity invariant, in one place so the search below and the
+        // post-clamp re-check can never drift apart.
+        const auto is_sf_aligned = [&](const int s) {
+            // A single partition spans all of K, so it has no interior boundary to
+            // misalign -- always valid, even when `num_k_blocks % kSFTileKBlocks != 0`.
+            if (s <= 1)
+                return true;
+            return num_k_blocks % s == 0 and (num_k_blocks / s) % kSFTileKBlocks == 0;
+        };
+
+        while (split_k > 1 and not is_sf_aligned(split_k))
             --split_k;
 
         split_k = std::min(split_k, num_k_blocks / (2 * kSFTileKBlocks));
@@ -349,7 +360,22 @@ struct SM120ArchSpec {
         if (mn_bytes > 0)
             split_k = std::min(split_k, std::max(static_cast<int>(kMaxWorkspaceBytes / mn_bytes), 1));
 
-        return std::max(split_k, 1);
+        // NOTES: deliberate divergence from `nv_dev`, which returns here. Both clamps
+        // above can lower `split_k` past the value the search settled on, onto one that
+        // no longer satisfies the invariant -- e.g. `num_k_blocks = 10`,
+        // `kSFTileKBlocks = 2`: the search lands on 5, then the first clamp yields
+        // `min(5, 10 / 4) = 2`, and `10 / 2 = 5` is not a multiple of 2, so partition 1
+        // would start mid-SF-tile. Re-establish the invariant instead of trusting it.
+        // Walking down is monotonically safe: a smaller factor can only cost
+        // performance, and `1` is always valid. `heuristics/sm120.hpp` is
+        // sm120-exclusive, so this divergence costs no rebase surface -- do not
+        // "restore" upstream's ordering here. See `AI/sm120_touchpoints.md`.
+        while (split_k > 1 and not is_sf_aligned(split_k))
+            --split_k;
+
+        split_k = std::max(split_k, 1);
+        DG_HOST_ASSERT(is_sf_aligned(split_k));
+        return split_k;
     }
 };
 

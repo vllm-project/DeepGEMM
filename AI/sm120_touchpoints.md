@@ -207,6 +207,28 @@ These hashes are specific to nvcc 13.1 and to the `_ID_` normalization token use
 snippet above; they will change with any toolchain update. Compare before-vs-after within a
 single run rather than against these recorded values.
 
+### Host-side no-regression check — and its false-green trap
+
+Any change under `csrc/**` (for example the `config.hpp` touchpoint below) must be shown not to
+break the sm90/sm100 host build:
+
+```bash
+touch csrc/python_api.cpp   # REQUIRED -- see below
+CUDA_HOME=/usr/local/cuda-13.1 python setup.py build_ext --inplace
+```
+
+**`setup.py build_ext --inplace` on its own is a false green for any header-only change.**
+setuptools decides what to rebuild by comparing each `.cpp` mtime against its `.o` mtime and
+does **not** track header dependencies. Every host header in this repo — `heuristics/*.hpp`,
+`impls/*.hpp`, `utils/*.hpp` — reaches the extension only by inclusion from the single TU
+`csrc/python_api.cpp`. So editing a header rebuilds **nothing**: the command prints an
+8-line log containing no compiler invocation at all and **exits 0**.
+
+Confirm the run was real before believing it. A genuine rebuild shows two
+`aarch64-linux-gnu-g++` invocations (compile, then link), a `copying build/... -> deep_gemm`
+line, and a freshly-bumped mtime on
+`build/temp.linux-*/csrc/python_api.o`. An exit code of 0 alone proves nothing.
+
 ## csrc/jit_kernels/heuristics/config.hpp
 
 Shared by sm90, sm100 and sm120. **All three fields are defaulted**, so every existing
@@ -239,6 +261,28 @@ mislead. Keeping it out also keeps the diff to three added lines total.
 indeterminate. This already happened once: `dev` added `PipelineConfig::num_tma_store_stages`
 after `nv_dev` forked, and `SM120ArchSpec::get_pipeline_config` now sets it explicitly to `2`
 (sm100's non-k-grouped value; sm120 has no k-grouped TMA-store special case).
+
+### Deliberate divergence from `nv_dev`: `SM120ArchSpec::get_split_k_factor`
+
+**Do not re-sync this function from `nv_dev`.** Upstream's version establishes an SF-alignment
+invariant with a search loop — `num_k_blocks % split_k == 0` and
+`(num_k_blocks / split_k) % kSFTileKBlocks == 0`, so every K partition starts on an SF tile
+boundary — and then **breaks it**: the two `std::min` clamps that follow (minimum SF tiles per
+partition, and the 32 MB workspace cap) can lower `split_k` onto a value that no longer
+satisfies it, with nothing re-checking. Example: `num_k_blocks = 10`, `kSFTileKBlocks = 2` —
+the search lands on 5, the first clamp yields `min(5, 10 / 4) = 2`, and `10 / 2 = 5` is not a
+multiple of 2, so partition 1 starts mid-SF-tile.
+
+This branch hoists the invariant into a local `is_sf_aligned` lambda (used by both the search
+and a post-clamp re-check, so the two cannot drift), walks `split_k` back down after clamping,
+and closes with `DG_HOST_ASSERT(is_sf_aligned(split_k))`. Walking down is monotonically safe:
+a smaller factor can only cost performance, and `1` is always valid.
+
+Diverging here is free — `heuristics/sm120.hpp` is **Category A** (sm120-exclusive, upstream
+never opens it), so unlike the `scheduler/gemm.cuh` situation there is no rebase surface to
+protect. Measured over a 2,007,040-point parameter sweep: violations `6594 -> 0`, and exactly
+those 6594 points changed their selected `split_k` (all to `1`); no other point moved, and the
+maximum selected factor is unchanged at 64.
 
 ### Related non-touchpoint: `get_byte_addressable_element_size`
 
