@@ -43,6 +43,11 @@ struct Scheduler {
     DG_STATIC_ASSERT(not is_k_grouped_contiguous(kGemmType) or kKAlignment % 128 == 0,
                      "K alignment must be a multiple of BLOCK_K (128)");
 
+    DG_STATIC_ASSERT(kSplitKFactor == 1 or kGemmType != GemmType::Batched,
+                     "Split-K is not supported for Batched GEMM: the Batched branch of "
+                     "get_next_block derives current_group_idx from the split-K-inflated "
+                     "num_blocks and never sets split_k_idx (same defect upstream in nv_dev)");
+
     int current_iter = -1;
 
     // Block configs
@@ -53,8 +58,6 @@ struct Scheduler {
     // Split-K state (inert unless kSplitKFactor > 1)
     uint32_t num_mn_blocks;
     uint32_t split_k_idx;
-    uint32_t k_partition_start;
-    uint32_t k_partition_end;
 
     // For SM90 multicast checks
     uint32_t num_blocks_in_group;
