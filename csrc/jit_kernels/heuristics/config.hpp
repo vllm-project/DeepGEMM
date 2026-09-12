@@ -22,6 +22,13 @@ struct GemmDesc {
     int num_sms, tc_util;
     std::string compiled_dims;
 
+    // SF granularity for split-K alignment: max(gran_k_a, gran_k_b). SM120 only.
+    int max_gran_k = 128;
+
+    // False for AB-swap (transposed, stride_cd_n != 1) output: the TMA-store epilogue
+    // cannot express it, so the kernel falls back to the strided-store epilogue. SM120 only.
+    bool cd_n_contiguous = true;
+
     // SM100 m-grouped psum layout padding contract
     bool ensure_zero_padding = true;
 
@@ -160,6 +167,9 @@ struct GemmConfig {
     StorageConfig storage_config;
     PipelineConfig pipeline_config;
     LaunchConfig launch_config;
+
+    // Number of K partitions. SM120 only; set by the impl after `get_best_config`.
+    int split_k_factor = 1;
 
     friend std::ostream& operator << (std::ostream& os, const GemmConfig& config) {
         os << "GemmConfig("

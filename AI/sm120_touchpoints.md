@@ -9,11 +9,13 @@ then run `AI/tools/check_sm120.sh` and the no-regression check below.
 
 | Upstream file | Edits | Added by |
 |---|---|---|
-| `deep_gemm/include/deep_gemm/scheduler/gemm.cuh` | 4 | Task 5 (split-K) |
+| `deep_gemm/include/deep_gemm/scheduler/gemm.cuh` | 5 | Task 5 (split-K) |
+| `csrc/jit_kernels/heuristics/config.hpp` | 3 | Task 7 (heuristics) |
 
 Everything else this branch adds is a **new** file (Category A: `deep_gemm/{mma,common,impls,scheduler}/sm120_*.cuh`,
-`AI/tools/**`) and cannot conflict on rebase. As of this commit, `scheduler/gemm.cuh` is the
-only upstream-owned file the branch modifies. Verify that claim after any rebase with:
+`csrc/jit_kernels/heuristics/sm120.hpp`, `csrc/jit_kernels/impls/sm120_*.hpp`, `AI/tools/**`) and
+cannot conflict on rebase. As of this commit, the two files above are the only upstream-owned
+files the branch modifies. Verify that claim after any rebase with:
 
 ```bash
 git diff --diff-filter=M --name-only <upstream-base>...HEAD
@@ -205,7 +207,59 @@ These hashes are specific to nvcc 13.1 and to the `_ID_` normalization token use
 snippet above; they will change with any toolchain update. Compare before-vs-after within a
 single run rather than against these recorded values.
 
+## csrc/jit_kernels/heuristics/config.hpp
+
+Shared by sm90, sm100 and sm120. **All three fields are defaulted**, so every existing
+construction site — including the designated-initializer `GemmDesc{...}` / `GemmConfig{...}`
+aggregates in `csrc/jit_kernels/impls/sm{90,100}_*.hpp` and in
+`heuristics/common.hpp::get_best_config` — is unaffected and needs no edit.
+
+| # | Anchor | Edit | Rationale |
+|---|---|---|---|
+| 1 | `struct GemmDesc`, after `compiled_dims`, before `ensure_zero_padding` | add `int max_gran_k = 128;` | SF granularity `max(gran_k_a, gran_k_b)`. `SM120ArchSpec::get_split_k_factor` needs it to size the SF tile (`kSFTileKBlocks = 4 * max_gran_k / block_k`) so each K partition starts on an SF-aligned boundary. sm90/sm100 never read it. |
+| 2 | `struct GemmDesc`, immediately after #1 | add `bool cd_n_contiguous = true;` | False for AB-swap output (transposed, `stride_cd_n != 1`), which the TMA-store epilogue cannot express. `SM120ArchSpec::get_storage_config` reads it to force `swizzle_cd_mode = 0`, selecting the strided-store epilogue. sm90/sm100 never read it. |
+| 3 | `struct GemmConfig`, after `launch_config` | add `int split_k_factor = 1;` | Number of K partitions. Set by `impls/sm120_fp8_fp4_gemm_1d1d.hpp` *after* `get_best_config` returns, and read by the kernel-arg builder and the split-K reduce launch. |
+
+**Placement of #1/#2 is deliberate.** Both go on `GemmDesc`, not `Layout`, and in this order —
+matching `nv_dev`'s declaration order. Two reasons: `SM120ArchSpec` reads them as
+`desc.max_gran_k` / `desc.cd_n_contiguous`, and C++20 requires designated initializers to appear
+in declaration order, so `nv_dev`'s `GemmDesc{ ..., .max_gran_k = ..., .cd_n_contiguous = ... }`
+sites in `impls/sm120_fp8_fp4_gemm_1d1d.hpp` port across unchanged. `cd_n_contiguous` could
+**not** live on `Layout`: `Layout` values are produced by `ArchSpec::get_layout_candidates`, never
+supplied by the caller, so a caller has no way to set it there and the field would be dead.
+
+**#3 is deliberately absent from `GemmConfig::operator<<`.** `nv_dev` prints it; we do not.
+`DG_PRINT_CONFIGS` dumps the config from inside `get_best_config`, which returns *before* the
+sm120 impl assigns `split_k_factor` — printing it there would always show the default `1` and
+mislead. Keeping it out also keeps the diff to three added lines total.
+
+**If upstream adds a field to `PipelineConfig`, `StorageConfig`, `LaunchConfig` or `LayoutInfo`,
+`SM120ArchSpec` must set it.** Those four are returned by brace-init from
+`heuristics/sm120.hpp`; a field upstream adds but sm120 does not initialize is left
+indeterminate. This already happened once: `dev` added `PipelineConfig::num_tma_store_stages`
+after `nv_dev` forked, and `SM120ArchSpec::get_pipeline_config` now sets it explicitly to `2`
+(sm100's non-k-grouped value; sm120 has no k-grouped TMA-store special case).
+
+### Related non-touchpoint: `get_byte_addressable_element_size`
+
+`nv_dev` defined this in the shared `heuristics/common.hpp`; `dev` has no such function.
+Rather than re-add it to a shared file, it is a static member of `SM120ArchSpec` — zero
+upstream-owned surface, so it is **not** a touchpoint. Note that
+`dev` also added `MmaKind::MXF4`, `GemmDesc::is_mxf4_mma()` and `GemmDesc::get_smem_pack_factor()`
+after `nv_dev` forked, and `GemmDesc::get_mma_kind()` now returns `MXF4` for FP4 x FP4 where
+`nv_dev` returned `MXFP8FP4`. SM120 must **not** adopt sm100's `get_smem_pack_factor` packing:
+`SM120ArchSpec::get_smem_bytes_per_k` already halves packed FP4, and SM120 loads FP4 through its
+own `.b4x16_p64` padded-SMEM path. See the comment on that function in `heuristics/sm120.hpp`.
+
 ## Gate
+
+`AI/tools/check_sm120_host.sh` compiles every header listed in `AI/tools/sm120_host_headers.txt`
+as a standalone TU against torch + DeepJIT + CUTLASS (`-fsyntax-only`, no GPU). It covers the
+host side — `heuristics/sm120.hpp` and, from Task 8 on, `impls/sm120_*.hpp`. Because
+`SM120ArchSpec` is a plain struct rather than a template, its member bodies are fully type-checked
+by the bare `#include`. The gate does **not** instantiate `get_best_config<SM120ArchSpec>`, so it
+alone does not prove the six-member ArchSpec concept is satisfied; that is covered from Task 8 on,
+when `impls/sm120_fp8_fp4_gemm_1d1d.hpp` calls it and enters the gate list.
 
 `AI/tools/check_sm120.sh` compiles `AI/tools/sm120_tu/sched_splitk.cu`, which instantiates
 `Scheduler` with a trailing `kSplitKFactor = 4`. If a rebase drops edit 1 or reorders the
