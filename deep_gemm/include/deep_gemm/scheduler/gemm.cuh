@@ -35,7 +35,8 @@ template <GemmType kGemmType,
           bool kEnsureZeroPadding = true,
           uint32_t kKAlignment = 128u,     // psum k-group start alignment
           uint32_t kSFKSpan = 128u,        // K covered by one k-grouped SF row
-          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
+          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>(),
+          uint32_t kSplitKFactor = 1>
 struct Scheduler {
     // A/B group starts must be aligned to whole K blocks. SF rows are packed
     // independently per group and tracked by `current_sf_k_cumsum`.
@@ -48,6 +49,12 @@ struct Scheduler {
     uint32_t num_blocks;
     uint32_t num_m_blocks;
     uint32_t num_n_blocks;
+
+    // Split-K state (inert unless kSplitKFactor > 1)
+    uint32_t num_mn_blocks;
+    uint32_t split_k_idx;
+    uint32_t k_partition_start;
+    uint32_t k_partition_end;
 
     // For SM90 multicast checks
     uint32_t num_blocks_in_group;
@@ -87,8 +94,9 @@ struct Scheduler {
         num_m_blocks = math::ceil_div(shape_m, BLOCK_M);
         num_n_blocks = math::ceil_div(shape_n, BLOCK_N);
         current_shape_k = is_k_grouped_contiguous(kGemmType) ? 0 : shape_k;
+        num_mn_blocks = num_m_blocks * num_n_blocks;
         if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched) {
-            num_blocks = num_m_blocks * num_n_blocks;
+            num_blocks = num_mn_blocks * kSplitKFactor;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_m_blocks * num_n_blocks;
             this->grouped_layout = grouped_layout;
@@ -258,15 +266,25 @@ struct Scheduler {
                 n_block_idx = block_idx / num_m_blocks;
             }
         } else {
+            // NOTES: the bounds check stays on the RAW index against the inflated
+            // `num_blocks`, or split-K never terminates.
             if (next_block_idx >= num_blocks)
                 return false;
+
+            uint32_t mn_block_idx = next_block_idx;
+            if constexpr (kSplitKFactor > 1) {
+                mn_block_idx = next_block_idx % num_mn_blocks;
+                split_k_idx  = next_block_idx / num_mn_blocks;
+            } else {
+                split_k_idx = 0;
+            }
 
             // For SM90 only
             // NOTES: we don't have to set `is_peer_cta_alive` for masked grouped GEMM, as it must be aligned
             is_peer_cta_alive = num_n_blocks % kNumMulticast == 0 or                  // Always aligned on N (constant bypass)
                                 num_m_blocks % kNumMulticast == 0 or                  // Always aligned on M (constant bypass)
-                                (next_block_idx ^ 1) < num_blocks;                    // Peer CTA in bound
-            get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
+                                (mn_block_idx ^ 1) < num_mn_blocks;                   // Peer CTA in bound
+            get_swizzled_block_idx(mn_block_idx, m_block_idx, n_block_idx);
         }
         return true;
     }
