@@ -4,3 +4,4 @@ csrc/jit_kernels/impls/sm120_bf16_gemm.hpp
 csrc/jit_kernels/impls/sm120_mqa_logits.hpp
 csrc/jit_kernels/impls/sm120_bmk_bnk_mn.hpp
 csrc/jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp
+csrc/apis/sm120_dispatch.hpp
