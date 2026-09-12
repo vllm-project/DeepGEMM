@@ -5,3 +5,6 @@ deep_gemm/impls/sm120_fp8_mqa_logits.cuh
 deep_gemm/impls/sm120_fp4_mqa_logits.cuh
 deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh
 deep_gemm/impls/sm120_fp4_paged_mqa_logits.cuh
+deep_gemm/impls/sm120_bf16_gemm.cuh
+deep_gemm/impls/sm120_bmk_bnk_mn.cuh
+deep_gemm/impls/sm120_tf32_hc_prenorm_gemm.cuh
