@@ -1,2 +1,7 @@
 deep_gemm/mma/sm120.cuh
 deep_gemm/common/sm120_utils.cuh
+deep_gemm/scheduler/sm120_paged_mqa_logits.cuh
+deep_gemm/impls/sm120_fp8_mqa_logits.cuh
+deep_gemm/impls/sm120_fp4_mqa_logits.cuh
+deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh
+deep_gemm/impls/sm120_fp4_paged_mqa_logits.cuh
