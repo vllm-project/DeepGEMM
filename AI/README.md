@@ -148,17 +148,35 @@ Coverage is the 8 sm120 kernels that issue MMA. `impls/sm120_split_k_reduce.cuh`
 `scheduler/sm120_paged_mqa_logits.cuh` do not include the header — they are a plain FP32 reduce
 and a metadata kernel, with no block-scaled MMA between them.
 
-`AI/tools/check_sm120_cuda_guard.sh` verifies it fires on a simulated 12.x sm120 device pass and
-stays silent on 13.x, on host passes, and on sm90/sm100 device passes. This host has no CUDA
-12.x toolkit, so the simulation is preprocessor-level (`gcc -E` with `__CUDA_ARCH__` and
-`__CUDACC_VER_MAJOR__` set explicitly); the script explains why forcing them through real nvcc
-does not work, and runs a real 12.x compile instead wherever such a toolkit exists.
+`AI/tools/check_sm120_cuda_guard.sh` verifies it fires on a 12.x sm120 device pass and stays
+silent on 13.x, on host passes, and on sm90/sm100 device passes. This host has no CUDA 12.x
+toolkit, so those five legs drive `gcc -E` with `__CUDA_ARCH__` and `__CUDACC_VER_MAJOR__` set
+explicitly.
+
+That is not a stand-in for nvcc's device pass — it **is** that pass. `nvcc --dryrun` for
+`-cubin --gpu-architecture=sm_120a` shows the device preprocessing step is literally
+`gcc -std=c++20 -D__CUDA_ARCH__=1200 ... -E -x c++ ... -D__CUDACC_VER_MAJOR__=13`, emitting a
+`.cpp1.ii` that is then handed to `cicc`; cicc never sees a preprocessor directive. The same
+observation explains why `nvcc -D__CUDACC_VER_MAJOR__=12` does *not* simulate a 12.x toolkit:
+on that generated command line the user's `-D "__CUDACC_VER_MAJOR__=12"` appears **before**
+nvcc's own `-D__CUDACC_VER_MAJOR__=13`, and the last `-D` wins.
+
+Two further legs: a real CUDA 12.x compile wherever such a toolkit exists (skipped here), and a
+sensitivity probe — the same `#error` in the same place with its comparison inverted to `>= 13`,
+which must abort a real `nvcc --gpu-architecture=sm_120a` compile. Without that leg every check
+would be `gcc -E` and nothing would show the guard can fail the toolchain it exists to fail.
+Removing the guard from a scratch copy of the tree makes the gate report `pass=4 fail=2` and
+exit 1, as it should.
 
 ## Test gating
 
 `tests/{generators,test_attention,test_fp8_fp4,test_einsum}.py` gained arch-12 enumeration rows.
-Every row restates a `DG_HOST_ASSERT` or `DG_STATIC_ASSERT` and names it in a comment; those
-asserts are the source of truth. See `sm120_touchpoints.md` → "Category B, part 3".
+Each row names, in a comment, the `DG_HOST_ASSERT` or `DG_STATIC_ASSERT` it restates; those
+asserts are the source of truth. Two rows have no assert behind them and say so: the paged
+`next_n` range (justified instead by the `kPadOddN` code path, which exists only for odd
+`next_n >= 3`) and the einsum arch-12 tolerance (inherited from `nv_dev`, no evidence here).
+Every widened value was additionally compile-probed for `sm_120a` with real nvcc before being
+enumerated. See `sm120_touchpoints.md` → "Category B, part 3".
 
 **These rows are dead code on this host** (capability 10.0) and were verified not to change the
 sm90/sm100 enumerations. They make no sm120 test runnable. No sm120 test case in this repo has
@@ -187,6 +205,16 @@ the pre-Task-14 tree: `test_mega_gate.py` (no `tile_kernels`), `test_mega_mhc.py
   `tests/test_attention.py` honours `DG_MQA_NUM_CASES`, sampling from a per-section seeded RNG,
   so the same N selects the identical case set on both sides of an A/B — but 40 of 2304 + 4320 +
   161 cases is a sample, not coverage.
+- **The arch-12 test enumerations are derived from asserts and compile probes, not from runs.**
+  An assert says what the code *refuses*, not what it *computes correctly*, and a successful
+  `sm_120a` compile says less still. A row that is too narrow silently loses coverage; one that
+  is too wide aborts on hardware. Neither is detectable here. Two rows rest on weaker ground
+  than the rest: the paged `next_n` range (no assert bounds it) and the einsum arch-12
+  tolerance (`nv_dev`'s numbers, no local evidence).
+- **The k-grouped SF-layout list for arch 12 is wider than `nv_dev`'s.** `nv_dev` restricts
+  arch 12 to `[(32,128),(128,128)]`; this branch keeps the full non-SM90 list, because its own
+  asserts accept any `k_alignment % 128 == 0` and no code here justifies the narrower set. If
+  `nv_dev` had a hardware reason, this branch will enumerate cases SM120 rejects.
 - **Every performance heuristic is unvalidated**, as is every numerical result. This bears
   repeating because it is the whole risk surface: the port is a compile-verified transcription.
 
@@ -213,7 +241,7 @@ of the tree — never the reverse.
 ```bash
 CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120.sh              # pass=23 fail=0
 CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_host.sh         # pass=7  fail=0
-CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_cuda_guard.sh   # pass=5  fail=0 (6 with a CUDA 12.x toolkit)
+CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_cuda_guard.sh   # pass=6  fail=0 (7 with a CUDA 12.x toolkit)
 touch csrc/python_api.cpp                                             # REQUIRED -- see sm120_touchpoints.md
 CUDA_HOME=/usr/local/cuda-13.1 python setup.py build_ext --inplace
 PYTHONPATH="$PWD" python tests/test_fp8_fp4.py                        # and the other standalone scripts
@@ -223,7 +251,7 @@ PYTHONPATH="$PWD" python tests/test_fp8_fp4.py                        # and the 
 |---|---|---|
 | `check_sm120.sh` | 12 device headers + 11 instantiations, correct MMA opcode | no |
 | `check_sm120_host.sh` | 7 sm120 host headers against torch + DeepJIT | no |
-| `check_sm120_cuda_guard.sh` | the CUDA>=13 `#error`, fires and does not false-positive | n/a |
+| `check_sm120_cuda_guard.sh` | the CUDA>=13 `#error`: fires, does not false-positive, and can still abort a real `sm_120a` compile | n/a |
 | `setup.py build_ext --inplace` | every Category B edit compiles and type-checks in situ | no |
 | Scheduler no-regression check | `kSplitKFactor == 1` is inert (4 steps, incl. a sensitivity probe) | n/a |
 | the standalone `tests/` scripts | no sm90/sm100 regression | no |

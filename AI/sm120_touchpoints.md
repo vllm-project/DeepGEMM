@@ -28,8 +28,9 @@ Category A files never conflict — upstream does not have them:
    compiles. Was `pass=7 fail=0`.
 6. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_cuda_guard.sh` — the CUDA>=13 guard in
    `deep_gemm/common/sm120_utils.cuh` still fires on 12.x and stays silent on 13.x, on host
-   passes, and on sm90/sm100 device passes. Was `pass=5 fail=0` (6 where a CUDA 12.x toolkit is
-   installed; that one check is skipped otherwise).
+   passes, and on sm90/sm100 device passes, and its inverted-guard sensitivity leg still aborts
+   a real `sm_120a` compile. Was `pass=6 fail=0` (7 where a CUDA 12.x toolkit is installed; that
+   one check is skipped otherwise).
 7. `touch csrc/python_api.cpp && CUDA_HOME=/usr/local/cuda-13.1 python setup.py build_ext --inplace`
    — the extension must build. The `touch` is **required**; see "Host-side no-regression check —
    and its false-green trap".
@@ -71,7 +72,7 @@ Category A files never conflict — upstream does not have them:
 | `tests/generators.py` | 2 | Task 14 (test gating) |
 | `tests/test_attention.py` | 2 | Task 14 (test gating) |
 | `tests/test_fp8_fp4.py` | 3 | Task 14 (test gating) |
-| `tests/test_einsum.py` | 4 | Task 14 (test gating) |
+| `tests/test_einsum.py` | 3 | Task 14 (test gating) |
 
 Everything else this branch adds is a **new** file (Category A: `deep_gemm/{mma,common,impls,scheduler}/sm120_*.cuh`,
 `csrc/jit_kernels/heuristics/sm120.hpp`, `csrc/jit_kernels/impls/sm120_*.hpp`,
@@ -802,8 +803,8 @@ it runs for real; it is untouched by these edits.
 
 | # | Anchor | Edit |
 |---|---|---|
-| 1 | `test_mqa_logits.enumerate_mqa_logits` | arch 12 gets `fmts = ('mxfp4', 'fp8')` (no MXFP8 kernel); `clean_logits` is forced off; FP4 `head_dims` narrows to `(128, )` |
-| 2 | `test_paged_mqa_logits.enumerate_paged_mqa_logits` | varlen widens to `arch_major in (10, 12)`; arch 12 gets `fmts = ('mxfp4', 'fp8')`, `block_kvs = (32, 64)` for FP4 and `(64, )` for FP8, and FP4 `head_dims = (128, )` |
+| 1 | `test_mqa_logits.enumerate_mqa_logits` | arch 12 gets `fmts = ('mxfp4', 'fp8')` (no MXFP8 kernel); `clean_logits` forced off; FP4 `head_dims` narrowed to `(128, )`; `heads = (16, 32, 64)` |
+| 2 | `test_paged_mqa_logits.enumerate_paged_mqa_logits` | varlen widens to `arch_major in (10, 12)`; arch 12 gets `fmts = ('mxfp4', 'fp8')`, `block_kvs = (32, 64)` for FP4 and `(64, )` for FP8, FP4 `head_dims = (128, )` and FP8 `(32, 64, 128)`, `heads = (16, 32, 64)`, `next_ns = (1, 2, 3, 4, 5, 6)` |
 
 The asserts each row restates:
 
@@ -812,8 +813,18 @@ The asserts each row restates:
 | MXFP8 excluded on arch 12 | `DG_HOST_ASSERT(arch_major == 10 or (arch_major == 12 and is_fp4))` guarding the MX scaling factor, `csrc/apis/attention.hpp` (dense and paged) |
 | `clean_logits` off on arch 12 | `DG_HOST_ASSERT(not clean_logits)` in the arch-12 dense arm — see "Deviations from `nv_dev`": this lineage deleted `smxx_clean_logits` and the sm120 kernels have no fused cleaning. **`nv_dev` does not have this restriction**; it is specific to this branch. |
 | FP4 `head_dim == 128` | `DG_STATIC_ASSERT(kHeadDim == 128, "FP4 MQA only supports head_dim=128")` in `sm120_fp4_mqa_logits.cuh:61` and `sm120_fp4_paged_mqa_logits.cuh:63`, and `DG_HOST_ASSERT(head_dim == 128)` in `csrc/jit_kernels/impls/sm120_mqa_logits.hpp:249` |
+| FP8 `head_dim` in `(32, 64, 128)` | `DG_HOST_ASSERT((not is_fp4 and head_dim == 32) or head_dim == 64 or head_dim == 128)` in both `csrc/apis/attention.hpp` entry points, and `DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128)` in the dense FP8 launcher (`sm120_mqa_logits.hpp:114`) |
+| `num_heads` in `(16, 32, 64)` | `DG_HOST_ASSERT(num_heads == 16 or num_heads == 32 or num_heads == 64)` in the arch-12 arm of both `csrc/apis/attention.hpp` entry points (dense `:187`, paged `:572`), plus `DG_HOST_ASSERT(128 % args.num_heads == 0)` in the paged runtime. Matches `nv_dev`. |
 | varlen on arch 12 | `DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and next_n == 1)` in the paged varlen block |
 | `block_kv` on arch 12 | the `arch_major == 12` clause of the fused-KV-cache assert (`(is_fp4 and (block_kv == 32 or block_kv == 64)) or (not is_fp4 and block_kv == 64)`), plus `DG_HOST_ASSERT(block_kv == 64)` in the FP8 paged launcher |
+| `next_n` up to 6 on arch 12 | no host assert bounds it, but `kPadOddN = (not kIsVarlen) and (kNextN % 2 == 1) and (kNextN >= 3)` in `sm120_fp8_paged_mqa_logits.cuh:150` and `scheduler/sm120_paged_mqa_logits.cuh:171` exists *only* to handle odd `next_n >= 3`. Stopping at 2 would leave that path unenumerated. Matches `nv_dev`. |
+
+**Compile-probed, not merely argued.** Every widened value was instantiated for `sm_120a` with
+real nvcc 13.1 before being enumerated: dense FP8 at `num_heads` × `head_dim` ∈ {16,32,64} ×
+{32,64,128}; dense FP4 at `num_heads` ∈ {16,32,64}, `head_dim` 128; paged FP8 at `num_heads` ∈
+{16,32,64}, `head_dim` ∈ {32,64,128}, `next_n` ∈ {1..6}, and varlen; paged FP4 at `num_heads` ∈
+{16,32,64} × `block_kv` ∈ {32,64}. All 31 instantiations compiled. That bounds the risk to
+*runtime* behaviour — it says nothing about numerics.
 
 Both edits are inert on arch 9 and 10: every ternary keeps its existing arm for those arches,
 and the only non-arch-12 rewrite is `block_kvs`, whose `else` branch is `(64, )` — the literal
@@ -823,12 +834,22 @@ text and exec'd — no GPU needed):
 
 | Enumerator | arch 9 | arch 10 | arch 12 |
 |---|---|---|---|
-| `enumerate_mqa_logits` | 192 → 192, identical | 2304 → 2304, identical | 192 → 128 |
-| `enumerate_paged_mqa_logits` | 24 → 24, identical | 4320 → 4320, identical | 24 → 120 |
+| `enumerate_mqa_logits` | 192 → 192, identical | 2304 → 2304, identical | 192 → 192, **content differs** |
+| `enumerate_paged_mqa_logits` | 24 → 24, identical | 4320 → 4320, identical | 24 → 660 |
 
-The arch-12 dense count *falls* because `clean_logits` halves the case set and MXFP4 re-adds
-only `head_dim == 128`; the paged count rises because varlen, MXFP4 and `block_kv == 32` are
-all newly reachable.
+The arch-12 dense count is unchanged by coincidence, not by inaction: `clean_logits` halves the
+set while MXFP4, the third head count and the FP4 `head_dim` narrowing between them restore it.
+The arch-12 sets now enumerated are:
+
+| | dense | paged |
+|---|---|---|
+| `fmts` | `fp8`, `mxfp4` | `fp8`, `mxfp4` |
+| `clean_logits` | `False` only | `False` only (already) |
+| `num_heads` | 16, 32, 64 | 16, 32, 64 |
+| `head_dim` | FP8 32/64/128, FP4 128 | FP8 32/64/128, FP4 128 |
+| `block_kv` | — | FP8 64, FP4 32/64 |
+| `next_n` | — | 1-6 |
+| varlen | — | both |
 
 ## tests/test_fp8_fp4.py — 3 edits
 
@@ -848,21 +869,28 @@ Edit 3 is behaviour-preserving for arch 9 and 10. Arch 9 FP8 yields only K-major
 `arch_major == 9` test did; arch 10 FP8 yields only MN-major, so it returns the TN entry point;
 the FP4 option is unchanged.
 
-## tests/test_einsum.py — 4 edits
+## tests/test_einsum.py — 3 edits
 
 | # | Anchor | Edit |
 |---|---|---|
-| 1 | module scope, above `test_bmk_bnk_mn` | add `assert_bf16_einsum_close(z, ref_z, fp32_ref_fn=None)` |
+| 1 | module scope, above `test_bmk_bnk_mn` | add `assert_bf16_einsum_close(z, ref_z, fp32_ref_fn)` |
 | 2 | `test_bhr_hdr_bhd` | replace `assert calc_diff(z, ref_z) < 1e-10` with the helper, passing an FP32-truth thunk |
 | 3 | `test_bhd_hdr_bhr` | same |
-| 4 | `test_bhd_bhr_hdr` | same, with no thunk — `ref_z` there is already the FP32 truth |
 
 On any arch other than 12 the helper is exactly the old `assert calc_diff(z, ref_z) < 1e-10`
 and the thunk is never called, so there is no extra work and no tolerance change on sm90/sm100.
 On arch 12 it relaxes the BF16-vs-BF16 comparison to `1e-7` and adds a `1e-5` check against an
-FP32 reference: DeepGEMM and the cuBLAS/torch reference differ only in FP32 accumulation order,
-which is a few ULPs past `1e-10`. **That tolerance choice is inherited from `nv_dev` and has
-never been observed on hardware from this branch.**
+FP32 reference: DeepGEMM and the torch/cuBLAS reference differ only in FP32 accumulation order,
+which is a few ULPs past `1e-10`. Ported from `nv_dev`, which applies its equivalent helper at
+exactly these two call sites (`nv_dev:tests/test_einsum.py:57` and `:79`). **The tolerance
+values themselves are `nv_dev`'s and have never been observed on hardware from this branch.**
+
+**`test_bhd_bhr_hdr` is deliberately left at `1e-10` on every arch, arch 12 included.** Both
+sides there are FP32 (`ref_z` is `z_0 + einsum(x.float(), y.float())`, the FP32 truth), so the
+BF16 accumulation-order argument does not apply, and `nv_dev` has no counterpart for that test
+at all — it is a 26/09 addition. An earlier draft of this task relaxed it 1000× by analogy;
+that was wrong and was reverted. If SM120 genuinely needs slack there, the strict check turning
+red on hardware is the finding; a pre-loosened one would hide it.
 
 ## Re-deriving the test rows after a rebase
 
@@ -874,8 +902,8 @@ done
 ```
 
 Expected for this branch (code lines only, comments excluded): `generators.py` **2**,
-`test_attention.py` **7**, `test_fp8_fp4.py` **1**, `test_einsum.py` **1**. `test_fp8_fp4.py`
-edits 1 and 3 and `test_einsum.py` edits 2-4 carry no literal `12`, so the count is a lower
+`test_attention.py` **11**, `test_fp8_fp4.py` **1**, `test_einsum.py` **1**. `test_fp8_fp4.py`
+edits 1 and 3 and `test_einsum.py` edits 2-3 carry no literal `12`, so the count is a lower
 bound — check the tables above as well.
 
 ## What these rows are NOT

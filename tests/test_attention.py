@@ -165,7 +165,12 @@ def test_mqa_logits():
                                 # SM120 FP4 MQA is head_dim=128 only -- `DG_STATIC_ASSERT(kHeadDim == 128)`
                                 # in deep_gemm/impls/sm120_fp4_mqa_logits.cuh.
                                 head_dims = ((128, ) if arch_major == 12 else (64, 128)) if is_mxfp4 else (32, 64, 128)
-                                heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else (32, 64)
+                                # SM120 takes 16, 32 or 64 heads -- `DG_HOST_ASSERT(num_heads == 16 or
+                                # num_heads == 32 or num_heads == 64)` in the arch-12 arm of
+                                # csrc/apis/attention.hpp. Falling through to the SM90 tuple would
+                                # silently drop the 16-head case the kernel supports.
+                                heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else \
+                                        ((16, 32, 64) if arch_major == 12 else (32, 64))
                                 for num_heads in heads:
                                     for head_dim in head_dims:
                                         for disable_cp in (False, True):
@@ -389,14 +394,26 @@ def test_paged_mqa_logits():
                         for block_kv in block_kvs:
                             for use_2d_context_lens, clean_logits in [(True, False)]:
                                 for batch_size in (256, 4096):
-                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2))):
+                                    # SM120 handles odd next_n >= 3 explicitly: `kPadOddN` in
+                                    # deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh:150 and in
+                                    # scheduler/sm120_paged_mqa_logits.cuh:171 exists only for that
+                                    # case, so stopping at 2 would leave it unenumerated.
+                                    next_ns = (1, ) if is_varlen else \
+                                              ((1, 6) if arch_major == 10 else
+                                               ((1, 2, 3, 4, 5, 6) if arch_major == 12 else (1, 2)))
+                                    for next_n in next_ns:
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
-                                            heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else (32, 64)
+                                            # SM120 takes 16, 32 or 64 heads -- `DG_HOST_ASSERT(num_heads
+                                            # == 16 or num_heads == 32 or num_heads == 64)` in the
+                                            # arch-12 arm of csrc/apis/attention.hpp.
+                                            heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else \
+                                                    ((16, 32, 64) if arch_major == 12 else (32, 64))
                                             # SM120 FP4 MQA is head_dim=128 only
                                             # (`DG_STATIC_ASSERT(kHeadDim == 128)` in
-                                            # deep_gemm/impls/sm120_fp4_paged_mqa_logits.cuh).
+                                            # deep_gemm/impls/sm120_fp4_paged_mqa_logits.cuh); SM120
+                                            # FP8 takes 32/64/128, as csrc/apis/attention.hpp allows.
                                             head_dims = ((128, ) if arch_major == 12 else (64, 128)) if is_mxfp4 else \
-                                                        ((32, 64, 128) if arch_major == 10 else (128, ))
+                                                        ((32, 64, 128) if arch_major in (10, 12) else (128, ))
                                             for num_heads in heads:
                                                 for head_dim in head_dims:
                                                     for avg_kv in (8192, 65536):

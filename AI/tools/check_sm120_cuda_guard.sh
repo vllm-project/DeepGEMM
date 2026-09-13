@@ -4,17 +4,31 @@
 #
 # The guard sits *before* the includes, inside the `__CUDA_ARCH__ >= 1200` block, so its
 # behaviour is decidable by the preprocessor alone -- which is what makes it checkable on a
-# host that has no CUDA 12.x toolkit installed (this one does not). `gcc -E` does not
-# predefine __CUDA_ARCH__ or __CUDACC_VER_MAJOR__, so both can be set exactly, simulating any
-# (toolkit version, compilation pass) pair. Forcing them through real nvcc does NOT work:
-# `nvcc -D__CUDACC_VER_MAJOR__=12` only redefines the macro for the host pass (with a
-# redefinition warning); cicc re-predefines it in the device pass, so the guard never sees 12.
+# host that has no CUDA 12.x toolkit installed (this one does not).
 #
-# If a real CUDA 12.x toolkit IS present, check 6 additionally runs it for real.
+# `gcc -E` is not a stand-in for nvcc's device pass: it IS that pass. `nvcc --dryrun` for
+# `-cubin --gpu-architecture=sm_120a` shows the device preprocessing step is literally
+#
+#   gcc -std=c++20 -D__CUDA_ARCH__=1200 ... -E -x c++ ... -D__CUDACC_VER_MAJOR__=13 ...
+#
+# emitting a .cpp1.ii that is then handed to cicc -- cicc never sees a preprocessor directive
+# at all. So driving `gcc -E` with __CUDA_ARCH__ and __CUDACC_VER_MAJOR__ set explicitly
+# reproduces any (toolkit version, compilation pass) pair exactly.
+#
+# This is also why `nvcc -D__CUDACC_VER_MAJOR__=12` does NOT simulate a 12.x toolkit: on that
+# same command line the user's `-D "__CUDACC_VER_MAJOR__=12"` appears BEFORE nvcc's own
+# `-D__CUDACC_VER_MAJOR__=13`, and the last -D wins. The guard never sees 12.
+#
+# Checks 1-5 are preprocessor probes. Check 6 runs a real CUDA 12.x toolkit if one exists.
+# Check 7 is the sensitivity leg: it proves that an `#error` nested inside the
+# `__CUDA_ARCH__ >= 1200` block really does abort a real `nvcc --gpu-architecture=sm_120a`
+# compile. Without it, every check here is `gcc -E` and nothing in this repo shows the guard
+# can fail the toolchain it is meant to fail.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 MSG='require CUDA 13.0 or newer'
+ARCH_REAL="${SM120_ARCH:-sm_120a}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 printf '#include <deep_gemm/common/sm120_utils.cuh>\n' > "$WORK/probe.cu"
 INC="-I$REPO/deep_gemm/include -I$REPO/third-party/cutlass/include -I$CUDA_HOME/include -I$CUDA_HOME/include/cccl"
@@ -58,6 +72,38 @@ if [ -n "$NVCC12" ]; then
   fi
 else
   printf '%-52s SKIPPED (no CUDA 12.x toolkit installed)\n' "real nvcc 12.x"
+fi
+
+# --- 7. sensitivity leg: the same `#error`, in the same place, MUST be able to fail a real
+#        sm_120a compile. Build a shadow include tree whose only difference is the inverted
+#        comparison (`>= 13` instead of `< 13`), so the guard fires on THIS toolkit, and
+#        compile the probe against it with the real nvcc. Checks 1-5 are all `gcc -E`; this is
+#        the only leg that exercises the real device-compile path, and if it ever reports
+#        "compiles" the guard is inert and checks 1-5 are measuring nothing.
+NVCC="$CUDA_HOME/bin/nvcc"
+if [ -x "$NVCC" ]; then
+  mkdir -p "$WORK/shadow"
+  cp -r "$REPO/deep_gemm/include/deep_gemm" "$WORK/shadow/deep_gemm"
+  H="$WORK/shadow/deep_gemm/common/sm120_utils.cuh"
+  sed -i 's/(__CUDACC_VER_MAJOR__ < 13)/(__CUDACC_VER_MAJOR__ >= 13)/' "$H"
+  if ! grep -q '__CUDACC_VER_MAJOR__ >= 13' "$H"; then
+    printf '%-52s %-6s (want %-6s) FAIL\n' "inverted-guard probe (patch did not apply)" - -
+    FAIL=$((FAIL+1))
+  else
+    out="$("$NVCC" -std=c++20 -cubin --gpu-architecture="$ARCH_REAL" \
+           -I"$WORK/shadow" -I"$REPO/third-party/cutlass/include" -I"$CUDA_HOME/include/cccl" \
+           --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 177,550 \
+           -o /dev/null "$WORK/probe.cu" 2>&1)"
+    if grep -qF -- "$MSG" <<<"$out"; then
+      printf '%-52s %-6s (want %-6s) OK\n' "inverted guard, real nvcc $ARCH_REAL" fires fires
+      PASS=$((PASS+1))
+    else
+      printf '%-52s %-6s (want %-6s) FAIL\n' "inverted guard, real nvcc $ARCH_REAL" silent fires
+      sed -n '1,10p' <<<"$out"; FAIL=$((FAIL+1))
+    fi
+  fi
+else
+  printf '%-52s SKIPPED (no nvcc at %s)\n' "inverted-guard sensitivity probe" "$NVCC"
 fi
 
 echo "-----"; echo "pass=$PASS fail=$FAIL"
