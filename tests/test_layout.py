@@ -82,8 +82,8 @@ def test_sf_layout_kernels() -> None:
 
 def test_k_grouped_sf_layout_kernels() -> None:
     print('Testing k-grouped SF layout kernels:')
-    if get_arch_major() != 10:
-        print(' > Skipped (packed k-grouped SF only supported on SM100)')
+    if get_arch_major() not in (10, 12):
+        print(' > Skipped (packed k-grouped SF supported on SM100 and SM120 only)')
         return
 
     for mn, ks_cpu, num_groups, gran_k, k_alignment in enumerate_k_grouped_sf_layout():
@@ -117,8 +117,8 @@ def test_k_grouped_sf_layout_kernels() -> None:
 
 def test_k_grouped_psum_sf_layout_kernels() -> None:
     print('Testing k-grouped psum SF layout kernels:')
-    if get_arch_major() != 10:
-        print(' > Skipped (packed k-grouped SF only supported on SM100)')
+    if get_arch_major() not in (10, 12):
+        print(' > Skipped (packed k-grouped SF supported on SM100 and SM120 only)')
         return
 
     for mn, real_ks_cpu, aligned_ks_cpu, psum_layout, num_groups, gran_k, k_alignment in enumerate_k_grouped_psum_sf_layout():

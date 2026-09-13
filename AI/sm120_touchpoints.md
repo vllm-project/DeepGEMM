@@ -92,8 +92,8 @@ Category A files never conflict — upstream does not have them:
 11. If a new field appears in `PipelineConfig`, `Layout`, `GemmDesc`, or the `ArchSpec`
     interface, check whether `SM120ArchSpec` (`csrc/jit_kernels/heuristics/sm120.hpp`) must
     populate it. A field it does not set takes a silent default; it is not a compile error.
-12. If `tests/generators.py`, `tests/test_attention.py`, `tests/test_fp8_fp4.py` or
-    `tests/test_einsum.py` conflicted, recheck each arch-12 enumeration row against the host
+12. If `tests/generators.py`, `tests/test_attention.py`, `tests/test_fp8_fp4.py`,
+    `tests/test_einsum.py` or `tests/test_layout.py` conflicted, recheck each arch-12 enumeration row against the host
     assert it cites. Those asserts are the source of truth; the enumeration only restates them.
 
 **Still unverified on real hardware: all numerics and all performance heuristics.** Read
@@ -116,6 +116,7 @@ Category A files never conflict — upstream does not have them:
 | `tests/test_attention.py` | 2 | Task 14 (test gating) |
 | `tests/test_fp8_fp4.py` | 3 | Task 14 (test gating) |
 | `tests/test_einsum.py` | 3 | Task 14 (test gating) |
+| `tests/test_layout.py` | 2 | post-final-review (k-grouped packer skip gates) |
 
 Everything else this branch adds is a **new** file (Category A: `deep_gemm/{mma,common,impls,scheduler}/sm120_*.cuh`,
 `csrc/jit_kernels/heuristics/sm120.hpp`, `csrc/jit_kernels/impls/sm120_*.hpp`,
@@ -860,7 +861,13 @@ rebase that touches this file:
 PYTHONPATH="$PWD" python tests/test_layout.py    # rc=0 on this sm100 host
 ```
 
-It exercises **only** arch 10 here, as everything does. It says nothing about arch 12.
+Its two k-grouped sections were gated `!= 10` and would have **skipped on SM120** — printing
+"only supported on SM100", a message this widening made false — so the one test that directly
+drives the newly-widened packer would have reported "Skipped" on the very hardware it matters on.
+Both gates are now `not in (10, 12)` and the message is corrected (`tests/test_layout.py:85`,
+`:120`). On this sm100 host it still exercises only arch 10, as everything does, and still says
+nothing about whether arch 12 produces correct numbers — but on SM120 silicon it will now
+actually run.
 
 ### Relationship to `origin/nv_dev`
 
