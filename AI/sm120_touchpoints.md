@@ -11,10 +11,17 @@ then run `AI/tools/check_sm120.sh` and the no-regression check below.
 |---|---|---|
 | `deep_gemm/include/deep_gemm/scheduler/gemm.cuh` | 5 | Task 5 (split-K) |
 | `csrc/jit_kernels/heuristics/config.hpp` | 3 | Task 7 (heuristics) |
+| `csrc/apis/gemm.hpp` | 10 | Task 13 (dispatch) |
+| `csrc/apis/attention.hpp` | 11 | Task 13 (dispatch) |
+| `csrc/apis/einsum.hpp` | 10 | Task 13 (dispatch) |
+| `csrc/apis/layout.hpp` | 5 | Task 13 (dispatch) |
+| `csrc/apis/hyperconnection.hpp` | 2 | Task 13 (dispatch) |
+| `csrc/utils/layout.hpp` | 3 | Task 13 (dispatch) |
 
 Everything else this branch adds is a **new** file (Category A: `deep_gemm/{mma,common,impls,scheduler}/sm120_*.cuh`,
-`csrc/jit_kernels/heuristics/sm120.hpp`, `csrc/jit_kernels/impls/sm120_*.hpp`, `AI/tools/**`) and
-cannot conflict on rebase. As of this commit, the two files above are the only upstream-owned
+`csrc/jit_kernels/heuristics/sm120.hpp`, `csrc/jit_kernels/impls/sm120_*.hpp`,
+`csrc/apis/sm120_dispatch.hpp`, `AI/tools/**`) and
+cannot conflict on rebase. As of this commit, the eight files above are the only upstream-owned
 files the branch modifies. Verify that claim after any rebase with:
 
 ```bash
@@ -22,6 +29,44 @@ git diff --diff-filter=M --name-only <upstream-base>...HEAD
 ```
 
 Anything listed there that is not in the table above is an undocumented touchpoint — add it.
+
+## READ THIS BEFORE TRUSTING A GREEN CHECKMARK
+
+**Most of the edits in this file fail silently if a rebase drops them. Nothing in this repo
+detects that.**
+
+The majority of this branch's Category B surface is **predicate widenings** —
+`arch_major == 10` becoming `(arch_major == 10 or arch_major == 12)` — and **dispatch arms**
+guarded by `else if (arch_major == 12)`. Both are *runtime conditions inside function bodies*.
+Drop one and:
+
+| Check | Still passes? | Why |
+|---|---|---|
+| `setup.py build_ext --inplace` | **yes** | the call still type-checks; a missing branch is not a type error |
+| `AI/tools/check_sm120_host.sh` | **yes** | `-fsyntax-only`; it never evaluates a branch |
+| `AI/tools/check_sm120.sh` | **yes** | compiles device TUs; knows nothing about host dispatch |
+| the whole `tests/` suite | **yes** | on sm90/sm100 hardware nothing ever sets `arch_major == 12` |
+
+The failure appears **only when an SM120 device runs an sm120 kernel**, as a
+`DG_HOST_UNREACHABLE` abort or a `DG_HOST_ASSERT` failure — and **this project has no sm120
+hardware**, so no check that exists here can reach it.
+
+What the green gates actually prove: that the arms which are *present* compile and type-check
+against the `sm120_*` launcher signatures, and that sm90/sm100 still behave as before. They
+prove **nothing** about arms that are *absent*. The only defence is the per-site tables below.
+After any rebase, re-derive the site list from upstream and diff it against those tables by
+hand:
+
+```bash
+for f in gemm attention einsum hyperconnection layout; do
+  echo "=== $f"; grep -cE "arch_major == 12" csrc/apis/$f.hpp
+done
+grep -cE "arch_major == 12" csrc/utils/layout.hpp    # must be 3
+```
+
+Expected counts for this branch (textual `arch_major == 12` occurrences, which exceed the
+edit-row counts where one edit contains two mentions): gemm **9**, attention **10**,
+einsum **9**, hyperconnection **1**, apis/layout **6**, utils/layout **3**.
 
 ## deep_gemm/include/deep_gemm/scheduler/gemm.cuh
 
@@ -316,3 +361,295 @@ are steps 1-4 of the no-regression check above, which must be run by hand on reb
 If upstream churns `get_next_block` badly enough that edits 3/4 no longer apply cleanly, fork to
 `scheduler/sm120_gemm.cuh` and drop this touchpoint entirely (design doc section 5.2). That
 removes all five edits at once and eliminates this file's Category B status.
+
+# Category B, part 2 — the `arch_major == 12` dispatch (Task 13)
+
+This is where the port becomes **reachable**: before this commit nothing `#include`d the sm120
+headers at all. Everything below lives in an upstream-owned file, so every row is permanent
+rebase surface. Re-apply each row after a rebase, then rerun both gates and the no-regression
+check above.
+
+## How to re-derive this list after a rebase
+
+```bash
+for f in gemm attention einsum hyperconnection layout; do
+  echo "=== $f"; git show <upstream-sm120-ref>:csrc/apis/$f.hpp | grep -nE "arch_major == 12"
+done
+git show <upstream-sm120-ref>:csrc/utils/layout.hpp | grep -nE "arch_major == 12"
+```
+
+Against `origin/nv_dev` that prints **9 / 11 / 7 / 1 / 5** for the api headers and **3** for
+`csrc/utils/layout.hpp` — 36 upstream sites. This branch realizes them in **37** edit points,
+because `dev` has diverged from `nv_dev` in several places (see "Deviations from nv_dev" below).
+
+## Include discipline
+
+Exactly **one** line is added to each api header that needs it:
+
+```cpp
+#include "sm120_dispatch.hpp"
+```
+
+Do **not** add the five individual `impls/sm120_*.hpp` includes that `nv_dev` adds — the
+dispatch header (Category A, Task 12) pulls them in. That is what holds each api header's
+include delta to a single line.
+
+`csrc/apis/layout.hpp` and `csrc/utils/layout.hpp` get **no** include: `sm120_dispatch.hpp`
+itself includes `csrc/apis/layout.hpp`, so adding it there would be a cycle. This is also why
+the SM120 K-major SF pre-transform (row 4 of the `apis/layout.hpp` table) must be inlined
+rather than extracted.
+
+## csrc/apis/gemm.hpp — 1 include + 9 dispatch arms
+
+| # | Line | Enclosing function | Edit |
+|---|---|---|---|
+| 1 | 14 | (include block, after `#include "layout.hpp"`) | add `#include "sm120_dispatch.hpp"` |
+| 2 | 113-118 | `fp8_fp4_gemm_nt` | insert `if (arch_major == 12) { ... return; }` **before** the shared `transform_sf_pair_into_required_layout` call: assert `not alpha.has_value()`, then `sm120::fp8_fp4_gemm_nt(a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, major_a, major_b, m, n, k)` |
+| 3 | 248-256 | `m_grouped_fp8_fp4_gemm_nt_contiguous` | `} else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {` — `sm120::to_k_major(b.first, major_b, n)`, `nv_dev`'s `is_mixed_fp4` / `k % 128` guard, then `sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(..., major_a, cute::UMMA::Major::K, compiled_dims, use_psum_layout, expected_m_for_psum_layout)` |
+| 4 | 321-324 | `m_grouped_fp8_fp4_gemm_nt_masked` | `} else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {` then `sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(...)` |
+| 5 | 376-387 | `k_grouped_fp8_gemm_tn_contiguous` | `} else if (arch_major == 12) {` — assert `not use_psum_layout` and `ks_cpu` non-empty; run the two `transform_k_grouped_sf_into_required_layout` calls inside the arm (upstream keeps them inside the arch-10 arm); allocate the tensormap buffer; call `sm120_k_grouped_fp8_fp4_gemm_1d1d(a.first.t().contiguous(), sfa, b.first.t().contiguous(), sfb, ..., gran_k, gran_k, K, K, compiled_dims, /*k_grouped_constant_stride=*/true, sum_k)` |
+| 6 | 441-446 | `k_grouped_fp8_gemm_nt_contiguous` | `} else if (arch_major == 12) {` then `sm120_k_grouped_fp8_fp4_gemm_1d1d(..., std::get<2>(recipe), std::get<2>(recipe), K, K, compiled_dims)` |
+| 7 | 546-550 | `bf16_gemm_nt` | `} else if (arch_major == 12) {` — assert `not alpha.has_value()`, then `sm120_bf16_gemm(sm120::to_k_major(a, major_a, m), sm120::to_k_major(b, major_b, n), c, d, m, n, k, K, K, compiled_dims)` |
+| 8 | 632-636 | `m_grouped_bf16_gemm_nt_contiguous` | `} else if (arch_major == 12) {` then `sm120_m_grouped_bf16_gemm_contiguous(...)` (no `ensure_zero_padding` parameter) |
+| 9 | 683-686 | `m_grouped_bf16_gemm_nt_masked` | `} else if (arch_major == 12) {` then `sm120_m_grouped_bf16_gemm_masked(...)` |
+| 10 | 731-736 | `k_grouped_bf16_gemm_tn_contiguous` | `} else if (arch_major == 12) {` — assert `c.has_value()` and `not use_psum_layout` and `ks_cpu` non-empty, then `sm120_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout, MN, MN, compiled_dims)` |
+
+Rows 2 and 7 carry an extra `DG_HOST_ASSERT(not alpha.has_value())` that `nv_dev` does not have:
+`dev` added an `alpha` epilogue parameter to `fp8_fp4_gemm_nt` / `bf16_gemm_nt` after `nv_dev`
+forked, and no sm120 launcher accepts it. Without the assert an `alpha` would be silently dropped.
+
+**Row 2 must stay above the SF transform.** SM120 decides the AB-swap first, and the swap
+changes *which* SF tensor is transformed as A and which as B, so it cannot reuse the shared
+transform that the sm90/sm100 path performs beforehand. `nv_dev` achieves the same by wrapping
+the whole sm90/sm100 body in `if (arch_major == 9 or arch_major == 10) { ... }`; the early-return
+form used here is behaviourally identical and reindents nothing.
+
+**Our `k_grouped_fp4_gemm_nt_contiguous` gets no arm.** That entry point does not exist in
+`nv_dev`, so there is no upstream sm120 arm to port. It stays SM100-only.
+
+## csrc/apis/attention.hpp — 1 include + 4 arms + 4 predicate widenings + 2 constants
+
+| # | Line | Enclosing function | Edit |
+|---|---|---|---|
+| 1 | 18 | (include block, after `#include "layout.hpp"`) | add `#include "sm120_dispatch.hpp"` |
+| 2 | 74-77 | `fp8_gemm_nt_skip_head_mid` | `} else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {` then `sm120_fp8_fp4_gemm_1d1d(..., 128, 128, major_a, major_b, compiled_dims, epilogue_type)` |
+| 3 | 107 | `fp8_fp4_mqa_logits` (SF-Q check) | `arch_major == 10` becomes `arch_major == 10 or (arch_major == 12 and is_fp4)` |
+| 4 | 146-147 | `fp8_fp4_mqa_logits` | `constexpr int block_kv = 256;` becomes `const int block_kv = (arch_major == 12) ? sm120::kMqaBlockKv : 256;` (plus one comment line) |
+| 5 | 181-192 | `fp8_fp4_mqa_logits` (dispatch) | `} else if (arch_major == 12) {` — assert `not clean_logits`, `not schedule_meta.has_value()`, qk dtype, `num_heads` in {16,32,64}, FP32 weights; then `sm120_mqa_logits(..., is_mx_sf, qk_dtype)` |
+| 6 | 407-416 | `get_paged_mqa_logits_metadata` | insert `if (arch_major == 12) { ... } else if (is_varlen) {` **as the first branch** — assert `block_kv` in {32,64} and the varlen invariants; derive `next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1`; call `sm120_paged_mqa_logits_metadata(..., (next_n + next_n_atom - 1) / next_n_atom, is_varlen, indices_ptr_or_nullptr)` |
+| 7 | 470 | `fp8_fp4_paged_mqa_logits` (SF-Q check) | `arch_major == 10` becomes `arch_major == 10 or (arch_major == 12 and is_fp4)` |
+| 8 | 480-483 | `fp8_fp4_paged_mqa_logits` (fused KV cache check) | add `or (arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64)) or (not is_fp4 and block_kv == 64)))` |
+| 9 | 523 | `fp8_fp4_paged_mqa_logits` (indices check) | `arch_major == 10` becomes `(arch_major == 10 or arch_major == 12)` |
+| 10 | 546-547 | `fp8_fp4_paged_mqa_logits` | `constexpr int split_kv = 256;` becomes `const int split_kv = (arch_major == 12) ? sm120::kPagedSplitKv : 256;` (plus one comment line) |
+| 11 | 570-578 | `fp8_fp4_paged_mqa_logits` (dispatch) | `} else if (arch_major == 12) {` — assert qk dtype, `num_heads` in {16,32,64}, FP32 weights; then `sm120_paged_mqa_logits(..., split_kv, is_mx_sf, qk_dtype)` |
+
+**Row 6 must be the first branch, and this is a deliberate divergence from `nv_dev`'s ordering.**
+`nv_dev` tests `is_varlen` only to *validate* and then dispatches on arch (10 / 9 / 12); `dev`
+restructured the function so the `is_varlen` branch itself *dispatches*, unconditionally to
+SM100. Leaving the sm120 arm at the end would let a varlen arch-12 call fall into the SM100
+branch. Placing it first keeps the arch-9 and arch-10 behaviour bit-for-bit unchanged (both
+branches are still reached under exactly the same conditions), and the varlen invariants that
+`nv_dev` asserts at its line 242 are folded into this arm instead of existing as a separate
+widening — which is why this table has 10 edit rows for `nv_dev`'s 11 sites.
+
+**Row 5's `not clean_logits` assert has no `nv_dev` counterpart.** `nv_dev` cleans logits with a
+standalone `smxx_clean_logits` kernel after dispatch; `dev` deleted that kernel and fused
+cleaning into the sm90/sm100 kernels. The sm120 kernels have no fused cleaning (Task 10
+confirmed exactly one `CUTLASS_GLOBAL` per sm120 mqa `.cuh`, so there is no clean entry point),
+so the only honest option is to refuse the request rather than silently return dirty logits.
+`schedule_meta` is refused for the same reason — `sm120_mqa_logits` has no such parameter.
+
+## csrc/apis/einsum.hpp — 1 include + 4 arms + 1 swap predicate + 2 guard widenings + 2 K-major coercions
+
+| # | Line | Enclosing function | Edit |
+|---|---|---|---|
+| 1 | 19 | (include block) | add `#include "sm120_dispatch.hpp"` |
+| 2 | 54-55 | `bmk_bnk_mn` | `} else if (arch_major == 12) { sm120_bmn_bnk_mn_gemm(a, b, d, s, m, n, k); }` — inserted **before** the arch-10 arm, matching `nv_dev`'s ordering |
+| 3 | 79-80 | `bhr_hdr_bhd` | `} else if (arch_major == 12) { sm120_bf16_bhr_hdr_bhd(...); }` — before the arch-10 arm |
+| 4 | 104-105 | `bhd_hdr_bhr` | `} else if (arch_major == 12) { sm120_bf16_bhd_hdr_bhr(...); }` — before the arch-10 arm |
+| 5 | 210-215 | `fp8_bmm` | insert, **after** `early_return` and **before** the SF transform: `if (sm120::bmm_swap_ab_eligible(m, major_a, major_b, d_tensor, c.has_value())) { sm120::fp8_fp4_bmm_swapped(a, sfa, b, sfb, c, d_tensor, batch_size, m, n, k, major_a, major_b, compiled_dims, recipe); return; }` |
+| 6 | 223-225 | `fp8_bmm` (dispatch) | `if (arch_major == 12) { sm120_fp8_fp4_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims); } else if (arch_major == 10) {` — 12 before 10, matching `nv_dev` |
+| 7 | 260 | `fp8_einsum`, `"bhd,hdr->bhr"` | `and arch_major == 10` becomes `and (arch_major == 10 or arch_major == 12)` |
+| 8 | 266 | `fp8_einsum`, `"bhd,hdr->bhr"` | `perm_b` becomes `arch_major == 12 ? b.first.permute({0, 2, 1}).contiguous() : b.first.permute({0, 2, 1})` |
+| 9 | 271 | `fp8_einsum`, `"bhd,bhr->hdr"` | `and arch_major == 10` becomes `and (arch_major == 10 or arch_major == 12)` |
+| 10 | 274-277 | `fp8_einsum`, `"bhd,bhr->hdr"` | same ternary `.contiguous()` treatment for **both** `perm_a` and `perm_b` |
+
+Rows 7 and 9 have no `nv_dev` counterpart: `nv_dev` matches those two expressions
+unconditionally, while `dev` added an `and arch_major == 10` guard after the fork. Without the
+widening, rows 8 and 10 would be dead code and arch 12 would hit `DG_HOST_UNREACHABLE`.
+
+Rows 8 and 10 exist because SM120's MMA consumes K-major operands: after the permute these
+tensors are MN-major, and the MN-major path is a ~3x-slower scalar fallback (A MN-major is not
+supported at all). `nv_dev` writes these as `if (arch_major == 12) { perm_x = perm_x.contiguous(); }`
+over non-const locals; the ternary form here keeps the locals `const` as `dev` declares them.
+
+**Row 5 takes the operands unswapped.** `sm120::fp8_fp4_bmm_swapped` performs the A/B swap
+*internally*, because the swap must precede the single SF transform; it also derives
+`gran_k_a`/`gran_k_b` itself, so it takes neither those nor `recipe_a`/`recipe_b`.
+`sm120::bmm_swap_ab_eligible` tests `arch_major == 12` internally — **do not** duplicate that
+test at the call site. An FP8 `(d, sfd)` output pair cannot reach either row: the pre-existing
+`DG_HOST_ASSERT(jit->device.get_arch_major() == 10 ...)` in the `sfd.has_value()` block fires
+first, which is correct since no sm120 launcher accepts an SFD.
+
+## csrc/apis/hyperconnection.hpp — 1 include + 1 arm
+
+| # | Line | Enclosing function | Edit |
+|---|---|---|---|
+| 1 | 7 | (include block) | add `#include "sm120_dispatch.hpp"` |
+| 2 | 48-51 | `tf32_hc_prenorm_gemm` | insert `if (arch_major == 12) { sm120_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1); } else if (arch_major == 9) {` — **12 before 9**, matching `nv_dev`'s ordering |
+
+## csrc/apis/layout.hpp — 4 predicate widenings + 1 inlined body (no include)
+
+| # | Line | Enclosing function | Edit |
+|---|---|---|---|
+| 1 | 45-46 | `transform_sf_into_required_layout` | `(FP32, x, gran_k)` path: `arch_major == 10` becomes `(arch_major == 10 or arch_major == 12)`; comment `SM100` becomes `SM100/SM120` |
+| 2 | 53-54 | `transform_sf_into_required_layout` | `(INT, 1, gran_k)` path: same widening and comment update |
+| 3 | 100-101 | `transform_k_grouped_sf_into_required_layout` | arch/granularity gate: `(arch_major == 10 and ...)` becomes `((arch_major == 10 or arch_major == 12) and ...)` |
+| 4 | 107-126 | `transform_k_grouped_sf_into_required_layout` | FP32 path: widen the predicate **and inline the SM120-only K-major SF pre-transform** — `sf_contiguous`, the `expected_sf_k` loop over `ks_cpu`, and the conditional `.t().contiguous()`; the packer is then called with `sf_input` instead of `sf` |
+| 5 | 128-129 | `transform_k_grouped_sf_into_required_layout` | INT pre-packed path: `arch_major == 10` becomes `(arch_major == 10 or arch_major == 12)`; the `gran_k == 32` restriction is **kept** |
+
+**Row 4 is a real body, not a widening**, and it is the one place in this task where extraction
+into `sm120_dispatch.hpp` is impossible: that header already includes this one (its line 27), so
+moving the block there would be a circular include. It is permanent Category B surface: the
+`if (arch_major == 12)` block itself is 11 lines (ours line 114-124), plus the `sf_input`
+local it needs and the comment explaining why it is stranded here. It exists because SM120 also accepts K-major operands, whose SF tensor is
+`[mn, sf_k]` while the common packer consumes `[sf_k, mn]`; the `expected_sf_k` sum decides
+which orientation was handed in.
+
+**Row 3 has no `nv_dev` counterpart.** `dev` added this hard arch/granularity/alignment assert
+after the fork; without widening it, every arch-12 k-grouped call would abort before reaching
+row 4.
+
+**Row 5 deliberately keeps `gran_k == 32`, where `nv_dev` has no granularity restriction on this
+path.** Dropping it would change the SM100 path too, and this task must not alter sm90/sm100
+behaviour. An sm120 INT (pre-packed UE8M0) k-grouped SF at `gran_k == 128` therefore still
+falls through to `DG_HOST_UNREACHABLE` — exactly as it does on SM100 today. If sm120 hardware
+later needs that case, drop the restriction for **both** arches in one deliberate change.
+
+## csrc/utils/layout.hpp — 3 predicate widenings (no include)
+
+**These three are missing from the Task 13 design/brief, which scoped the task to
+`csrc/apis/*.hpp`. They are required for the dispatch to function**, and `nv_dev` carries all
+three at its lines 58 / 67 / 80.
+
+| # | Line | Enclosing function | Edit |
+|---|---|---|---|
+| 1 | 64 | `check_ab_fp8_fp4` | `DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10)` becomes `... and (arch_major == 10 or arch_major == 12))` |
+| 2 | 73 | `check_grouped_ab_fp8_fp4` | same widening |
+| 3 | 86 | `get_default_recipe` | `} else if (arch_major == 10) {` becomes `} else if (arch_major == 10 or arch_major == 12) {` |
+
+Row 3 is load-bearing for `sm120_dispatch.hpp` itself: both `sm120::fp8_fp4_gemm_nt` (its
+line 111) and `sm120::fp8_fp4_bmm_swapped` (its line 182) call `get_default_recipe` whenever
+the caller supplies no recipe, and without this widening every such call hits
+`DG_HOST_UNREACHABLE("Unknown recipe")`. Rows 1 and 2 gate packed-FP4 operands; without them
+every FP4 shape check on arch 12 aborts, making the sm120 FP4 kernels unreachable through the
+public API.
+
+### Dropping these three rows fails at RUNTIME, not at compile time — nothing here catches it
+
+This is the most dangerous rebase hazard in the whole branch, so it is worth stating flatly.
+All three rows are **runtime `if`/assert conditions inside function bodies**. A rebase that
+drops them:
+
+- still **compiles**: `csrc/apis/sm120_dispatch.hpp` calls `get_default_recipe(...)` by name
+  with matching argument types either way, so the call type-checks;
+- still passes **`check_sm120_host.sh`**, which is `-fsyntax-only` and never evaluates a branch;
+- still passes **`setup.py build_ext --inplace`**, for the same reason;
+- still passes the **whole `tests/` suite on any sm90/sm100 box**, because none of those paths
+  ever sets `arch_major == 12`.
+
+The failure appears only when an SM120 device runs an sm120 kernel, as a
+`DG_HOST_UNREACHABLE("Unknown recipe")` abort or a packed-FP4 `DG_HOST_ASSERT` failure. Since
+this project has **no sm120 hardware**, that means a dropped row here is invisible to every
+check that exists. Re-verify these three by hand after every rebase:
+
+```bash
+grep -n "arch_major == 12" csrc/utils/layout.hpp   # must print 3 lines
+```
+
+The same reasoning applies to the `csrc/apis/layout.hpp` rows and to every predicate widening
+in the attention table: widenings are runtime conditions and are invisible to the gates. Only
+the **dispatch arms** fail loudly if dropped, and even then only as a
+`DG_HOST_UNREACHABLE("Unsupported architecture")` at runtime rather than a build break. The
+build is a real type-check of the arms that are *present*; it can say nothing about arms that
+are *absent*.
+
+## Deviations from `nv_dev`, collected
+
+`dev` has moved since `nv_dev` forked, so some `nv_dev` sites do not exist here and some
+`dev`-only sites do. Net: 36 upstream sites are realized as 37 edit points (plus the 4 one-line includes).
+
+| Where | What `nv_dev` does | What this branch does | Why |
+|---|---|---|---|
+| `apis/attention.hpp` `get_paged_mqa_logits_metadata` | validates `is_varlen`, then dispatches 10 / 9 / 12 | the sm120 arm goes **first**, absorbing the varlen validation | `dev`'s `is_varlen` branch dispatches to SM100 itself; a trailing arm would be unreachable for varlen |
+| `apis/attention.hpp` `fp8_fp4_mqa_logits` | cleans logits via a standalone `smxx_clean_logits` kernel | asserts `not clean_logits` in the sm120 arm | `dev` deleted `smxx_clean_logits`; sm120 kernels have no fused cleaning |
+| `apis/gemm.hpp` `fp8_fp4_gemm_nt` / `bf16_gemm_nt` | no `alpha` parameter | extra `DG_HOST_ASSERT(not alpha.has_value())` | `dev` added `alpha`; no sm120 launcher accepts it |
+| `apis/gemm.hpp` `fp8_fp4_gemm_nt` | wraps the sm90/sm100 body in `if (arch_major == 9 or arch_major == 10)` | early-returns on arch 12 before the SF transform | behaviourally identical, reindents nothing |
+| `apis/einsum.hpp` `fp8_einsum` | matches two expressions unconditionally | widens `dev`'s `and arch_major == 10` guards | `dev`-only guard added after the fork |
+| `apis/layout.hpp` k-grouped | no arch/granularity assert | widens `dev`'s assert | `dev`-only assert added after the fork |
+| `apis/layout.hpp` INT k-grouped path | no `gran_k` restriction | keeps `dev`'s `gran_k == 32` | dropping it would change SM100 behaviour |
+| `apis/gemm.hpp` `k_grouped_fp4_gemm_nt_contiguous` | entry point does not exist | no arm added | nothing upstream to port |
+
+## Sites NOT wired, and why
+
+- **`csrc/jit_kernels/heuristics/runtime.hpp`.** `nv_dev:53` returns a `{128, 64, 64}` BLOCK_M
+  search spec for arch 12 inside `get_contiguous_mk_alignment`, a helper `dev` does not have —
+  `dev`'s `get_theoretical_mk_alignment_for_contiguous_layout` has a different shape entirely and
+  returns the legacy 128 for every arch other than 10. This is a **performance/alignment
+  heuristic**, not dispatch reachability, and heuristics were Task 7's scope. Arch 12 gets the
+  legacy 128 alignment, which every sm120 arm accepts. Revisit if sm120 hardware shows the
+  k-grouped/contiguous alignment mattering.
+- **`csrc/python_api.cpp`.** Confirmed unchanged and unchanged-needed:
+  `grep -cE "sm90|sm100|sm120|arch_major" csrc/python_api.cpp` returns 0. sm120 is reached
+  through the existing generic entry points, which dispatch internally on `arch_major`.
+
+## Verification for this part
+
+```bash
+touch csrc/python_api.cpp                                       # REQUIRED, see the trap above
+CUDA_HOME=/usr/local/cuda-13.1 python setup.py build_ext --inplace
+CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_host.sh   # pass=7  fail=0
+CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120.sh        # pass=23 fail=0
+```
+
+Unlike Tasks 2-12, this task's edits are inside the single translation unit that
+`csrc/python_api.cpp` actually compiles, so the build is a real syntax and type check of every
+arm — including the `sm120::` and `sm120_*` call signatures.
+
+For the runtime no-regression check, note that `tests/` are standalone scripts, **not** pytest
+files (there is no pytest in this environment), and that they import `deep_gemm` from
+site-packages unless told otherwise. Run them as:
+
+```bash
+ln -sfn "$PWD/third-party/cutlass/include/cutlass" deep_gemm/include/cutlass   # as develop.sh does
+ln -sfn "$PWD/third-party/cutlass/include/cute"    deep_gemm/include/cute
+cd tests && PYTHONPATH=.. python test_fp8_fp4.py
+```
+
+Without the two `deep_gemm/include` symlinks every JIT compile fails with
+`fatal error: cute/numeric/math.hpp: No such file or directory`, which looks like a code
+regression and is not one. Without `PYTHONPATH`, the scripts import a stale `deep_gemm 2.3.0`
+from site-packages and fail with `ImportError: cannot import name ...`, which likewise looks
+like a regression and is not one. Normalise both before comparing anything.
+
+`tests/test_attention.py` reads **`DG_MQA_NUM_CASES`** to sample N cases per section
+(`prefill` / `paged` / `sparse`) from a `random.Random` seeded per section with a fixed
+constant. The same N therefore selects the **identical** case set on both sides of an A/B, so
+it is safe to bound that script rather than run all 2304 + 4320 + 161 cases. Task 13 used
+`DG_MQA_NUM_CASES=40`.
+
+**Four scripts cannot run on this host at all**, for reasons unrelated to the port. Do not
+record them as passes:
+
+| Script | Why it cannot run |
+|---|---|
+| `tests/test_mega_gate.py` | `ModuleNotFoundError: No module named 'tile_kernels'` |
+| `tests/test_mega_mhc.py` | `ModuleNotFoundError: No module named 'tilelang'` |
+| `tests/test_sanitizer.py` | `ModuleNotFoundError: No module named 'tilelang'` |
+| `tests/test_mega_moe.py` | spawns 8 distributed ranks; this host has 4 GPUs (`ValueError: device_id cuda:5 is out of range`) |
+
+`test_mega_moe.py` is the only one of the four that would exercise an edited function
+(`csrc/apis/mega_moe.hpp` line 190/192 calls `check_grouped_ab_fp8_fp4`, widened above). That
+widening adds a disjunct and cannot change the arch-10 result, but it is **not** covered by any
+runnable test here. Re-run that script on an 8-GPU host after any rebase that touches
+`csrc/utils/layout.hpp`.

@@ -42,16 +42,16 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
-    // (FP32, x, gran_k) on SM100: transform to (INT, 1, gran_k), TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and arch_major == 10) {
+    // (FP32, x, gran_k) on SM100/SM120: transform to (INT, 1, gran_k), TMA-aligned and MN-major
+    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and (arch_major == 10 or arch_major == 12)) {
         DG_HOST_ASSERT(not disable_ue8m0_cast);
         const auto broadcasted = gran_mn == 1 ? sf :
                                  sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));
         return get_mn_major_tma_aligned_packed_ue8m0_tensor(broadcasted, psum_layout);
     }
 
-    // (INT, 1, gran_k) on SM100: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and arch_major == 10)
+    // (INT, 1, gran_k) on SM100/SM120: transform to TMA-aligned and MN-major
+    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and (arch_major == 10 or arch_major == 12))
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, true, false, torch::kInt);
 
     DG_HOST_UNREACHABLE("Unknown SF transformation");
@@ -98,18 +98,35 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     const int gran_k = std::get<2>(recipe);
     const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT((arch_major == 9 and gran_k == 128 and k_alignment == 128) or
-                   (arch_major == 10 and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0));
+                   ((arch_major == 10 or arch_major == 12) and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0));
 
     // FP32 on SM90
     if (sf.scalar_type() == torch::kFloat and arch_major == 9)
         return get_mn_major_tma_aligned_tensor(sf);
 
-    // FP32 on SM100
-    if (sf.scalar_type() == torch::kFloat and arch_major == 10)
-        return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
+    // FP32 on SM100/SM120
+    if (sf.scalar_type() == torch::kFloat and (arch_major == 10 or arch_major == 12)) {
+        auto sf_input = sf;
+        // SM120 also accepts K-major operands. Their SF tensor is [mn, sf_k],
+        // while the common packer consumes [sf_k, mn].
+        // NOTES: this body cannot move into `sm120_dispatch.hpp` -- that header includes
+        //        this one, so extracting it would be a circular include.
+        if (arch_major == 12) {
+            const auto sf_contiguous = sf.is_contiguous() ? sf : sf.contiguous();
+            if (ks_cpu.has_value() and not ks_cpu.value().empty()) {
+                int expected_sf_k = 0;
+                for (const auto k: ks_cpu.value())
+                    expected_sf_k += ceil_div(k, gran_k);
+                sf_input = sf_contiguous.size(0) == expected_sf_k ? sf_contiguous : sf_contiguous.t().contiguous();
+            } else {
+                sf_input = sf_contiguous;
+            }
+        }
+        return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf_input, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
+    }
 
-    // Pre-packed UE8M0 is only accepted for gran_k=32 on SM100.
-    if (sf.scalar_type() == torch::kInt and arch_major == 10 and gran_k == 32)
+    // Pre-packed UE8M0 is only accepted for gran_k=32 on SM100/SM120.
+    if (sf.scalar_type() == torch::kInt and (arch_major == 10 or arch_major == 12) and gran_k == 32)
         return check_k_grouped_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
 
     DG_HOST_UNREACHABLE("Unknown cases");

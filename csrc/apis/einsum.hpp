@@ -16,6 +16,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
+#include "sm120_dispatch.hpp"
 
 namespace deep_gemm::einsum {
 
@@ -50,6 +51,8 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         sm90_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
+    } else if (arch_major == 12) {
+        sm120_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else if (arch_major == 10) {
         sm100_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else {
@@ -73,6 +76,8 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
         cublaslt_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
         sm90_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
+    } else if (arch_major == 12) {
+        sm120_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else {
@@ -96,6 +101,8 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
         cublaslt_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
         sm90_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
+    } else if (arch_major == 12) {
+        sm120_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else {
@@ -200,13 +207,23 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     if (batch_size == 0 or gemm::early_return(m, n, k, d_tensor, c, sfd))
         return;
 
+    // SM120 AB-swap for small-M decode; must be decided before the SF transform
+    if (sm120::bmm_swap_ab_eligible(m, major_a, major_b, d_tensor, c.has_value())) {
+        sm120::fp8_fp4_bmm_swapped(a, sfa, b, sfb, c, d_tensor, batch_size, m, n, k,
+                                   major_a, major_b, compiled_dims, recipe);
+        return;
+    }
+
     // Transform scaling factors
     const auto [transformed_sfa, transformed_sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         sfa, sfb, m, n, k, recipe, std::nullopt, std::nullopt, batch_size, batch_size, false);
 
     // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
-    if (arch_major == 10) {
+    if (arch_major == 12) {
+        sm120_fp8_fp4_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k,
+                          gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+    } else if (arch_major == 10) {
         sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims, sfd);
     } else {
         const auto major_sfb = get_major_type_ab(sfb);
@@ -240,22 +257,24 @@ static void fp8_einsum(const std::string& expr,
             std::get<torch::Tensor>(perm_d) = std::get<torch::Tensor>(perm_d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,hdr->bhr" and arch_major == 10) {
+    } else if (expr == "bhd,hdr->bhr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, b, r, d)
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
         const auto perm_a = a.first.permute({1, 0, 2});
         const auto perm_sfa = a.second.permute({1, 0, 2});
-        const auto perm_b = b.first.permute({0, 2, 1});
+        // SM120: B is MN-major after permute; .contiguous() to K-major (scalar MN-major path ~3x slower)
+        const auto perm_b = arch_major == 12 ? b.first.permute({0, 2, 1}).contiguous() : b.first.permute({0, 2, 1});
         const auto perm_sfb = b.second.permute({0, 2, 1});
         const auto perm_d = std::get<torch::Tensor>(d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,bhr->hdr" and arch_major == 10) {
+    } else if (expr == "bhd,bhr->hdr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, d, r, b)
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
-        const auto perm_a = a.first.permute({1, 2, 0});
+        // SM120: A/B are MN-major after permute; force K-major (MN-major A unsupported, scalar path ~3x slower)
+        const auto perm_a = arch_major == 12 ? a.first.permute({1, 2, 0}).contiguous() : a.first.permute({1, 2, 0});
         const auto perm_sfa = a.second.permute({1, 2, 0});
-        const auto perm_b = b.first.permute({1, 2, 0});
+        const auto perm_b = arch_major == 12 ? b.first.permute({1, 2, 0}).contiguous() : b.first.permute({1, 2, 0});
         const auto perm_sfb = b.second.permute({1, 2, 0});
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn");
     } else {

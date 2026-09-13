@@ -11,6 +11,7 @@
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
 #include "layout.hpp"
+#include "sm120_dispatch.hpp"
 
 namespace deep_gemm::gemm {
 
@@ -107,6 +108,14 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     // Early return for trivial cases
     if (early_return(m, n, k, d, c))
         return;
+
+    // SM120 owns its whole pipeline: the AB-swap decision must precede the SF transform
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+        sm120::fp8_fp4_gemm_nt(a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims,
+                               disable_ue8m0_cast, major_a, major_b, m, n, k);
+        return;
+    }
 
     // Transform SFA and SFB into compute-required layout
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
@@ -236,6 +245,14 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+        const auto b_data = sm120::to_k_major(b.first, major_b, n);
+        const bool is_mixed_fp4 = (a.first.scalar_type() != b_data.scalar_type()) and
+                                  (a.first.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
+        DG_HOST_ASSERT(not is_mixed_fp4 or k % 128 == 0);
+        sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b_data, sfb, d, grouped_layout,
+                                                     num_groups, m, n, k, gran_k_a, gran_k_b, major_a, cute::UMMA::Major::K,
+                                                     compiled_dims, use_psum_layout, expected_m_for_psum_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -301,6 +318,10 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
                                                  major_a, major_b, compiled_dims);
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+        sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
+                                                 num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
+                                                 major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -352,6 +373,17 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
         const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, grouped_layout, gran_k, k_alignment,
                                        cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout);
+    } else if (arch_major == 12) {
+        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
+        // SM120: single transpose [sum_k, M/N] -> [M/N, sum_k] with constant stride=sum_k.
+        // Kernel uses kKGroupedConstantStride: per-group only replaces addr+dim, not stride.
+        const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+        const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+        const auto tensor_map_buffer = torch::empty({runtime->get_num_sms() * 4 * static_cast<int>(sizeof(CUtensorMap))},
+                                                    a.first.options().dtype(torch::kByte));
+        sm120_k_grouped_fp8_fp4_gemm_1d1d(a.first.t().contiguous(), sfa, b.first.t().contiguous(), sfb, c, d, m, n,
+                                          ks_cpu.value(), grouped_layout, tensor_map_buffer, gran_k, gran_k,
+                                          cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims, true, sum_k);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -406,6 +438,11 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     if (arch_major == 9) {
         sm90_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks_cpu.value(), grouped_layout, tensor_map_buffer,
                                      cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
+    } else if (arch_major == 12) {
+        sm120_k_grouped_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n,
+                                          ks_cpu.value(), grouped_layout, tensor_map_buffer,
+                                          std::get<2>(recipe), std::get<2>(recipe),
+                                          cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -506,6 +543,10 @@ static void bf16_gemm_nt(const torch::Tensor& a,
         sm90_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
         sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, alpha);
+    } else if (arch_major == 12) {
+        DG_HOST_ASSERT(not alpha.has_value() and "BF16 GEMM alpha requires SM100");
+        sm120_bf16_gemm(sm120::to_k_major(a, major_a, m), sm120::to_k_major(b, major_b, n),
+                        c, d, m, n, k, cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -588,6 +629,10 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
         sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
                                              use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
+    } else if (arch_major == 12) {
+        sm120_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
+                                             num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                             use_psum_layout, expected_m_for_psum_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -635,6 +680,9 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
     } else if (arch_major == 10) {
         sm100_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
                                          num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+    } else if (arch_major == 12) {
+        sm120_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
+                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -680,6 +728,11 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
     } else if (arch_major == 10) {
         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, grouped_layout,
                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout);
+    } else if (arch_major == 12) {
+        DG_HOST_ASSERT(c.has_value());
+        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
+        sm120_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout,
+                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
