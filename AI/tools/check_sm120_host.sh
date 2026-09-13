@@ -13,7 +13,9 @@ INC="-I$REPO -I$REPO/deep_gemm/include -I$REPO/third-party/cutlass/include \
      $TORCH_INC $PY_INC"
 FLAGS="-std=c++20 -fsyntax-only -fPIC -D_GLIBCXX_USE_CXX11_ABI=$ABI -Wno-deprecated-declarations -Wno-abi"
 PASS=0; FAIL=0
-for h in $(cat "$REPO/AI/tools/sm120_host_headers.txt" 2>/dev/null); do
+HEADERS="$(cat "$REPO/AI/tools/sm120_host_headers.txt" 2>/dev/null || true)"
+[ -n "$(printf '%s' "$HEADERS" | tr -d '[:space:]')" ] || { echo "FATAL: AI/tools/sm120_host_headers.txt is missing, empty, or unreadable -- gate would verify nothing"; exit 2; }
+for h in $HEADERS; do
   [ -f "$REPO/$h" ] || { printf '%-56s MISSING\n' "$h"; FAIL=$((FAIL+1)); continue; }
   echo "#include \"$REPO/$h\"" > "$WORK/c.cpp"
   if g++ $FLAGS $INC "$WORK/c.cpp" 2>"$WORK/e"; then
@@ -23,4 +25,5 @@ for h in $(cat "$REPO/AI/tools/sm120_host_headers.txt" 2>/dev/null); do
   fi
 done
 echo "-----"; echo "pass=$PASS fail=$FAIL"
+[ "$PASS" -eq 0 ] && [ "$FAIL" -eq 0 ] && { echo "FATAL: gate ran zero checks (pass=0 fail=0) -- nothing was verified"; exit 2; }
 [ "$FAIL" -eq 0 ]

@@ -22,19 +22,61 @@ Category A files never conflict — upstream does not have them:
    hand** — see "How to re-derive this list after a rebase". This is the only defence against a
    silently dropped dispatch arm; "READ THIS BEFORE TRUSTING A GREEN CHECKMARK" explains why no
    gate in this repo catches one.
-4. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120.sh` — every device kernel compiles and
+4. **Triage every surviving `== 10` predicate for arch-12 reachability.** Step 3 finds sites
+   that already say `== 12`. It is structurally blind to the opposite failure: a predicate that
+   **needs** widening in a file containing no `== 12` at all. Such a file is in no table above
+   until someone puts it there, and no grep for `12` will ever surface it.
+
+   Two stages. Stage 1 is the full list; stage 2 is the high-signal subset — a `== 10` in a
+   file the Inventory table does not mention, which is precisely the shape of the miss below.
+
+   ```bash
+   # stage 1 -- every un-widened == 10 predicate (34 on this branch)
+   grep -rnE "get_arch_major\(\) == 10|arch_major == 10" csrc/ \
+     | grep -vE "or arch_major == 12|or .*get_arch_major\(\) == 12"
+
+   # stage 2 -- only those in files NOT already tabulated above (4 on this branch)
+   TABULATED='csrc/apis/gemm.hpp|csrc/apis/attention.hpp|csrc/apis/einsum.hpp|csrc/apis/hyperconnection.hpp|csrc/apis/layout.hpp|csrc/utils/layout.hpp|csrc/jit_kernels/impls/smxx_layout.hpp|csrc/jit_kernels/heuristics/config.hpp'
+   grep -rnE "get_arch_major\(\) == 10|arch_major == 10" csrc/ \
+     | grep -vE "or arch_major == 12|or .*get_arch_major\(\) == 12" \
+     | grep -vE "^($TABULATED):"
+   ```
+
+   Triage every hit: *can an arch-12 request reach this line?* If yes it needs widening and a
+   row in this file. Answer by following callers, not by grepping for `12`. Stage 1's other 30
+   hits are `== 10` arms inside chains that already carry a sibling `== 12` arm; they are
+   correct as they stand, but re-read them if the surrounding chain changed.
+
+   **Stage 2's expected output on this branch is exactly these four**, all legitimately
+   arch-10-only — `csrc/apis/mega_moe.hpp:259` and `:371`, `csrc/apis/mega_gate.hpp:176`,
+   `csrc/apis/mega_mhc.hpp:223`. There is no SM120 MegaMoE/MegaGate/MegaMHC here or upstream
+   (`grep -c sm120` on all three returns 0). **Anything else in stage 2 is a suspect.**
+
+   **This is the check that would have caught the k-grouped abort.**
+   `csrc/jit_kernels/impls/smxx_layout.hpp` shipped for three commits with
+   `DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and ...)` while `csrc/apis/layout.hpp` had
+   already been widened to route arch 12 straight into it — so both k-grouped FP8 entry points
+   aborted on SM120. The file contained no `== 12`, appeared in no table, and every gate stayed
+   green. See its section below for the worked chain.
+
+   Verified retroactively: run stage 2 against `cb7a994` with that commit's Inventory table
+   (which had no `smxx_layout.hpp` row) and the list is five lines — the four MegaMoE ones
+   above plus `csrc/jit_kernels/impls/smxx_layout.hpp:224`, the abort. Stage 1 was 35 there,
+   34 now.
+5. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120.sh` — every device kernel compiles and
    emits its expected MMA opcode. Was `pass=23 fail=0` when this was written.
-5. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_host.sh` — every sm120 host header
+6. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_host.sh` — every sm120 host header
    compiles. Was `pass=7 fail=0`.
-6. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_cuda_guard.sh` — the CUDA>=13 guard in
-   `deep_gemm/common/sm120_utils.cuh` still fires on 12.x and stays silent on 13.x, on host
-   passes, and on sm90/sm100 device passes, and its inverted-guard sensitivity leg still aborts
+7. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_cuda_guard.sh` — the CUDA>=13 guard in
+   `deep_gemm/common/sm120_utils.cuh` (duplicated verbatim in `deep_gemm/mma/sm120.cuh`, the
+   file that emits the `block_scale` PTX; both Category A) still fires on 12.x and stays silent
+   on 13.x, on host passes, and on sm90/sm100 device passes, and its inverted-guard leg aborts
    a real `sm_120a` compile. Was `pass=6 fail=0` (7 where a CUDA 12.x toolkit is installed; that
    one check is skipped otherwise).
-7. `touch csrc/python_api.cpp && CUDA_HOME=/usr/local/cuda-13.1 python setup.py build_ext --inplace`
+8. `touch csrc/python_api.cpp && CUDA_HOME=/usr/local/cuda-13.1 python setup.py build_ext --inplace`
    — the extension must build. The `touch` is **required**; see "Host-side no-regression check —
    and its false-green trap".
-8. If `deep_gemm/include/deep_gemm/scheduler/gemm.cuh` conflicted, re-run the **four-step**
+9. If `deep_gemm/include/deep_gemm/scheduler/gemm.cuh` conflicted, re-run the **four-step**
    no-regression check in "No-regression check" below — all four steps, including step 3, the
    sensitivity probe.
 
@@ -44,13 +86,13 @@ Category A files never conflict — upstream does not have them:
    normalises the cookie (or compares `.text` directly), and the sensitivity probe is what
    proves the comparison is capable of reporting a difference at all. A probe that reports
    `IDENTICAL` means the comparison is broken, not that the change is inert.
-9. Re-run the standalone test scripts under the conditions in "Verification for this part"
-   (`PYTHONPATH` pinned to the repo root, plus the two `deep_gemm/include` symlinks). They are
-   **not** pytest, and four of them cannot run on a 4-GPU host at all — that table lists which.
-10. If a new field appears in `PipelineConfig`, `Layout`, `GemmDesc`, or the `ArchSpec`
+10. Re-run the standalone test scripts under the conditions in "Verification for this part"
+    (`PYTHONPATH` pinned to the repo root, plus the two `deep_gemm/include` symlinks). They are
+    **not** pytest, and four of them cannot run on a 4-GPU host at all — that table lists which.
+11. If a new field appears in `PipelineConfig`, `Layout`, `GemmDesc`, or the `ArchSpec`
     interface, check whether `SM120ArchSpec` (`csrc/jit_kernels/heuristics/sm120.hpp`) must
     populate it. A field it does not set takes a silent default; it is not a compile error.
-11. If `tests/generators.py`, `tests/test_attention.py`, `tests/test_fp8_fp4.py` or
+12. If `tests/generators.py`, `tests/test_attention.py`, `tests/test_fp8_fp4.py` or
     `tests/test_einsum.py` conflicted, recheck each arch-12 enumeration row against the host
     assert it cites. Those asserts are the source of truth; the enumeration only restates them.
 
@@ -69,6 +111,7 @@ Category A files never conflict — upstream does not have them:
 | `csrc/apis/layout.hpp` | 5 | Task 13 (dispatch) |
 | `csrc/apis/hyperconnection.hpp` | 2 | Task 13 (dispatch) |
 | `csrc/utils/layout.hpp` | 3 | Task 13 (dispatch) |
+| `csrc/jit_kernels/impls/smxx_layout.hpp` | 1 | Fix wave (k-grouped SF packer) |
 | `tests/generators.py` | 2 | Task 14 (test gating) |
 | `tests/test_attention.py` | 2 | Task 14 (test gating) |
 | `tests/test_fp8_fp4.py` | 3 | Task 14 (test gating) |
@@ -77,14 +120,20 @@ Category A files never conflict — upstream does not have them:
 Everything else this branch adds is a **new** file (Category A: `deep_gemm/{mma,common,impls,scheduler}/sm120_*.cuh`,
 `csrc/jit_kernels/heuristics/sm120.hpp`, `csrc/jit_kernels/impls/sm120_*.hpp`,
 `csrc/apis/sm120_dispatch.hpp`, `AI/tools/**`) and
-cannot conflict on rebase. As of this commit, the twelve files above are the only upstream-owned
-files the branch modifies. Verify that claim after any rebase with:
+cannot conflict on rebase. As of this commit, the **thirteen** files above are the only
+upstream-owned files the branch modifies. Verify that claim after any rebase with:
 
 ```bash
 git diff --diff-filter=M --name-only <upstream-base>...HEAD
 ```
 
 Anything listed there that is not in the table above is an undocumented touchpoint — add it.
+
+**The thirteenth entry, `csrc/jit_kernels/impls/smxx_layout.hpp`, was missed for three commits
+precisely because nothing pointed at it.** It is not an api header, contains no `arch_major == 12`,
+and is reached only indirectly from `csrc/apis/layout.hpp`. The `git diff --diff-filter=M`
+command above is what finds a file like it; the `== 12` greps elsewhere in this document never
+will. Run the diff, not just the greps.
 
 ## READ THIS BEFORE TRUSTING A GREEN CHECKMARK
 
@@ -138,21 +187,51 @@ does against `nv_dev`. Keep the patterns identical so the two sides stay compara
 | 2 | state fields, after `num_n_blocks` | add `num_mn_blocks` and `split_k_idx` (exactly two fields — see note below) |
 | 3 | constructor, `Normal or Batched` branch | hoist `num_mn_blocks = num_m_blocks * num_n_blocks;` above the `if constexpr`; `num_blocks = num_mn_blocks * kSplitKFactor` |
 | 4 | `get_next_block`, final `else` branch | derive `mn_block_idx`/`split_k_idx` under `if constexpr (kSplitKFactor > 1)`; feed `mn_block_idx` to `is_peer_cta_alive` and `get_swizzled_block_idx`; bounds check stays on the raw index |
-| 5 | `Scheduler` body, after the existing `kKAlignment` `DG_STATIC_ASSERT` | add `DG_STATIC_ASSERT(kSplitKFactor == 1 or kGemmType != GemmType::Batched, ...)` |
+| 5 | `Scheduler` body, after the existing `kKAlignment` `DG_STATIC_ASSERT` | add `DG_STATIC_ASSERT(kSplitKFactor == 1 or kGemmType == GemmType::Normal, ...)` plus its explanatory comment block |
 
 **Do not re-add `k_partition_start` / `k_partition_end`.** nv_dev declares them but never writes
 or reads them anywhere; they are vestigial upstream. They were dropped deliberately to keep the
 Category B diff minimal — two dead `uint32_t` in a shared struct are pure rebase-conflict
 surface for zero function. If a future nv_dev sync shows them becoming live, re-add them then.
 
-**Touchpoint 5 rationale.** The constructor inflates `num_blocks` for `Normal` **or** `Batched`,
-but `get_next_block`'s `Batched` branch then derives `current_group_idx = next_block_idx /
-num_blocks` from that inflated value and never sets `split_k_idx`. That combination silently
-produces wrong group indexing. The same defect exists upstream in nv_dev. We deliberately do
-**not** rewrite the `Batched` branch — diverging there buys an untestable correctness fix at
-permanent rebase cost. The assert converts a silent wrong result into a compile error instead.
-This is reachable, not theoretical: `sm120_fp8_fp4_bmm` is a `Batched` entry point.
-`Batched` at the default `kSplitKFactor == 1` is unaffected and still compiles.
+**Touchpoint 5 rationale — the guard states the invariant, not one symptom.** Split-K needs
+*two* cooperating halves, and only `GemmType::Normal` has both:
+
+| Half | Where | Applies to |
+|---|---|---|
+| `num_blocks` inflated by `kSplitKFactor` | constructor | `Normal`, `Batched` |
+| raw index decomposed into `mn_block_idx` / `split_k_idx` | `get_next_block`'s final `else` | `Normal`, `MGroupedContiguous` |
+
+The intersection is `Normal` alone, so the assert is `kSplitKFactor == 1 or kGemmType ==
+GemmType::Normal`. Each of the two types holding only one half is silently wrong in its own way:
+
+- **`Batched`** is inflated but its own `get_next_block` branch never sets `split_k_idx`, and it
+  derives `current_group_idx = next_block_idx / num_blocks` from the inflated value — wrong
+  group indexing. Reachable: `sm120_fp8_fp4_bmm` is a `Batched` entry point.
+- **`MGroupedContiguous`** falls through to the same final `else` as `Normal` but its
+  constructor branch sets `num_blocks = num_m_blocks * num_n_blocks` **without** the
+  `kSplitKFactor` multiply. So `num_blocks == num_mn_blocks`, `split_k_idx = next_block_idx /
+  num_mn_blocks` is **always 0**, every block writes `gmem_workspace + 0`, partitions
+  `1..kSplitKFactor-1` keep whatever `torch::empty` left there, and `sm120_split_k_reduce` sums
+  uninitialised memory. Silent wrong numerics, not an abort.
+
+An earlier revision of this touchpoint named only the `Batched` case. That version was
+`kSplitKFactor == 1 or kGemmType != GemmType::Batched`, which **admitted the
+`MGroupedContiguous` defect above**. It was defended on the grounds that
+`SM120ArchSpec::get_split_k_factor` returns 1 for every non-`Normal` type on its first statement
+— but that is a reachability argument about today's caller, and the same argument was rejected
+for `Batched` when the assert was first added. A guard that encodes the invariant does not have
+to be re-audited every time a caller changes.
+
+We deliberately do **not** rewrite the `Batched` or `MGroupedContiguous` branches to *support*
+split-K — diverging there buys an untestable correctness fix at permanent rebase cost. The
+`Batched` defect also exists upstream in nv_dev. The assert converts both silent wrong results
+into compile errors instead.
+
+Everything instantiated today still compiles: `kSplitKFactor` defaults to 1 everywhere except
+`sm120_fp8_fp4_gemm_1d1d.cuh`, which is `Normal`. Verified by compiling
+`{MGroupedContiguous, Normal, Batched} x {1, 2}` plus `MGroupedMasked x 2` against `sm_120a`:
+factor 1 compiles for every type, factor 2 compiles only for `Normal`.
 
 `kSplitKFactor` **must stay the last template parameter**, after `kNum1DBlocksPerGroup` — this
 matches nv_dev's order, and `sm120_fp8_fp4_gemm_1d1d.cuh` passes it positionally.
@@ -167,9 +246,10 @@ matches nv_dev's order, and `sm120_fp8_fp4_gemm_1d1d.cuh` passes it positionally
   constructor sets `num_blocks = num_m_blocks * num_n_blocks`, which is also `== num_mn_blocks`.
   So substituting `num_mn_blocks` for `num_blocks` and `mn_block_idx` for `next_block_idx` is an
   identity in both cases.
-- Edit 5 is a `static_assert` only — it emits no code, and its condition is true for every
-  instantiation that exists today (`kSplitKFactor` defaults to 1 everywhere except
-  `sm120_fp8_fp4_gemm_1d1d.cuh`, which is `Normal`).
+- Edit 5 is a `static_assert` only — it emits no code, and its condition
+  (`kSplitKFactor == 1 or kGemmType == GemmType::Normal`) is true for every instantiation that
+  exists today (`kSplitKFactor` defaults to 1 everywhere except `sm120_fp8_fp4_gemm_1d1d.cuh`,
+  which is `Normal`).
 - No other `GemmType` branch is touched.
 
 ## No-regression check
@@ -278,23 +358,32 @@ sed -i 's/uint32_t kSplitKFactor = 2>/uint32_t kSplitKFactor = 1>/' \
 
 If the probe reports `IDENTICAL`, the comparison is broken — fix it before trusting steps 1-2.
 
-**Step 4 (REQUIRED) — the `Batched` guard still fires.** Compile this in a scratch dir (do not
-add it to the gate); it must fail with the touchpoint-5 message:
+**Step 4 (REQUIRED) — the split-K guard still fires.** Compile this in a scratch dir (do not
+add it to the gate), substituting each `GemmType` below for `<TYPE>`; it must fail with the
+touchpoint-5 message for every type **except** `Normal`:
 
 ```cpp
 #include <deep_gemm/scheduler/gemm.cuh>
 using namespace deep_gemm;
 static void f(){
-    using S = sched::Scheduler<GemmType::Batched, 128, 128, 4, 1, false, 148,
+    using S = sched::Scheduler<GemmType::<TYPE>, 128, 128, 4, 1, false, 148,
                                true, 128u, 128u,
-                               sched::get_num_1d_blocks_per_group<GemmType::Batched,128,128,148,false>(),
+                               sched::get_num_1d_blocks_per_group<GemmType::<TYPE>,128,128,148,false>(),
                                /*kSplitKFactor=*/2>;
     static_assert(sizeof(S) > 0);
 }
 ```
 
-Re-run it with `kSplitKFactor = 1` as a negative control: that **must** still compile, or the
-assert is over-broad and has broken every existing `Batched` kernel.
+| `<TYPE>` | `kSplitKFactor = 2` | `kSplitKFactor = 1` (negative control) |
+|---|---|---|
+| `Normal` | must **compile** | must compile |
+| `MGroupedContiguous` | must **fail** | must compile |
+| `Batched` | must **fail** | must compile |
+| `MGroupedMasked` | must **fail** | must compile |
+
+The `kSplitKFactor = 1` column is the control: if any of it fails, the assert is over-broad and
+has broken existing kernels. Do not check only `Batched` — that is the narrow form of the guard
+this touchpoint deliberately replaced.
 
 Recorded result at the time of the Task 5 commit, on nvcc 13.1 / `CUDA_HOME=/usr/local/cuda-13.1`.
 `before` is the pre-Task-5 tree (`5d588d0`), `after` is the tree with touchpoints 1-5 applied:
@@ -415,8 +504,34 @@ when `impls/sm120_fp8_fp4_gemm_1d1d.hpp` calls it and enters the gate list.
 `AI/tools/check_sm120.sh` compiles `AI/tools/sm120_tu/sched_splitk.cu`, which instantiates
 `Scheduler` with a trailing `kSplitKFactor = 4`. If a rebase drops edit 1 or reorders the
 template parameters, that entry fails with "too many arguments for class template".
-The gate does **not** cover inertness at factor 1, nor touchpoint 5's `Batched` guard — those
+The gate does **not** cover inertness at factor 1, nor touchpoint 5's split-K guard — those
 are steps 1-4 of the no-regression check above, which must be run by hand on rebase.
+
+**The gate TUs must pin tuples the host launcher can actually produce.** `AI/tools/sm120_tu/*.cu`
+is the only automated verification this port has, so a TU pinned to an unreachable shape
+verifies nothing about the shipped path. `fp8_mqa.cu` and `fp4_mqa.cu` originally pinned
+`BLOCK_Q = 64`, `kNumKVStages = 4` and `kIsCompressedLogits = false` — none of which any arch-12
+call can reach. They now pin, with each value derived from the launcher rather than chosen:
+
+| Template arg | Value | Derived from |
+|---|---|---|
+| `kNumHeads` | 16 | `DG_HOST_ASSERT(num_heads == 16 or 32 or 64)`, `csrc/apis/attention.hpp` arch-12 arm |
+| `kHeadDim` | 128 | FP4 asserts `head_dim == 128`; FP8 accepts `{32,64,128}` |
+| `kIsCompressedLogits` | `true` | `max_seqlen_k > 0`; `tests/test_attention.py` forces `compressed_logits` on for arch 12 |
+| `BLOCK_Q` | 8 | `128 / num_heads`, `csrc/apis/attention.hpp:148` |
+| `BLOCK_KV` | 128 | `sm120::kMqaBlockKv`, `csrc/apis/sm120_dispatch.hpp:33` |
+| `kNumQStages` | 2 | `csrc/jit_kernels/impls/sm120_mqa_logits.hpp:89` (FP8) / `:244` (FP4) |
+| `kNumKVStages` | 3 (FP8) / 5 (FP4) | same two lines — they differ by kernel |
+| `kNumTMAThreads` / `kNumMathThreads` | 128 / 256 | same, `:88`/`:90` and `:242`/`:243` |
+| `logits_dtype_t` | `float` | one of the two arch-12 test dtypes |
+
+`kNumSMs = 148` is the one value that is **not** an sm120 value: it is this host's
+`runtime->get_num_sms()` (GB200). The real sm120 count is unknowable here. It affects only
+scheduling arithmetic, not the MMA shape the `.expect` asserts on.
+
+After a rebase, re-derive these from the launcher again rather than trusting the table — if a
+stage count or `kMqaBlockKv` changes upstream, the TU silently drifts back to an unreachable
+shape and still compiles.
 
 ## Fallback
 
@@ -673,12 +788,87 @@ Three distinct behaviours:
 |---|---|
 | A dispatch arm whose `if` / `else if` chain ends in `DG_HOST_UNREACHABLE` — every arm in `gemm.hpp` and `attention.hpp`, and `einsum.hpp`'s three BF16 arms | clean `DG_HOST_UNREACHABLE("Unsupported architecture")` abort |
 | **`einsum.hpp`'s `fp8_bmm` arm (row 6 of that table)** | **no clean abort.** That chain ends in an *unguarded* `else` calling `sm90_fp8_bmm` (ours, `csrc/apis/einsum.hpp:228-232`), so arch 12 silently routes into the **SM90** path and surfaces later as a JIT / device-compile failure. Loud, but not the clean abort the rest of this section promises. The code is faithful to `nv_dev` here; only the failure mode differs. |
+| **`csrc/jit_kernels/impls/smxx_layout.hpp`'s widening** | **loud `DG_HOST_ASSERT` abort**, not silent wrong numerics. Both k-grouped FP8 entry points abort at the top of `get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor` before touching any data. The loudest failure mode in this table — but only on sm120 silicon, like everything else here. |
 | Either attention constant (`block_kv`, `split_kv`) | **self-detecting downstream**, not silent: `csrc/jit_kernels/impls/sm120_mqa_logits.hpp:487` and `:625` assert `split_kv == 128`, and `deep_gemm/include/deep_gemm/impls/sm120_fp8_mqa_logits.cuh:58` static-asserts `BLOCK_KV == kNumMathWarps * MMA_M`. Reverting either constant to 256 trips one of those. |
 
 All three are still **runtime and sm120-only** — none reaches a host without SM120 silicon, so
 none of them changes the conclusion above. The table exists only so a rebaser knows that the
 `fp8_bmm` arm misroutes rather than aborting, and that the two attention constants are the one
 category of dropped edit this port can actually detect.
+
+## csrc/jit_kernels/impls/smxx_layout.hpp — 1 predicate widening (no include)
+
+**This is the thirteenth upstream-owned file, and it was missed by the original Task 13 sweep.**
+That sweep scoped itself to `csrc/apis/*.hpp` plus `csrc/utils/layout.hpp`; this file is a JIT
+launcher header reached only *indirectly*, so nothing in the sweep pointed at it. It shipped
+broken for three commits with every gate green.
+
+| # | Line | Enclosing function | Edit |
+|---|---|---|---|
+| 1 | 224-226 | `get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor` | `DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and ...)` becomes a local `arch_major` plus `DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and ...)`; the `(gran_k == 32 or gran_k == 128)` and `k_alignment % 128 == 0` conjuncts are **kept unchanged** |
+
+### The reachability chain
+
+Both arch-12 k-grouped FP8 entry points land on this assert. Verified by reading each hop:
+
+1. `tests/generators.py:253` — `enumerate_k_grouped_contiguous` gives arch 12 **both** major
+   pairs for FP8: `(MNMajor, MNMajor)` and `(KMajor, KMajor)`. `tests/test_fp8_fp4.py:232`
+   routes K-major to `k_grouped_fp8_gemm_nt_contiguous` and MN-major to
+   `k_grouped_fp8_gemm_tn_contiguous`, so **both** arms below are exercised.
+2. The SF is **float32** on every path. `generate_k_grouped_contiguous` calls
+   `per_channel_cast_to_fp8` (`deep_gemm/utils/math.py:52`), whose `sf = x_amax / 448.0` is
+   float32; `ceil_to_ue8m0` (`:13`) round-trips through `.view(torch.int)` and back to
+   `.view(torch.float)`, so `use_ue8m0` does not change the dtype. The empty-group fallback
+   (`tests/generators.py:555`) is explicitly `dtype=torch.float`.
+3. `csrc/apis/gemm.hpp:427-428` (`k_grouped_fp8_gemm_nt_contiguous`, which pins
+   `recipe == (1,1,128)` at `:402`) and `csrc/apis/gemm.hpp:380-381` (the arch-12 arm of
+   `k_grouped_fp8_gemm_tn_contiguous`) both call
+   `layout::transform_k_grouped_sf_into_required_layout`.
+4. `csrc/apis/layout.hpp:99-100` — row 3 of the `csrc/apis/layout.hpp` table above already
+   admits arch 12.
+5. `csrc/apis/layout.hpp:108` — `sf.scalar_type() == kFloat and (arch_major == 10 or arch_major
+   == 12)` is therefore **true**, and `:125` calls
+   `get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor`.
+6. `csrc/jit_kernels/impls/smxx_layout.hpp:226` — the assert. Before this widening it demanded
+   `arch_major == 10`, so **every arch-12 k-grouped FP8 call aborted here.**
+
+The INT (pre-packed UE8M0) path is no escape: it needs `gran_k == 32`
+(`csrc/apis/layout.hpp:128`), and the NT entry point pins `gran_k == 128`, so an INT SF there
+falls through to `DG_HOST_UNREACHABLE("Unknown cases")` instead.
+
+### Why the `== 12` re-derivation could never have found this
+
+The file contained **no** `arch_major == 12` and no `== 12)` before this edit — the bug was a
+`== 10` that needed widening, in a file no table listed. Every re-derivation recipe in this
+document greps for `12`, so all of them returned clean. Rebase step 4 exists to close exactly
+this gap; this file is its worked example.
+
+### Failure mode if a rebase drops this row
+
+**Loud, not silent.** `DG_HOST_ASSERT` fires at the top of the packer, before any data is
+touched, so both k-grouped FP8 entry points abort cleanly on SM120 rather than returning wrong
+numbers. That makes it the least dangerous row in this document to lose — but it is still
+sm120-only and therefore invisible to every check that runs here.
+
+### No-regression check for this row
+
+`tests/test_layout.py` drives `get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor` directly
+and is the cheapest check that the widening did not disturb the arch-10 path — run it after any
+rebase that touches this file:
+
+```bash
+PYTHONPATH="$PWD" python tests/test_layout.py    # rc=0 on this sm100 host
+```
+
+It exercises **only** arch 10 here, as everything does. It says nothing about arch 12.
+
+### Relationship to `origin/nv_dev`
+
+`nv_dev`'s `smxx_layout.hpp` contains **no** `arch_major` reference at all
+(`git show origin/nv_dev:csrc/jit_kernels/impls/smxx_layout.hpp | grep arch_major` → empty), and
+the file has diverged wholesale since the fork (`dev` replaced the `LaunchRuntime` machinery).
+The assert is 26/09 `dev` drift, like row 3 of the `csrc/apis/layout.hpp` table. Do **not** try
+to re-derive this edit from `nv_dev`.
 
 ## Deviations from `nv_dev`, collected
 

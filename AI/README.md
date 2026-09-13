@@ -71,6 +71,14 @@ into the SM90 path.
 `sm120_touchpoints.md` tabulates all 37 per site, with the re-derivation commands. That manual
 diff is the only defence that exists.
 
+**And the enumeration itself has a blind spot.** Those 37 all live in the six files the Task 13
+sweep scoped. A **thirteenth** upstream-owned file, `csrc/jit_kernels/impls/smxx_layout.hpp`,
+was found later: a `get_arch_major() == 10` assert that needed widening, reached indirectly from
+`csrc/apis/layout.hpp`. Because it contained no `== 12`, every re-derivation grep in
+`sm120_touchpoints.md` returned clean while both k-grouped FP8 entry points aborted on SM120.
+Rebase step 4 in that document now greps the `== 10` predicates for the same class of miss. A
+rebaser who runs only the `== 12` greps will repeat the mistake.
+
 ## Deliberate divergences from `nv_dev`
 
 Three, all intentional. Do not "fix" them by re-syncing from `nv_dev` without reading why.

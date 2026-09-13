@@ -20,6 +20,9 @@
 //     CuTe include graph -- which also makes it checkable with a preprocessor-only probe
 //     (AI/tools/check_sm120_cuda_guard.sh).
 //
+// The same guard is duplicated in `mma/sm120.cuh`, the file that actually emits the
+// `block_scale` MMA PTX, so coverage there is structural rather than incidental.
+//
 // Coverage: the 8 sm120 kernels that issue block-scaled/FP8 MMA all include this header.
 // `impls/sm120_split_k_reduce.cuh` and `scheduler/sm120_paged_mqa_logits.cuh` do not -- they
 // are plain FP32 reduce / metadata kernels with no MMA, so they are outside the guard's remit.

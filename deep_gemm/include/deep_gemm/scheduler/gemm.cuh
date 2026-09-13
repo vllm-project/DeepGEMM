@@ -43,10 +43,20 @@ struct Scheduler {
     DG_STATIC_ASSERT(not is_k_grouped_contiguous(kGemmType) or kKAlignment % 128 == 0,
                      "K alignment must be a multiple of BLOCK_K (128)");
 
-    DG_STATIC_ASSERT(kSplitKFactor == 1 or kGemmType != GemmType::Batched,
-                     "Split-K is not supported for Batched GEMM: the Batched branch of "
-                     "get_next_block derives current_group_idx from the split-K-inflated "
-                     "num_blocks and never sets split_k_idx (same defect upstream in nv_dev)");
+    // Only `Normal` has both halves of split-K: the constructor inflates `num_blocks` by
+    // `kSplitKFactor`, and `get_next_block`'s final `else` decomposes the raw index back into
+    // `mn_block_idx` / `split_k_idx`. Every other `GemmType` has at most one half:
+    //   - `Batched` is inflated but its own branch never sets `split_k_idx`, and it derives
+    //     `current_group_idx` from the inflated `num_blocks` -- wrong group indexing;
+    //   - `MGroupedContiguous` falls into the same final `else` as `Normal` but is NOT
+    //     inflated, so `split_k_idx` is always 0 -- every block writes partition 0 and
+    //     partitions 1..n-1 keep the uninitialised workspace `sm120_split_k_reduce` sums.
+    // Both are silent wrong numerics, so encode the invariant rather than the two symptoms.
+    // The `Batched` defect also exists upstream in nv_dev; we deliberately do not fix it here.
+    DG_STATIC_ASSERT(kSplitKFactor == 1 or kGemmType == GemmType::Normal,
+                     "Split-K is only supported for Normal GEMM: it is the only GemmType whose "
+                     "constructor inflates num_blocks by kSplitKFactor AND whose get_next_block "
+                     "branch decomposes the index into mn_block_idx/split_k_idx");
 
     int current_iter = -1;
 

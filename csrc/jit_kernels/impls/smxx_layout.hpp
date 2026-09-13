@@ -221,7 +221,9 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
                                                                             const int gran_k,
                                                                             const int k_alignment,
                                                                             const bool& use_psum_layout) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0);
+    // SM120 reaches this packer through `csrc/apis/layout.hpp`'s FP32 k-grouped path.
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0);
     const auto [sf_k, mn] = get_shape<2>(sf);
     const auto num_groups = static_cast<int>(grouped_layout.numel());
 
