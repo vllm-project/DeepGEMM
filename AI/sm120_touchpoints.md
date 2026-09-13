@@ -59,14 +59,20 @@ hand:
 
 ```bash
 for f in gemm attention einsum hyperconnection layout; do
-  echo "=== $f"; grep -cE "arch_major == 12" csrc/apis/$f.hpp
+  echo "=== $f"; grep -cE "arch_major == 12|== 12\)" csrc/apis/$f.hpp
 done
-grep -cE "arch_major == 12" csrc/utils/layout.hpp    # must be 3
+grep -cE "arch_major == 12|== 12\)" csrc/utils/layout.hpp    # must be 3
 ```
 
-Expected counts for this branch (textual `arch_major == 12` occurrences, which exceed the
-edit-row counts where one edit contains two mentions): gemm **9**, attention **10**,
-einsum **9**, hyperconnection **1**, apis/layout **6**, utils/layout **3**.
+Expected counts for this branch (textual occurrences, which exceed the edit-row counts where
+one edit contains two mentions): gemm **9**, attention **10**, einsum **9**,
+hyperconnection **1**, apis/layout **6**, utils/layout **3**.
+
+Use the **same two-branch pattern** here as in the upstream re-derivation above. Today every
+arch-12 mention in our files goes through a local named `arch_major`, so the narrow pattern
+happens to give identical counts — but a rebase that pulls in upstream's
+`get_arch_major() == 12` phrasing would make the narrow pattern undercount here exactly as it
+does against `nv_dev`. Keep the patterns identical so the two sides stay comparable.
 
 ## deep_gemm/include/deep_gemm/scheduler/gemm.cuh
 
@@ -373,14 +379,23 @@ check above.
 
 ```bash
 for f in gemm attention einsum hyperconnection layout; do
-  echo "=== $f"; git show <upstream-sm120-ref>:csrc/apis/$f.hpp | grep -nE "arch_major == 12"
+  echo "=== $f"; git show <upstream-sm120-ref>:csrc/apis/$f.hpp | grep -nE "arch_major == 12|== 12\)"
 done
-git show <upstream-sm120-ref>:csrc/utils/layout.hpp | grep -nE "arch_major == 12"
+git show <upstream-sm120-ref>:csrc/utils/layout.hpp | grep -nE "arch_major == 12|== 12\)"
 ```
 
 Against `origin/nv_dev` that prints **9 / 11 / 7 / 1 / 5** for the api headers and **3** for
 `csrc/utils/layout.hpp` — 36 upstream sites. This branch realizes them in **37** edit points,
 because `dev` has diverged from `nv_dev` in several places (see "Deviations from nv_dev" below).
+
+**The second alternation branch `== 12\)` is load-bearing — do not simplify this pattern to
+just `arch_major == 12`.** `nv_dev` writes one site as
+`const int block_kv = (device_runtime->get_arch_major() == 12) ? 128 : 256;`
+(`nv_dev:csrc/apis/attention.hpp:157`), where the `== 12` is attached to the *call* rather than
+to a local named `arch_major`. The narrow pattern silently misses it and prints
+**9 / 10 / 7 / 1 / 5 = 32**, one short — which makes every count quoted in this document fail
+to reconcile and makes the whole enumeration look unverifiable. Verified against
+`origin/nv_dev`: the corrected pattern prints 9 / 11 / 7 / 1 / 5 = 33, the narrow one 32.
 
 ## Include discipline
 
@@ -520,6 +535,17 @@ which orientation was handed in.
 after the fork; without widening it, every arch-12 k-grouped call would abort before reaching
 row 4.
 
+**Row 3 retains a second strictness, also deliberately.** The widened assert keeps `dev`'s
+`k_alignment % 128 == 0` where `nv_dev` requires only `k_alignment % 32 == 0`
+(`nv_dev:csrc/apis/layout.hpp:103`), so arch 12 is stricter here than upstream. Loosening it
+would change the **SM100** path too, which this task must not do. In practice the retention is
+unreachable: every caller of `transform_k_grouped_sf_into_required_layout` already guarantees a
+multiple of 128 before calling — `csrc/apis/gemm.hpp:347` and `:705` assert
+`k_alignment % 128 == 0`, `:471` asserts `% 256 == 0`, and `:427` / `:428` pass the literal
+`128`. No call can therefore produce a `k_alignment` that `nv_dev` would accept and this branch
+rejects. If a future caller passes a 32- or 64-aligned value, loosen it for **both** arches in
+one deliberate change rather than special-casing arch 12.
+
 **Row 5 deliberately keeps `gran_k == 32`, where `nv_dev` has no granularity restriction on this
 path.** Dropping it would change the SM100 path too, and this task must not alter sm90/sm100
 behaviour. An sm120 INT (pre-packed UE8M0) k-grouped SF at `gran_k == 128` therefore still
@@ -538,12 +564,24 @@ three at its lines 58 / 67 / 80.
 | 2 | 73 | `check_grouped_ab_fp8_fp4` | same widening |
 | 3 | 86 | `get_default_recipe` | `} else if (arch_major == 10) {` becomes `} else if (arch_major == 10 or arch_major == 12) {` |
 
-Row 3 is load-bearing for `sm120_dispatch.hpp` itself: both `sm120::fp8_fp4_gemm_nt` (its
-line 111) and `sm120::fp8_fp4_bmm_swapped` (its line 182) call `get_default_recipe` whenever
-the caller supplies no recipe, and without this widening every such call hits
-`DG_HOST_UNREACHABLE("Unknown recipe")`. Rows 1 and 2 gate packed-FP4 operands; without them
-every FP4 shape check on arch 12 aborts, making the sm120 FP4 kernels unreachable through the
-public API.
+Row 3 is load-bearing, and its blast radius is wider than `sm120_dispatch.hpp`. **Three**
+callers of `get_default_recipe` are reachable from an arch-12 request:
+
+| Caller | Reached by |
+|---|---|
+| `csrc/apis/sm120_dispatch.hpp:111` (`sm120::fp8_fp4_gemm_nt`) | every default-recipe `fp8_fp4_gemm_nt` / `_nn` / `_tn` / `_tt` call on arch 12 |
+| `csrc/apis/sm120_dispatch.hpp:182` (`sm120::fp8_fp4_bmm_swapped`) | the small-M AB-swapped batched path |
+| **`csrc/apis/layout.hpp:73`** (`transform_sf_pair_into_required_layout`) | **every** default-recipe arch-12 m-grouped contiguous and m-grouped masked GEMM, plus the non-swapped `fp8_bmm` arm in `einsum.hpp` |
+
+The third is the one easiest to overlook: it is not in a file named `sm120_*`, and it is
+reached indirectly, because `transform_sf_pair_into_required_layout` fills in a default recipe
+for any caller that passes neither `recipe` nor `recipe_a`. Without the widening all three
+abort with `DG_HOST_UNREACHABLE("Unknown recipe")`.
+
+Rows 1 and 2 gate packed-FP4 operands; without them every FP4 shape check on arch 12 aborts,
+making the sm120 FP4 kernels unreachable through the public API. Row 2
+(`check_grouped_ab_fp8_fp4`) is additionally reached from `csrc/apis/mega_moe.hpp:190` and
+`:192`.
 
 ### Dropping these three rows fails at RUNTIME, not at compile time — nothing here catches it
 
@@ -564,15 +602,27 @@ this project has **no sm120 hardware**, that means a dropped row here is invisib
 check that exists. Re-verify these three by hand after every rebase:
 
 ```bash
-grep -n "arch_major == 12" csrc/utils/layout.hpp   # must print 3 lines
+grep -nE "arch_major == 12|== 12\)" csrc/utils/layout.hpp   # must print 3 lines
 ```
 
 The same reasoning applies to the `csrc/apis/layout.hpp` rows and to every predicate widening
-in the attention table: widenings are runtime conditions and are invisible to the gates. Only
-the **dispatch arms** fail loudly if dropped, and even then only as a
-`DG_HOST_UNREACHABLE("Unsupported architecture")` at runtime rather than a build break. The
+in the attention table: widenings are runtime conditions and are invisible to the gates. The
 build is a real type-check of the arms that are *present*; it can say nothing about arms that
 are *absent*.
+
+**How loudly a dropped edit fails varies, and a rebaser should not expect one signature.**
+Three distinct behaviours:
+
+| Dropped edit | What happens on SM120 |
+|---|---|
+| A dispatch arm whose `if` / `else if` chain ends in `DG_HOST_UNREACHABLE` — every arm in `gemm.hpp` and `attention.hpp`, and `einsum.hpp`'s three BF16 arms | clean `DG_HOST_UNREACHABLE("Unsupported architecture")` abort |
+| **`einsum.hpp`'s `fp8_bmm` arm (row 6 of that table)** | **no clean abort.** That chain ends in an *unguarded* `else` calling `sm90_fp8_bmm` (ours, `csrc/apis/einsum.hpp:228-232`), so arch 12 silently routes into the **SM90** path and surfaces later as a JIT / device-compile failure. Loud, but not the clean abort the rest of this section promises. The code is faithful to `nv_dev` here; only the failure mode differs. |
+| Either attention constant (`block_kv`, `split_kv`) | **self-detecting downstream**, not silent: `csrc/jit_kernels/impls/sm120_mqa_logits.hpp:487` and `:625` assert `split_kv == 128`, and `deep_gemm/include/deep_gemm/impls/sm120_fp8_mqa_logits.cuh:58` static-asserts `BLOCK_KV == kNumMathWarps * MMA_M`. Reverting either constant to 256 trips one of those. |
+
+All three are still **runtime and sm120-only** — none reaches a host without SM120 silicon, so
+none of them changes the conclusion above. The table exists only so a rebaser knows that the
+`fp8_bmm` arm misroutes rather than aborting, and that the two attention constants are the one
+category of dropped edit this port can actually detect.
 
 ## Deviations from `nv_dev`, collected
 
