@@ -5,6 +5,57 @@ then run `AI/tools/check_sm120.sh` and the no-regression check below.
 
 **Rule: any change to an upstream-owned file updates this file in the same commit.**
 
+## Rebase procedure
+
+Category A files never conflict — upstream does not have them:
+`deep_gemm/include/deep_gemm/{mma,common,impls,scheduler}/sm120_*.cuh`,
+`deep_gemm/include/deep_gemm/mma/sm120.cuh`, `csrc/jit_kernels/heuristics/sm120.hpp`,
+`csrc/jit_kernels/impls/sm120_*.hpp`, `csrc/apis/sm120_dispatch.hpp`, and everything under
+`AI/`. Everything that *can* conflict is tabulated in this file.
+
+1. Rebase or merge onto the new upstream.
+2. For each conflict in an upstream-owned file, find its section below and reapply those rows.
+   **Do not re-derive the edit from `origin/nv_dev`.** That branch is on the 26/07 infra; its
+   version of these files will not apply, and its test enumerations encode different kernel
+   constraints — see "Deviations from `nv_dev`, collected".
+3. Re-derive the site list from the new upstream and diff it against the tables here **by
+   hand** — see "How to re-derive this list after a rebase". This is the only defence against a
+   silently dropped dispatch arm; "READ THIS BEFORE TRUSTING A GREEN CHECKMARK" explains why no
+   gate in this repo catches one.
+4. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120.sh` — every device kernel compiles and
+   emits its expected MMA opcode. Was `pass=23 fail=0` when this was written.
+5. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_host.sh` — every sm120 host header
+   compiles. Was `pass=7 fail=0`.
+6. `CUDA_HOME=/usr/local/cuda-13.1 ./AI/tools/check_sm120_cuda_guard.sh` — the CUDA>=13 guard in
+   `deep_gemm/common/sm120_utils.cuh` still fires on 12.x and stays silent on 13.x, on host
+   passes, and on sm90/sm100 device passes. Was `pass=5 fail=0` (6 where a CUDA 12.x toolkit is
+   installed; that one check is skipped otherwise).
+7. `touch csrc/python_api.cpp && CUDA_HOME=/usr/local/cuda-13.1 python setup.py build_ext --inplace`
+   — the extension must build. The `touch` is **required**; see "Host-side no-regression check —
+   and its false-green trap".
+8. If `deep_gemm/include/deep_gemm/scheduler/gemm.cuh` conflicted, re-run the **four-step**
+   no-regression check in "No-regression check" below — all four steps, including step 3, the
+   sensitivity probe.
+
+   **Do not substitute a bare `cmp` of two cubins for steps 1-3.** nvcc 13.1 is not
+   byte-deterministic: it embeds a per-compilation cookie, so two compiles of *identical*
+   source already differ and `cmp` reports a difference that means nothing. The recipe below
+   normalises the cookie (or compares `.text` directly), and the sensitivity probe is what
+   proves the comparison is capable of reporting a difference at all. A probe that reports
+   `IDENTICAL` means the comparison is broken, not that the change is inert.
+9. Re-run the standalone test scripts under the conditions in "Verification for this part"
+   (`PYTHONPATH` pinned to the repo root, plus the two `deep_gemm/include` symlinks). They are
+   **not** pytest, and four of them cannot run on a 4-GPU host at all — that table lists which.
+10. If a new field appears in `PipelineConfig`, `Layout`, `GemmDesc`, or the `ArchSpec`
+    interface, check whether `SM120ArchSpec` (`csrc/jit_kernels/heuristics/sm120.hpp`) must
+    populate it. A field it does not set takes a silent default; it is not a compile error.
+11. If `tests/generators.py`, `tests/test_attention.py`, `tests/test_fp8_fp4.py` or
+    `tests/test_einsum.py` conflicted, recheck each arch-12 enumeration row against the host
+    assert it cites. Those asserts are the source of truth; the enumeration only restates them.
+
+**Still unverified on real hardware: all numerics and all performance heuristics.** Read
+`AI/README.md` before drawing any conclusion from a green run.
+
 ## Inventory
 
 | Upstream file | Edits | Added by |
@@ -17,11 +68,15 @@ then run `AI/tools/check_sm120.sh` and the no-regression check below.
 | `csrc/apis/layout.hpp` | 5 | Task 13 (dispatch) |
 | `csrc/apis/hyperconnection.hpp` | 2 | Task 13 (dispatch) |
 | `csrc/utils/layout.hpp` | 3 | Task 13 (dispatch) |
+| `tests/generators.py` | 2 | Task 14 (test gating) |
+| `tests/test_attention.py` | 2 | Task 14 (test gating) |
+| `tests/test_fp8_fp4.py` | 3 | Task 14 (test gating) |
+| `tests/test_einsum.py` | 4 | Task 14 (test gating) |
 
 Everything else this branch adds is a **new** file (Category A: `deep_gemm/{mma,common,impls,scheduler}/sm120_*.cuh`,
 `csrc/jit_kernels/heuristics/sm120.hpp`, `csrc/jit_kernels/impls/sm120_*.hpp`,
 `csrc/apis/sm120_dispatch.hpp`, `AI/tools/**`) and
-cannot conflict on rebase. As of this commit, the eight files above are the only upstream-owned
+cannot conflict on rebase. As of this commit, the twelve files above are the only upstream-owned
 files the branch modifies. Verify that claim after any rebase with:
 
 ```bash
@@ -703,3 +758,134 @@ record them as passes:
 widening adds a disjunct and cannot change the arch-10 result, but it is **not** covered by any
 runnable test here. Re-run that script on an 8-GPU host after any rebase that touches
 `csrc/utils/layout.hpp`.
+
+---
+
+# Category B, part 3 — test gating (Task 14)
+
+Four `tests/*.py` files are upstream-owned and gain arch-12 enumeration rows. Unlike the
+dispatch edits, these rows do not change any `csrc/` behaviour: dropping one can only make the
+suite enumerate a case SM120 rejects (a loud `DG_HOST_ASSERT` on sm120 hardware) or stop
+enumerating a case SM120 supports (lost coverage). Neither is visible on sm90/sm100.
+
+**Every arch-12 row restates a host assert or a `DG_STATIC_ASSERT`; those are the source of
+truth.** The comment on each row names the file and condition it restates. On rebase, recheck
+the assert before the enumeration.
+
+## tests/generators.py — 2 edits
+
+| # | Anchor | Edit |
+|---|---|---|
+| 1 | `QuantConfig.get_list_from_dtype`, after the `arch_major == 10` branch | add `elif get_arch_major() == 12:` appending `(32, 32, True, True)` (FP4xFP4), `(128, 32, False, True)` (FP8_A x FP4_B) and `(32, 128, True, False)` (FP4_A x FP8_B, the swapAB / `kAIsFP4` orientation) |
+| 2 | `enumerate_k_grouped_contiguous` | scalar `major_a, major_b` becomes a `major_pairs` list; arch 12 + FP8 yields **both** `(MNMajor, MNMajor)` (the TN entry point) and `(KMajor, KMajor)` (the NT entry point). The body is wrapped in `for major_a, major_b in major_pairs:`, and the K-major FP8 case narrows to `gran_k == 128` and `cd_options == [(True, torch.float)]` because `k_grouped_fp8_gemm_nt_contiguous` pins `recipe == (1, 1, 128)` and requires a `c` (`csrc/apis/gemm.hpp`). |
+
+Edit 2 is inert for every other arch: SM90 FP8 and FP4 already yielded a single K-major pair,
+everything else a single MN-major pair, so the added loop has length 1 and the narrowing is a
+no-op (SM90's SF-layout list is already `[(128, 128)]` and its `cd_options` already
+`[(True, torch.float)]`).
+
+Verified by A/B against the pre-edit file, with `get_arch_major` monkeypatched so all three
+arches are comparable on this (arch-10) host:
+
+| Enumerator | arch 9 | arch 10 | arch 12 |
+|---|---|---|---|
+| `QuantConfig.get_list_from_dtype` (FP8) | identical | identical | 1 → 4 configs |
+| `enumerate_k_grouped_contiguous` (FP8) | identical | identical | 126 → 147 rows |
+| `enumerate_k_grouped_contiguous` (BF16, FP4) | identical | identical | identical |
+| `enumerate_normal` (FP8, BF16) | — | identical | — |
+
+The 21 extra arch-12 k-grouped rows are exactly the new K-major/NT arm: 7 shapes × 3 SF layouts
+with `gran_k == 128` × 1 `cd_option`. `enumerate_normal` was compared on this host only, where
+it runs for real; it is untouched by these edits.
+
+## tests/test_attention.py — 2 edits
+
+| # | Anchor | Edit |
+|---|---|---|
+| 1 | `test_mqa_logits.enumerate_mqa_logits` | arch 12 gets `fmts = ('mxfp4', 'fp8')` (no MXFP8 kernel); `clean_logits` is forced off; FP4 `head_dims` narrows to `(128, )` |
+| 2 | `test_paged_mqa_logits.enumerate_paged_mqa_logits` | varlen widens to `arch_major in (10, 12)`; arch 12 gets `fmts = ('mxfp4', 'fp8')`, `block_kvs = (32, 64)` for FP4 and `(64, )` for FP8, and FP4 `head_dims = (128, )` |
+
+The asserts each row restates:
+
+| Row | Restates |
+|---|---|
+| MXFP8 excluded on arch 12 | `DG_HOST_ASSERT(arch_major == 10 or (arch_major == 12 and is_fp4))` guarding the MX scaling factor, `csrc/apis/attention.hpp` (dense and paged) |
+| `clean_logits` off on arch 12 | `DG_HOST_ASSERT(not clean_logits)` in the arch-12 dense arm — see "Deviations from `nv_dev`": this lineage deleted `smxx_clean_logits` and the sm120 kernels have no fused cleaning. **`nv_dev` does not have this restriction**; it is specific to this branch. |
+| FP4 `head_dim == 128` | `DG_STATIC_ASSERT(kHeadDim == 128, "FP4 MQA only supports head_dim=128")` in `sm120_fp4_mqa_logits.cuh:61` and `sm120_fp4_paged_mqa_logits.cuh:63`, and `DG_HOST_ASSERT(head_dim == 128)` in `csrc/jit_kernels/impls/sm120_mqa_logits.hpp:249` |
+| varlen on arch 12 | `DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and next_n == 1)` in the paged varlen block |
+| `block_kv` on arch 12 | the `arch_major == 12` clause of the fused-KV-cache assert (`(is_fp4 and (block_kv == 32 or block_kv == 64)) or (not is_fp4 and block_kv == 64)`), plus `DG_HOST_ASSERT(block_kv == 64)` in the FP8 paged launcher |
+
+Both edits are inert on arch 9 and 10: every ternary keeps its existing arm for those arches,
+and the only non-arch-12 rewrite is `block_kvs`, whose `else` branch is `(64, )` — the literal
+the original expression produced for every non-10 arch. Verified by A/B against the pre-edit
+file, with `arch_major` stubbed (the enumerators are closures, so their source is lifted out by
+text and exec'd — no GPU needed):
+
+| Enumerator | arch 9 | arch 10 | arch 12 |
+|---|---|---|---|
+| `enumerate_mqa_logits` | 192 → 192, identical | 2304 → 2304, identical | 192 → 128 |
+| `enumerate_paged_mqa_logits` | 24 → 24, identical | 4320 → 4320, identical | 24 → 120 |
+
+The arch-12 dense count *falls* because `clean_logits` halves the case set and MXFP4 re-adds
+only `head_dim == 128`; the paged count rises because varlen, MXFP4 and `block_kv == 32` are
+all newly reachable.
+
+## tests/test_fp8_fp4.py — 3 edits
+
+| # | Anchor | Edit |
+|---|---|---|
+| 1 | import block | add `MajorTypeAB` to the `from generators import (...)` list |
+| 2 | `test_gemm`, after `recipe, recipe_a, recipe_b = ...` | `continue` when `is_mixed_fp4 and get_arch_major() == 12 and k % 128 != 0` |
+| 3 | `test_k_grouped_gemm_contiguous` | the FP8 entry point is selected **per case** from `major_a` (`select_fp8_gemm`) instead of per arch; the FP4 option becomes a `lambda` that ignores `major_a` |
+
+Edit 2 restates `DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0)` in `csrc/apis/sm120_dispatch.hpp`
+(and the identical assert in the arch-12 arm of `m_grouped_fp8_fp4_gemm_nt_contiguous`,
+`csrc/apis/gemm.hpp`). It is reachable: the backward shapes in `enumerate_normal` put `k` at
+2112 and 576, neither a multiple of 128.
+
+Edit 3 is behaviour-preserving for arch 9 and 10. Arch 9 FP8 yields only K-major, so
+`select_fp8_gemm` returns `k_grouped_fp8_gemm_nt_contiguous` exactly where the old
+`arch_major == 9` test did; arch 10 FP8 yields only MN-major, so it returns the TN entry point;
+the FP4 option is unchanged.
+
+## tests/test_einsum.py — 4 edits
+
+| # | Anchor | Edit |
+|---|---|---|
+| 1 | module scope, above `test_bmk_bnk_mn` | add `assert_bf16_einsum_close(z, ref_z, fp32_ref_fn=None)` |
+| 2 | `test_bhr_hdr_bhd` | replace `assert calc_diff(z, ref_z) < 1e-10` with the helper, passing an FP32-truth thunk |
+| 3 | `test_bhd_hdr_bhr` | same |
+| 4 | `test_bhd_bhr_hdr` | same, with no thunk — `ref_z` there is already the FP32 truth |
+
+On any arch other than 12 the helper is exactly the old `assert calc_diff(z, ref_z) < 1e-10`
+and the thunk is never called, so there is no extra work and no tolerance change on sm90/sm100.
+On arch 12 it relaxes the BF16-vs-BF16 comparison to `1e-7` and adds a `1e-5` check against an
+FP32 reference: DeepGEMM and the cuBLAS/torch reference differ only in FP32 accumulation order,
+which is a few ULPs past `1e-10`. **That tolerance choice is inherited from `nv_dev` and has
+never been observed on hardware from this branch.**
+
+## Re-deriving the test rows after a rebase
+
+```bash
+for f in tests/generators.py tests/test_attention.py tests/test_fp8_fp4.py tests/test_einsum.py; do
+  printf '%-26s %s\n' "$f" \
+    "$(grep -vE '^[[:space:]]*#' "$f" | grep -cE 'arch_major(\(\))? *(==|!=) *12|arch_major in \(10, 12\)')"
+done
+```
+
+Expected for this branch (code lines only, comments excluded): `generators.py` **2**,
+`test_attention.py` **7**, `test_fp8_fp4.py` **1**, `test_einsum.py` **1**. `test_fp8_fp4.py`
+edits 1 and 3 and `test_einsum.py` edits 2-4 carry no literal `12`, so the count is a lower
+bound — check the tables above as well.
+
+## What these rows are NOT
+
+They do not make any sm120 test runnable here. This host reports capability 10.0; every
+arch-12 row above is dead code on it, and the arch-9/arch-10 enumerations are identical to their
+pre-Task-14 form (verified above). **No sm120 test case in this repo has ever been executed.**
+
+Runtime confirmation on this host (arch 10), with `PYTHONPATH` and the include symlinks set:
+`test_einsum.py`, `test_attention.py` (`DG_MQA_NUM_CASES=40`), `test_fp8_fp4.py`,
+`test_bf16.py`, `test_layout.py`, `test_legacy.py`, `test_hyperconnection.py` and
+`test_lazy_init.py` all exit `0`. That proves no sm90/sm100 regression; it proves nothing about
+arch 12.

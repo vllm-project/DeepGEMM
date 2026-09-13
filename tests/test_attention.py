@@ -143,19 +143,29 @@ def test_mqa_logits():
         return ks, ke
 
     def enumerate_mqa_logits():
-        # Formats: 'fp8' (per-KV float scale), 'mxfp4' / 'mxfp8' (per-32 block scale, SM100 only)
-        fmts = ('mxfp4', 'mxfp8', 'fp8') if get_arch_major() == 10 else ('fp8', )
+        arch_major = get_arch_major()
+        # Formats: 'fp8' (per-KV float scale), 'mxfp4' / 'mxfp8' (per-32 block scale).
+        # SM120 has an MXFP4 kernel but no MXFP8 one: csrc/apis/attention.hpp accepts an MX
+        # scaling factor only via `arch_major == 10 or (arch_major == 12 and is_fp4)`.
+        fmts = ('mxfp4', 'mxfp8', 'fp8') if arch_major == 10 else \
+               (('mxfp4', 'fp8') if arch_major == 12 else ('fp8', ))
         for fmt in fmts:
             is_mxfp4 = fmt == 'mxfp4'
             for logits_dtype in (torch.bfloat16, torch.float):
-                for weights_dtype in ((torch.float, torch.bfloat16) if get_arch_major() == 10 else (torch.float, )):
+                for weights_dtype in ((torch.float, torch.bfloat16) if arch_major == 10 else (torch.float, )):
                     if weights_dtype == torch.bfloat16 and logits_dtype == torch.float:
                         continue
-                    for compressed_logits, clean_logits in [(False, True), (True, False)]:
+                    # SM120 refuses `clean_logits`: its kernels have no fused cleaning and this
+                    # lineage dropped the standalone `smxx_clean_logits` kernel, so
+                    # csrc/apis/attention.hpp asserts `not clean_logits` on arch 12.
+                    cl_options = [(True, False)] if arch_major == 12 else [(False, True), (True, False)]
+                    for compressed_logits, clean_logits in cl_options:
                         for seq_len in (2048, 8192):
                             for seq_len_kv in (8192, 65536):
-                                head_dims = (64, 128) if is_mxfp4 else (32, 64, 128)
-                                heads = (8, 12, 16, 20, 32, 64) if get_arch_major() == 10 else (32, 64)
+                                # SM120 FP4 MQA is head_dim=128 only -- `DG_STATIC_ASSERT(kHeadDim == 128)`
+                                # in deep_gemm/impls/sm120_fp4_mqa_logits.cuh.
+                                head_dims = ((128, ) if arch_major == 12 else (64, 128)) if is_mxfp4 else (32, 64, 128)
+                                heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else (32, 64)
                                 for num_heads in heads:
                                     for head_dim in head_dims:
                                         for disable_cp in (False, True):
@@ -353,20 +363,40 @@ def test_paged_mqa_logits():
         arch_major = get_arch_major()
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_varlen_tokens = 16 * 1024
-        for is_varlen in ((False, True) if arch_major == 10 else (False, )):
-            for fmt in (('mxfp4', 'mxfp8', 'fp8') if arch_major == 10 else ('fp8', )):
+        # Varlen is SM100/SM120-only: the SM90 paged kernel rejects it, and
+        # csrc/apis/attention.hpp asserts `(arch_major == 10 or arch_major == 12) and next_n == 1`.
+        for is_varlen in ((False, True) if arch_major in (10, 12) else (False, )):
+            # SM120 has an MXFP4 paged kernel but no MXFP8 one: MX scaling factors need
+            # `arch_major == 10 or (arch_major == 12 and is_fp4)`.
+            fmts = ('mxfp4', 'mxfp8', 'fp8') if arch_major == 10 else \
+                   (('mxfp4', 'fp8') if arch_major == 12 else ('fp8', ))
+            for fmt in fmts:
                 is_mxfp4 = fmt == 'mxfp4'
                 for logits_dtype in (torch.bfloat16, torch.float):
                     for weights_dtype in ((torch.float, torch.bfloat16) if arch_major == 10 else (torch.float, )):
                         if weights_dtype == torch.bfloat16 and logits_dtype == torch.float:
                             continue
-                        for block_kv in ((128, 32, 64, ) if arch_major == 10 else (64, )):
+                        # SM120 block_kv: FP4 takes 32 or 64, FP8 only 64 -- the `arch_major == 12`
+                        # clause of the fused-KV-cache assert in csrc/apis/attention.hpp, plus
+                        # `DG_HOST_ASSERT(block_kv == 64)` in the FP8 paged launcher
+                        # (csrc/jit_kernels/impls/sm120_mqa_logits.hpp).
+                        if arch_major == 10:
+                            block_kvs = (128, 32, 64)
+                        elif arch_major == 12:
+                            block_kvs = (32, 64) if is_mxfp4 else (64, )
+                        else:
+                            block_kvs = (64, )
+                        for block_kv in block_kvs:
                             for use_2d_context_lens, clean_logits in [(True, False)]:
                                 for batch_size in (256, 4096):
                                     for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2))):
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
                                             heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else (32, 64)
-                                            head_dims = (64, 128) if is_mxfp4 else ((32, 64, 128) if arch_major == 10 else (128, ))
+                                            # SM120 FP4 MQA is head_dim=128 only
+                                            # (`DG_STATIC_ASSERT(kHeadDim == 128)` in
+                                            # deep_gemm/impls/sm120_fp4_paged_mqa_logits.cuh).
+                                            head_dims = ((128, ) if arch_major == 12 else (64, 128)) if is_mxfp4 else \
+                                                        ((32, 64, 128) if arch_major == 10 else (128, ))
                                             for num_heads in heads:
                                                 for head_dim in head_dims:
                                                     for avg_kv in (8192, 65536):

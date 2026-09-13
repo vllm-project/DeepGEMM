@@ -15,7 +15,7 @@ from utils import (
 )
 
 from generators import (
-    KernelType, QuantConfig, get_ue8m0_usage,
+    KernelType, MajorTypeAB, QuantConfig, get_ue8m0_usage,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
@@ -35,6 +35,13 @@ def test_gemm() -> None:
         use_ue8m0 = get_ue8m0_usage(kernel_type)
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes(is_wgrad=(kernel_type.is_1d1d() and accumulate))
+
+        # SM120 mixed FP8xFP4 is K-major only and the 16U4_ALIGN16B TMA constraint makes
+        # `k % 128 == 0` mandatory -- `DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0)` in
+        # csrc/apis/sm120_dispatch.hpp. Skip the shapes the kernel cannot take.
+        is_mixed_fp4 = quant_config.is_fp4_a != quant_config.is_fp4_b
+        if is_mixed_fp4 and get_arch_major() == 12 and k % 128 != 0:
+            continue
 
         for test_alias in (False, True):
             for use_alpha in use_alpha_options:
@@ -217,20 +224,27 @@ def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped GEMM:')
 
     arch_major = get_arch_major()
-    test_options = [(torch.float8_e4m3fn, QuantConfig(),
-                     deep_gemm.k_grouped_fp8_gemm_nt_contiguous if arch_major == 9 else
-                     deep_gemm.k_grouped_fp8_gemm_tn_contiguous)]
+
+    # The K-major/MN-major choice is the entry point: K-major is NT, MN-major is TN.
+    # SM90 FP8 is K-major, SM120 FP8 yields both, everything else is MN-major -- so select
+    # per case rather than per arch (see `enumerate_k_grouped_contiguous`).
+    def select_fp8_gemm(major_a: MajorTypeAB):
+        return (deep_gemm.k_grouped_fp8_gemm_nt_contiguous if major_a.is_k_major()
+                else deep_gemm.k_grouped_fp8_gemm_tn_contiguous)
+
+    test_options = [(torch.float8_e4m3fn, QuantConfig(), select_fp8_gemm)]
     if arch_major == 10:
         test_options.append((torch.float4_e2m1fn_x2, QuantConfig((32, 32, True, True)),
-                             deep_gemm.k_grouped_fp4_gemm_nt_contiguous))
+                             lambda major_a: deep_gemm.k_grouped_fp4_gemm_nt_contiguous))
     use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
-    for dtype, quant_config, gemm in test_options:
+    for dtype, quant_config, select_gemm in test_options:
         is_fp4 = dtype == torch.float4_e2m1fn_x2
         dtype_opt = 'FP4' if is_fp4 else 'FP8'
 
         for num_groups, m, n, major_a, major_b, real_ks_cpu, _, _, gran_k, k_alignment, use_psum_layout, accumulate, out_dtype in \
                 enumerate_k_grouped_contiguous(dtype):
             recipe = (1, 1, gran_k)
+            gemm = select_gemm(major_a)
 
             for test_real_ks_cpu in enumerate_k_grouped_contiguous_test_variants(real_ks_cpu):
                 total_k, a, b, c, d, ref_d, grouped_layout, host_ks_cpu = generate_k_grouped_contiguous(

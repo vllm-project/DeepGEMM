@@ -83,6 +83,15 @@ class QuantConfig:
         if get_arch_major() == 10:
             quant_config_list.append(QuantConfig((128, 32, False, True)))
             quant_config_list.append(QuantConfig((32, 32, True, True)))
+        elif get_arch_major() == 12:
+            # SM120: FP4xFP4, then both mixed orientations. FP8_A x FP4_B takes the normal
+            # path; FP4_A x FP8_B is the swapAB orientation (`kAIsFP4` in
+            # csrc/jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp). Either mixed orientation
+            # additionally requires `k % 128 == 0` -- `DG_HOST_ASSERT(!is_mixed_fp4 or
+            # k % 128 == 0)` in csrc/apis/sm120_dispatch.hpp -- so callers skip other shapes.
+            quant_config_list.append(QuantConfig((32, 32, True, True)))
+            quant_config_list.append(QuantConfig((128, 32, False, True)))
+            quant_config_list.append(QuantConfig((32, 128, True, False)))
         return quant_config_list
 
 
@@ -234,32 +243,47 @@ def enumerate_k_grouped_contiguous(dtype: torch.dtype):
     else:
         sf_layout_list = ([(128, 128)] if get_arch_major() == 9 else
                           [(32, 128), (128, 128), (32, 256), (128, 256), (32, 384), (128, 384)])
-    # Only K-major is supported for SM90 FP8
+    # SM90 FP8 is K-major (the NT entry point); SM120 FP8 supports both NT and TN;
+    # all other cases are MN-major (the TN entry point). The consumer picks the entry point
+    # from `major_a`, so a K-major pair here means `k_grouped_fp8_gemm_nt_contiguous`.
     if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
-        major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
+        major_pairs = [(MajorTypeAB.KMajor, MajorTypeAB.KMajor)]
     elif dtype == torch.float4_e2m1fn_x2:
-        major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
+        major_pairs = [(MajorTypeAB.KMajor, MajorTypeAB.KMajor)]
+    elif get_arch_major() == 12 and dtype == torch.float8_e4m3fn:
+        major_pairs = [(MajorTypeAB.MNMajor, MajorTypeAB.MNMajor),
+                       (MajorTypeAB.KMajor, MajorTypeAB.KMajor)]
     else:
-        major_a, major_b = MajorTypeAB.MNMajor, MajorTypeAB.MNMajor
+        major_pairs = [(MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)]
     psum_list = (False, True) if get_arch_major() == 10 else (False, )
     if get_arch_major() == 9:
         cd_options = [(True, torch.float)]
     else:
         cd_options = [(True, torch.float), (False, torch.float), (False, torch.bfloat16)]
 
-    # NOTES: the first shape has many small groups, for stressing the SM90 in-place tensor map update
-    for num_groups, m, n, expected_k_per_group in (( 8,  768, 2048,  128),
-                                                   ( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
-                                                   ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
-                                                   (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
-        real_ks_cpu = [max(1, int(expected_k_per_group * random.uniform(0.7, 1.3))) for _ in range(num_groups)]
-        for use_psum_layout in psum_list:
-            for gran_k, k_alignment in sf_layout_list:
-                set_mk_alignment_for_contiguous_layout(k_alignment)
-                aligned_ks_cpu = [align(k, k_alignment) for k in real_ks_cpu]
-                for accumulate, out_dtype in cd_options:
-                    yield (num_groups, m, n, major_a, major_b, real_ks_cpu, aligned_ks_cpu,
-                           expected_k_per_group, gran_k, k_alignment, use_psum_layout, accumulate, out_dtype)
+    for major_a, major_b in major_pairs:
+        # `k_grouped_fp8_gemm_nt_contiguous` (the K-major FP8 entry point) pins
+        # `recipe == (1, 1, 128)` and requires a `c` -- see csrc/apis/gemm.hpp. SM90 already
+        # encodes that above by being K-major-only with a single `(128, 128)` SF layout and
+        # `cd_options == [(True, torch.float)]`; SM120 reaches the same entry point from a
+        # wider set, so narrow it here instead of globally.
+        is_fp8_nt = dtype == torch.float8_e4m3fn and major_a.is_k_major()
+        case_sf_layouts = [(g, a) for g, a in sf_layout_list if g == 128] if is_fp8_nt else sf_layout_list
+        case_cd_options = [(True, torch.float)] if is_fp8_nt else cd_options
+
+        # NOTES: the first shape has many small groups, for stressing the SM90 in-place tensor map update
+        for num_groups, m, n, expected_k_per_group in (( 8,  768, 2048,  128),
+                                                       ( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
+                                                       ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
+                                                       (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
+            real_ks_cpu = [max(1, int(expected_k_per_group * random.uniform(0.7, 1.3))) for _ in range(num_groups)]
+            for use_psum_layout in psum_list:
+                for gran_k, k_alignment in case_sf_layouts:
+                    set_mk_alignment_for_contiguous_layout(k_alignment)
+                    aligned_ks_cpu = [align(k, k_alignment) for k in real_ks_cpu]
+                    for accumulate, out_dtype in case_cd_options:
+                        yield (num_groups, m, n, major_a, major_b, real_ks_cpu, aligned_ks_cpu,
+                               expected_k_per_group, gran_k, k_alignment, use_psum_layout, accumulate, out_dtype)
 
 
 def enumerate_k_grouped_contiguous_test_variants(real_ks_cpu: List[int]):
