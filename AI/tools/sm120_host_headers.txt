@@ -1,7 +1,0 @@
-csrc/jit_kernels/heuristics/sm120.hpp
-csrc/jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp
-csrc/jit_kernels/impls/sm120_bf16_gemm.hpp
-csrc/jit_kernels/impls/sm120_mqa_logits.hpp
-csrc/jit_kernels/impls/sm120_bmk_bnk_mn.hpp
-csrc/jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp
-csrc/apis/sm120_dispatch.hpp
