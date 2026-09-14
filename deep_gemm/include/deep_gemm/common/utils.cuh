@@ -1,5 +1,6 @@
 #pragma once
 
+#include <type_traits>
 #include <utility>
 
 #include <cuda/std/cstdint>
@@ -47,6 +48,24 @@ CUTLASS_DEVICE constexpr uint32_t get_num_aligned_tmem_cols() {
     if constexpr (kNumCols <= 128) return 128;
     if constexpr (kNumCols <= 256) return 256;
     return 512;
+}
+
+template <typename T>
+__device__ __forceinline__ T shfl_sync(unsigned mask, T var, int srcLane, int width = 32) {
+
+    using shfl_t = std::conditional_t<sizeof(T) == 4, int,
+                   std::conditional_t<sizeof(T) == 8, long long, long long>>;
+
+    T result;
+    shfl_t* var_ptr = reinterpret_cast<shfl_t*>(&var);
+    shfl_t* result_ptr = reinterpret_cast<shfl_t*>(&result);
+    *result_ptr = __shfl_sync(mask, *var_ptr, srcLane, width);
+
+    if constexpr (sizeof(T) == 16) {
+        *(result_ptr + 1) = __shfl_sync(mask, *(var_ptr + 1), srcLane, width);
+    }
+
+    return result;
 }
 
 } // namespace deep_gemm::utils

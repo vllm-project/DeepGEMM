@@ -390,7 +390,7 @@ def test_paged_mqa_logits():
                         elif arch_major == 12:
                             block_kvs = (32, 64) if is_mxfp4 else (64, )
                         else:
-                            block_kvs = (64, )
+                            block_kvs = (32, 64)
                         for block_kv in block_kvs:
                             for use_2d_context_lens, clean_logits in [(True, False)]:
                                 for batch_size in (256, 4096):
@@ -400,7 +400,7 @@ def test_paged_mqa_logits():
                                     # case, so stopping at 2 would leave it unenumerated.
                                     next_ns = (1, ) if is_varlen else \
                                               ((1, 6) if arch_major == 10 else
-                                               ((1, 2, 3, 4, 5, 6) if arch_major == 12 else (1, 2)))
+                                               ((1, 2, 3, 4, 5, 6) if arch_major == 12 else (1, 2, 4)))
                                     for next_n in next_ns:
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
                                             # SM120 takes 16, 32 or 64 heads -- `DG_HOST_ASSERT(num_heads
@@ -518,9 +518,11 @@ def test_paged_mqa_logits():
         assert block_table.min().item() >= 0
         assert block_table.max().item() < num_total_blocks
         assert context_lens_nextn.max().item() <= max_model_len
+        # SM90 next_n=4 launches one cluster of two CTAs per scheduler task.
+        num_kv_multicast = 2 if get_arch_major() == 9 and next_n == 4 else 1
         metadata_kwargs = dict(
             context_lens=context_lens_nextn, block_kv=block_kv,
-            num_sms=deep_gemm.get_num_sms(), indices=indices,
+            num_sms=deep_gemm.get_num_sms() // num_kv_multicast, indices=indices,
         )
         kernel_kwargs = dict(
             q=q_in, kv_cache=kv_in, weights=kernel_weights,

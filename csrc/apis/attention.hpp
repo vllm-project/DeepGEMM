@@ -425,8 +425,11 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
         DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
         sm100_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, batch_size * next_n, next_n, num_sms, is_context_lens_2d, false, nullptr);
     } else if (arch_major == 9) {
-        DG_HOST_ASSERT(block_kv == 64);
-        sm90_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d, false, nullptr);
+        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
+        // SM90 always schedules 64-row compute tiles. A 32-row page is paired
+        // with the following physical page inside each compute tile.
+        sm90_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n,
+                                       64, num_sms, is_context_lens_2d, 1, false, nullptr);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -478,7 +481,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     // Check fused KV cache
     const auto [num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
     DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
-                   (arch_major == 9 and block_kv == 64) or
+                   (arch_major == 9 and (block_kv == 32 or block_kv == 64)) or
                    (arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64)) or
                                           (not is_fp4 and block_kv == 64))));
     const int kv_head_dim = is_fp4 ? head_dim / 2 : head_dim;
@@ -526,9 +529,11 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
     }
 
-    // Check schedule metadata
+    // Check schedule metadata. SM90 next_n=4 uses one scheduler entry per
+    // two-CTA cluster rather than one entry per SM.
     auto [_schedule_meta_size, _meta_info_size] = get_shape<2>(schedule_meta);
-    DG_HOST_ASSERT(_schedule_meta_size == num_sms + 1 and _meta_info_size == 2);
+    const int num_kv_multicast = (arch_major == 9 and next_n == 4) ? 2 : 1;
+    DG_HOST_ASSERT(_schedule_meta_size == num_sms / num_kv_multicast + 1 and _meta_info_size == 2);
     DG_HOST_ASSERT(schedule_meta.is_contiguous());
     DG_HOST_ASSERT(schedule_meta.scalar_type() == torch::kInt);
 

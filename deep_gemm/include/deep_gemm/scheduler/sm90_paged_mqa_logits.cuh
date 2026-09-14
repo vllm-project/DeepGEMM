@@ -9,7 +9,9 @@ namespace deep_gemm::sched {
 template <uint32_t kAlignedBatchSize, uint32_t SPLIT_KV, uint32_t kNumSMs, bool kIsVarlen = false>
 CUTLASS_GLOBAL __launch_bounds__(32, 1)
 void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n, const bool is_context_lens_2d,
-                                    const uint32_t* context_lens, const uint32_t* indices, uint32_t* schedule_metadata) {
+                                    const uint32_t num_next_n_atoms,
+                                    const uint32_t* context_lens, const uint32_t* indices,
+                                    uint32_t* schedule_metadata) {
     DG_STATIC_ASSERT(kAlignedBatchSize % 32 == 0, "Invalid aligned batch size");
     const uint32_t lane_idx = ptx::get_lane_idx();
 
@@ -94,8 +96,8 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
             schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
         }
     } else {
-        const uint32_t next_n_atom = (next_n >= 2) ? 2 : 1;
-        const uint32_t num_next_n_atoms = math::ceil_div(next_n, next_n_atom);
+        // The host supplies this because SM90 next_n=4 uses one scheduler item
+        // backed by a two-CTA cluster, while other kernels may atomize next_n.
         const uint32_t total = sum * num_next_n_atoms;
         const uint32_t q = total / kNumSMs, r = total % kNumSMs;
         const uint32_t pivot = kNumSMs - r;
