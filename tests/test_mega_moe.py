@@ -198,7 +198,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math))
+            fast_math=bool(args.fast_math),
+            activation_alpha=args.activation_alpha,
+            activation_beta=args.activation_beta)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -209,6 +211,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > SwiGLU: limit={args.activation_clamp}, alpha={args.activation_alpha}, beta={args.activation_beta}',
+               once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
@@ -274,6 +278,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     avail_tokens=None,
                     num_per_channels=128, use_col_major_scales=True,
                     clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                    alpha=args.activation_alpha, beta=args.activation_beta,
                     round_scale=False, ue8m0_scale=False, output_bf16=True)[-1]
                 deep_gemm.bf16_gemm_nt(l2_in, shared_l2_weights, y)
             else:
@@ -284,6 +289,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     avail_tokens=None,
                     num_per_channels=32, use_col_major_scales=True,
                     clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                    alpha=args.activation_alpha, beta=args.activation_beta,
                     round_scale=True, ue8m0_scale=True, output_bf16=False)
                 deep_gemm.fp8_gemm_nt(l2_in, shared_l2_weights, y, recipe=(1, 1, 32), disable_ue8m0_cast=True)
             return y
@@ -308,6 +314,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
                 num_per_channels=32, use_col_major_scales=True,
                 clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                alpha=args.activation_alpha, beta=args.activation_beta,
                 **swiglu_kwargs)
             l1_y = swiglu_result[-1] if is_bf16xbf16 else swiglu_result
 
@@ -430,6 +437,8 @@ if __name__ == '__main__':
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--num-shared-experts', type=int, default=1, help='Number of shared experts (use 0 to disable)')
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
+    parser.add_argument('--activation-alpha', type=float, default=1.0, help='SwiGLU sigmoid scale')
+    parser.add_argument('--activation-beta', type=float, default=0.0, help='SwiGLU up-projection bias')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')

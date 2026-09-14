@@ -175,7 +175,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True):
+                     fast_math: bool = True,
+                     activation_alpha: float = 1.0,
+                     activation_beta: float = 0.0):
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -187,7 +189,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        activation_alpha, activation_beta
     )
 
 def bf16_mega_moe(y: torch.Tensor,
@@ -199,7 +202,9 @@ def bf16_mega_moe(y: torch.Tensor,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  activation_alpha: float = 1.0,
+                  activation_beta: float = 0.0):
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -214,5 +219,6 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        activation_alpha, activation_beta
     )

@@ -59,6 +59,8 @@ def _swiglu_apply_weight_to_fp8_tl(
         out_sf: T.Tensor[get_sf_shape(num_tokens, half_hidden, num_per_channels, ue8m0_scale, use_col_major_scales), out_sf_dtype],  # type: ignore
         out_bf16: T.Tensor[(num_tokens, half_hidden), T.bfloat16],  # type: ignore
         clamp_value: T.float32,
+        alpha: T.float32,
+        beta: T.float32,
     ):
         gate_frag = T.alloc_fragment((blk_n, blk_h), T.float32)
         up_frag = T.alloc_fragment((blk_n, blk_h), T.float32)
@@ -90,7 +92,8 @@ def _swiglu_apply_weight_to_fp8_tl(
                 up_frag[i, j] = T.min(clamp_value, T.max(-clamp_value, up_frag[i, j]))
                 gate_frag[i, j] = T.min(clamp_value, gate_frag[i, j])
             y_frag[i, j // num_per_channels, j % num_per_channels] = (
-                gate_frag[i, j] / (1 + T.exp(-gate_frag[i, j])) * up_frag[i, j] * topk_weight[i] + zero
+                gate_frag[i, j] / (1 + T.exp(-alpha * gate_frag[i, j]))
+                * (up_frag[i, j] + beta) * topk_weight[i] + zero
             )  # HACK : + 0 for vectorize
 
         y_max_frag = T.alloc_fragment((blk_n, blk_h // num_per_channels), T.float32)
@@ -129,6 +132,8 @@ def _swiglu_apply_weight_to_fp8_tl(
         out_sf: T.Tensor[get_sf_shape(num_tokens, half_hidden, num_per_channels, ue8m0_scale, use_col_major_scales), out_sf_dtype],  # type: ignore
         out_bf16: T.Tensor[(num_tokens, half_hidden), T.bfloat16],  # type: ignore
         clamp_value: T.float32,
+        alpha: T.float32,
+        beta: T.float32,
     ):
         # we actually don't use this
         _ = num_tokens
@@ -142,7 +147,8 @@ def _swiglu_apply_weight_to_fp8_tl(
             if cta_id >= new_num_ctas * num_block_h:
                 T.thread_return()
             for bi in T.serial(cta_id // num_block_h, avail_tokens_l - thread_idx // layout_h * new_num_ctas, new_num_ctas * blk_n):
-                main(bi, cta_id % num_block_h, new_num_ctas, x, topk_weights, avail_tokens, out, out_sf, out_bf16, clamp_value)
+                main(bi, cta_id % num_block_h, new_num_ctas, x, topk_weights, avail_tokens,
+                     out, out_sf, out_bf16, clamp_value, alpha, beta)
 
     return _swiglu_apply_weight_to_fp8
 
@@ -160,6 +166,8 @@ def swiglu_apply_weight_to_fp8(
     num_sms: int | None = None,
     output_bf16: bool = False,
     fast_math: bool = True,
+    alpha: float = 1.0,
+    beta: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     assert fmt == "e4m3"
     if num_sms is None:
@@ -200,7 +208,8 @@ def swiglu_apply_weight_to_fp8(
             output_bf16,
             fast_math
         )
-        kernel(x, topk_weights, avail_tokens.view(1) if avail_tokens is not None else None, y, y_sf, y_bf16, clamp_value or 0.0)
+        kernel(x, topk_weights, avail_tokens.view(1) if avail_tokens is not None else None,
+               y, y_sf, y_bf16, clamp_value or 0.0, alpha, beta)
 
     if ue8m0_scale:
         if num_tokens == 0:

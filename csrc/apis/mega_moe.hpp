@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <functional>
 #include <string>
 #include <pybind11/functional.h>
@@ -165,7 +166,9 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const float& activation_alpha,
+    const float& activation_beta
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -181,6 +184,8 @@ static void fp8_fp4_mega_moe(
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(std::isfinite(activation_alpha));
+    DG_HOST_ASSERT(std::isfinite(activation_beta));
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -273,7 +278,8 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, activation_alpha, activation_beta,
+                               fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -297,7 +303,9 @@ static void bf16_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const float& activation_alpha,
+    const float& activation_beta
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -308,6 +316,8 @@ static void bf16_mega_moe(
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(std::isfinite(activation_alpha));
+    DG_HOST_ASSERT(std::isfinite(activation_beta));
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -381,7 +391,8 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math);
+                            activation_clamp, activation_alpha, activation_beta,
+                            fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

@@ -34,6 +34,8 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
+    float kActivationAlpha,
+    float kActivationBeta,
     bool kFastMath,
     typename weight_dtype_t,
     bool kHasShared = (kNumSharedExperts > 0),
@@ -1049,7 +1051,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply SwiGLU: gate * sigmoid(alpha * gate) * (up + beta)
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1064,18 +1066,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
 
                             // SwiGLU
-                            auto gate = __bfloat1622float2(bf16_gate);
+                            const auto gate = __bfloat1622float2(bf16_gate);
+                            auto sigmoid_input = gate;
+                            if constexpr (kActivationAlpha != 1.0f)
+                                sigmoid_input = __fmul2_rn(
+                                    sigmoid_input, {kActivationAlpha, kActivationAlpha});
                             auto neg_gate_exp = make_float2(
-                                kFastMath ? __expf(-gate.x) : expf(-gate.x),
-                                kFastMath ? __expf(-gate.y) : expf(-gate.y));
+                                kFastMath ? __expf(-sigmoid_input.x) : expf(-sigmoid_input.x),
+                                kFastMath ? __expf(-sigmoid_input.y) : expf(-sigmoid_input.y));
                             const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                            float2 gated;
                             if constexpr (kFastMath) {
-                                gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                gated = __fmul2_rn(
+                                    gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
                             } else {
-                                gate = {gate.x / denom.x, gate.y / denom.y};
+                                gated = {gate.x / denom.x, gate.y / denom.y};
                             }
-                            const auto up = __bfloat1622float2(bf16_up);
-                            activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+                            auto up = __bfloat1622float2(bf16_up);
+                            if constexpr (kActivationBeta != 0.0f)
+                                up = __fadd2_rn(up, {kActivationBeta, kActivationBeta});
+                            activation_values[i][k] = __fmul2_rn(
+                                __fmul2_rn(gated, up), weights);
                         }
 
                         // Amax reduction (thread-level)

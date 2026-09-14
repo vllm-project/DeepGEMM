@@ -130,8 +130,14 @@ buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
 # Run the fused mega MoE kernel
 y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
+deep_gemm.fp8_fp4_mega_moe(
+    y, transformed_l1, transformed_l2, buffer,
+    activation_alpha=1.0,
+    activation_beta=0.0,
+)
 ```
+
+The fused SwiGLU computes `gate * sigmoid(activation_alpha * gate) * (up + activation_beta)`.
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 

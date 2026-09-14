@@ -31,6 +31,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
+    const float& activation_alpha,
+    const float& activation_beta,
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -183,6 +185,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -200,6 +204,8 @@ static void __instantiate_kernel() {{
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
         to_string(activation_clamp),
+        to_string(activation_alpha),
+        to_string(activation_beta),
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type())));
 
