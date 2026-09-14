@@ -11,6 +11,7 @@
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 
 namespace deep_gemm::mega {
 
@@ -39,7 +40,7 @@ get_symm_buffer_size_for_mega_moe(
     const std::string& mma_type, const std::string& activation,
     const int& num_shared_experts = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
@@ -177,7 +178,7 @@ static void fp8_fp4_mega_moe(
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // Activation checks
@@ -186,6 +187,11 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(activation_clamp >= 0);
     DG_HOST_ASSERT(std::isfinite(activation_alpha));
     DG_HOST_ASSERT(std::isfinite(activation_beta));
+    if (activation == "situ") {
+        DG_HOST_ASSERT(activation_alpha > 0);
+        // Zero represents FlashInfer's optional, unset situ_linear_beta.
+        DG_HOST_ASSERT(activation_beta >= 0);
+    }
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -262,24 +268,32 @@ static void fp8_fp4_mega_moe(
 
     // Dispatch into different architectures
     if (arch_major == 10) {
-        sm100_fp8_fp4_mega_moe(y,
-                               l1_acts, l1_acts_sf,
-                               l2_acts, l2_acts_sf,
-                               shared_l1_acts, shared_l1_acts_sf,
-                               shared_l2_acts, shared_l2_acts_sf,
-                               l1_weights, l2_weights,
-                               l1_weights_sf, l2_weights_sf,
-                               shared_l1_weights, shared_l2_weights,
-                               shared_l1_weights_sf, shared_l2_weights_sf,
-                               cumulative_local_expert_recv_stats,
-                               sym_buffer_ptrs,
-                               rank_idx, num_max_tokens_per_rank,
-                               num_experts_per_rank,
-                               num_shared_experts,
-                               num_tokens, num_topk,
-                               hidden, intermediate_hidden,
-                               activation_clamp, activation_alpha, activation_beta,
-                               fast_math);
+        const auto launch = [&](const auto kernel, const auto&... activation_args) {
+            kernel(y,
+                   l1_acts, l1_acts_sf,
+                   l2_acts, l2_acts_sf,
+                   shared_l1_acts, shared_l1_acts_sf,
+                   shared_l2_acts, shared_l2_acts_sf,
+                   l1_weights, l2_weights,
+                   l1_weights_sf, l2_weights_sf,
+                   shared_l1_weights, shared_l2_weights,
+                   shared_l1_weights_sf, shared_l2_weights_sf,
+                   cumulative_local_expert_recv_stats,
+                   sym_buffer_ptrs,
+                   rank_idx, num_max_tokens_per_rank,
+                   num_experts_per_rank,
+                   num_shared_experts,
+                   num_tokens, num_topk,
+                   hidden, intermediate_hidden,
+                   activation_args...);
+        };
+        if (activation == "situ") {
+            launch(sm100_fp8_fp4_mega_moe_situ,
+                   activation_alpha, activation_beta, fast_math);
+        } else {
+            launch(sm100_fp8_fp4_mega_moe,
+                   activation_clamp, activation_alpha, activation_beta, fast_math);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

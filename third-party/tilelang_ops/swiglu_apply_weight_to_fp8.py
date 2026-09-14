@@ -1,3 +1,6 @@
+import ctypes
+import math
+
 import deep_gemm
 import tilelang
 import torch
@@ -20,6 +23,8 @@ def _swiglu_apply_weight_to_fp8_tl(
     has_clamp_value: bool,
     output_bf16: bool,
     fast_math: bool,
+    is_situ: bool,
+    has_situ_linear_beta: bool,
 ) -> None:
     in_dtype = T.bfloat16
     w_dtype = T.float32
@@ -61,6 +66,8 @@ def _swiglu_apply_weight_to_fp8_tl(
         clamp_value: T.float32,
         alpha: T.float32,
         beta: T.float32,
+        alpha_inv: T.float32,
+        beta_inv: T.float32,
     ):
         gate_frag = T.alloc_fragment((blk_n, blk_h), T.float32)
         up_frag = T.alloc_fragment((blk_n, blk_h), T.float32)
@@ -88,13 +95,25 @@ def _swiglu_apply_weight_to_fp8_tl(
 
         zero = T.alloc_var(T.float32, 0.0)
         for i, j in T.Parallel(blk_n, blk_h):
-            if has_clamp_value:
-                up_frag[i, j] = T.min(clamp_value, T.max(-clamp_value, up_frag[i, j]))
-                gate_frag[i, j] = T.min(clamp_value, gate_frag[i, j])
-            y_frag[i, j // num_per_channels, j % num_per_channels] = (
-                gate_frag[i, j] / (1 + T.exp(-alpha * gate_frag[i, j]))
-                * (up_frag[i, j] + beta) * topk_weight[i] + zero
-            )  # HACK : + 0 for vectorize
+            if is_situ:
+                gate_scaled = gate_frag[i, j] * alpha_inv
+                gate_tanh = 2.0 / (1.0 + T.exp(-(2.0 * gate_scaled))) - 1.0
+                gate_sigmoid = 1.0 / (1.0 + T.exp(-gate_frag[i, j]))
+                situ_up = up_frag[i, j]
+                if has_situ_linear_beta:
+                    up_scaled = up_frag[i, j] * beta_inv
+                    situ_up = beta * (2.0 / (1.0 + T.exp(-(2.0 * up_scaled))) - 1.0)
+                y_frag[i, j // num_per_channels, j % num_per_channels] = (
+                    alpha * gate_tanh * gate_sigmoid * situ_up * topk_weight[i] + zero
+                )  # HACK : + 0 for vectorize
+            else:
+                if has_clamp_value:
+                    up_frag[i, j] = T.min(clamp_value, T.max(-clamp_value, up_frag[i, j]))
+                    gate_frag[i, j] = T.min(clamp_value, gate_frag[i, j])
+                y_frag[i, j // num_per_channels, j % num_per_channels] = (
+                    gate_frag[i, j] / (1 + T.exp(-alpha * gate_frag[i, j]))
+                    * (up_frag[i, j] + beta) * topk_weight[i] + zero
+                )  # HACK : + 0 for vectorize
 
         y_max_frag = T.alloc_fragment((blk_n, blk_h // num_per_channels), T.float32)
         sf_inv_frag = T.alloc_fragment((blk_n, blk_h // num_per_channels), T.float32)
@@ -134,6 +153,8 @@ def _swiglu_apply_weight_to_fp8_tl(
         clamp_value: T.float32,
         alpha: T.float32,
         beta: T.float32,
+        alpha_inv: T.float32,
+        beta_inv: T.float32,
     ):
         # we actually don't use this
         _ = num_tokens
@@ -148,7 +169,7 @@ def _swiglu_apply_weight_to_fp8_tl(
                 T.thread_return()
             for bi in T.serial(cta_id // num_block_h, avail_tokens_l - thread_idx // layout_h * new_num_ctas, new_num_ctas * blk_n):
                 main(bi, cta_id % num_block_h, new_num_ctas, x, topk_weights, avail_tokens,
-                     out, out_sf, out_bf16, clamp_value, alpha, beta)
+                     out, out_sf, out_bf16, clamp_value, alpha, beta, alpha_inv, beta_inv)
 
     return _swiglu_apply_weight_to_fp8
 
@@ -166,10 +187,16 @@ def swiglu_apply_weight_to_fp8(
     num_sms: int | None = None,
     output_bf16: bool = False,
     fast_math: bool = True,
+    activation: str = "swiglu",
     alpha: float = 1.0,
     beta: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     assert fmt == "e4m3"
+    assert activation in ("swiglu", "situ")
+    assert math.isfinite(alpha) and math.isfinite(beta)
+    if activation == "situ":
+        assert alpha > 0.0
+        assert beta >= 0.0
     if num_sms is None:
         num_sms = deep_gemm.get_num_sms()
 
@@ -206,10 +233,16 @@ def swiglu_apply_weight_to_fp8(
             avail_tokens is not None,
             clamp_value is not None,
             output_bf16,
-            fast_math
+            fast_math,
+            activation == "situ",
+            activation == "situ" and beta > 0.0,
         )
+        alpha_f32 = ctypes.c_float(alpha).value
+        beta_f32 = ctypes.c_float(beta).value
+        alpha_inv = ctypes.c_float(1.0 / alpha_f32).value if activation == "situ" else 0.0
+        beta_inv = ctypes.c_float(1.0 / beta_f32).value if activation == "situ" and beta > 0.0 else 0.0
         kernel(x, topk_weights, avail_tokens.view(1) if avail_tokens is not None else None,
-               y, y_sf, y_bf16, clamp_value or 0.0, alpha, beta)
+               y, y_sf, y_bf16, clamp_value or 0.0, alpha, beta, alpha_inv, beta_inv)
 
     if ue8m0_scale:
         if num_tokens == 0:

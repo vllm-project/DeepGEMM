@@ -108,7 +108,7 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 #### Mega MoE
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), SwiGLU, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), a gated activation, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
 
 ```python
 # Allocate symmetric memory buffer
@@ -138,6 +138,15 @@ deep_gemm.fp8_fp4_mega_moe(
 ```
 
 The fused SwiGLU computes `gate * sigmoid(activation_alpha * gate) * (up + activation_beta)`.
+
+For the FP8/FP4 Mega MoE kernel path, set `activation='situ'` to select SiTU.
+In that mode, `activation_alpha` is the gate tanh scale, so the gate branch is
+`activation_alpha * tanh(gate / activation_alpha) * sigmoid(gate)`. A positive
+`activation_beta` is the linear/up tanh scale and changes the up branch to
+`activation_beta * tanh(up / activation_beta)`; the default `0.0` leaves the up
+branch unchanged, matching an unset `situ_linear_beta` in FlashInfer.
+`activation_alpha` must be positive, and `activation_clamp` applies only to
+SwiGLU.
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 

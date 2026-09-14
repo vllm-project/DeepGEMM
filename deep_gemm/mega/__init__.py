@@ -15,6 +15,14 @@ except Exception as exception:
 from .. import _C
 
 
+_SUPPORTED_ACTIVATIONS = ('swiglu', 'situ')
+
+
+def _validate_activation(activation: str) -> None:
+    assert activation in _SUPPORTED_ACTIVATIONS, \
+        f'Activation must be one of {_SUPPORTED_ACTIVATIONS}, got `{activation}`'
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -28,7 +36,7 @@ class SymmBuffer:
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
         # Init
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        _validate_activation(activation)
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -149,7 +157,7 @@ def transform_weights_for_mega_moe(
     activation: str = 'swiglu'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+    _validate_activation(activation)
     if isinstance(l1_weights, tuple):
         # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
@@ -178,6 +186,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      fast_math: bool = True,
                      activation_alpha: float = 1.0,
                      activation_beta: float = 0.0):
+    _validate_activation(activation)
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -205,6 +214,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   fast_math: bool = True,
                   activation_alpha: float = 1.0,
                   activation_beta: float = 0.0):
+    assert activation == 'swiglu', \
+        f'BF16 Mega MoE only supports `swiglu`, got `{activation}`'
     _C.bf16_mega_moe(
         y,
         l1_weights,
