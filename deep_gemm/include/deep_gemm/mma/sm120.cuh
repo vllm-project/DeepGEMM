@@ -9,9 +9,9 @@
 // duplicate adds no coverage; it makes coverage structural rather than incidental, so a future
 // kernel that includes only this header is still guarded. Both files are Category A, so the
 // duplication costs zero rebase surface.
-// NOTES: `AI/tools/check_sm120_cuda_guard.sh` probes the `common/sm120_utils.cuh` copy only;
-//        this copy is identical text in an identical preprocessor context, but is not itself
-//        exercised by that gate.
+// NOTES: the guard probe used during development exercised the `common/sm120_utils.cuh`
+//        copy only; this copy is identical text in an identical preprocessor context, but
+//        was not itself exercised by that probe.
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ < 13)
 #error "DeepGEMM SM120 kernels require CUDA 13.0 or newer"
 #endif

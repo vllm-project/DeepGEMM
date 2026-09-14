@@ -12,13 +12,13 @@
 //
 // Placed here, before the includes, on purpose:
 //   * this file is Category A (sm120-exclusive; upstream never opens it), so the guard costs
-//     zero rebase surface -- see AI/sm120_touchpoints.md;
+//     zero rebase surface;
 //   * it is inside the `__CUDA_ARCH__ >= 1200` block, so it fires only in an sm120 *device*
 //     pass -- i.e. exactly when the JIT invokes nvcc for an sm120 kernel. Host passes and
 //     sm90/sm100 device passes are untouched, and the host extension never includes it;
 //   * before the includes rather than after, so it fires without first resolving the CUDA and
 //     CuTe include graph -- which also makes it checkable with a preprocessor-only probe
-//     (AI/tools/check_sm120_cuda_guard.sh).
+//     (a preprocessor-only probe was used for exactly this during development).
 //
 // The same guard is duplicated in `mma/sm120.cuh`, the file that actually emits the
 // `block_scale` MMA PTX, so coverage there is structural rather than incidental.

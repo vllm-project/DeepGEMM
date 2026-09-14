@@ -369,7 +369,7 @@ struct SM120ArchSpec {
         // Walking down is monotonically safe: a smaller factor can only cost
         // performance, and `1` is always valid. `heuristics/sm120.hpp` is
         // sm120-exclusive, so this divergence costs no rebase surface -- do not
-        // "restore" upstream's ordering here. See `AI/sm120_touchpoints.md`.
+        // "restore" upstream's ordering here.
         while (split_k > 1 and not is_sf_aligned(split_k))
             --split_k;
 
