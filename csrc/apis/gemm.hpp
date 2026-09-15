@@ -245,7 +245,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
-    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt) {
         const auto b_data = sm120::to_k_major(b.first, major_b, n);
         const bool is_mixed_fp4 = (a.first.scalar_type() != b_data.scalar_type()) and
                                   (a.first.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
@@ -318,7 +318,7 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
                                                  major_a, major_b, compiled_dims);
-    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt) {
         sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
                                                  major_a, major_b, compiled_dims);

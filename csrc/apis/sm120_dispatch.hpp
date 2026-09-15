@@ -99,26 +99,19 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const bool swap_ab = (m >= 1 and m <= kSwapAbMMax
         and d.stride(-1) == 1 and !is_mixed_fp4 and !c.has_value());
 
-    // Resolve actual granularities, swap if needed
-    int ga, gb, gk;
-    if (recipe.has_value()) {
-        std::tie(ga, gb, gk) = recipe.value();
-    } else if (recipe_a.has_value()) {
-        ga = std::get<0>(recipe_a.value());
-        gb = std::get<0>(recipe_b.value());
-        gk = std::get<1>(recipe_a.value());
-    } else {
-        std::tie(ga, gb, gk) = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
-    }
+    DG_HOST_ASSERT(recipe_a.has_value() == recipe_b.has_value());
+    DG_HOST_ASSERT(not recipe.has_value() or not recipe_a.has_value());
 
     std::optional<std::tuple<int, int, int>> eff_recipe = std::nullopt;
     std::optional<std::tuple<int, int>> eff_recipe_a, eff_recipe_b;
-    if (swap_ab) {
+    if (recipe_a.has_value()) {
+        eff_recipe_a = swap_ab ? recipe_b : recipe_a;
+        eff_recipe_b = swap_ab ? recipe_a : recipe_b;
+    } else if (swap_ab) {
+        const auto [ga, gb, gk] = recipe.value_or(
+            get_default_recipe(a.second.scalar_type(), b.second.scalar_type()));
         eff_recipe_a = std::make_tuple(gb, gk);
         eff_recipe_b = std::make_tuple(ga, gk);
-    } else if (recipe_a.has_value()) {
-        eff_recipe_a = recipe_a;
-        eff_recipe_b = recipe_b;
     } else {
         eff_recipe = recipe;
     }
@@ -131,6 +124,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         sf_a_raw, sf_b_raw, eff_m, eff_n, k, eff_recipe,
         eff_recipe_a, eff_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt);
 
     if (swap_ab) {
         sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,

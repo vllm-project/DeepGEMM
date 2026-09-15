@@ -21,6 +21,8 @@ public:
         GemmConfig gemm_config;
         deep_jit::cuda::LaunchOptions options;
         const std::optional<std::string> epilogue_type;
+        int64_t stride_cd_m;
+        int64_t stride_cd_batch;
 
         void* gmem_d;
         void* gmem_c;
@@ -87,6 +89,7 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
+            args.stride_cd_m, args.stride_cd_batch,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd
         );
@@ -116,7 +119,7 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 
-    const auto cd = c.value_or(d);
+    const auto& cd = d;
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -129,7 +132,7 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
                                                 config.layout.block_m, config.layout.block_n,
-                                                n, 1,
+                                                static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
     // Compile and launch
@@ -143,6 +146,8 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = d.stride(-2),
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,
@@ -215,6 +220,8 @@ static void sm120_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = d.stride(-2),
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -278,6 +285,8 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = n,
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -364,7 +373,7 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
                                                 config.layout.block_m, config.layout.block_n,
                                                 n, num_groups,
                                                 config.storage_config.swizzle_cd_mode);
-    const auto cd = c.value_or(d);
+    const auto& cd = d;
     // Compile and launch
     SM120BF16GemmRuntime::compile_and_launch("sm120_bf16_k_grouped_gemm", {
         .gemm_desc = desc,
@@ -376,6 +385,8 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = d.stride(-2),
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = cd.data_ptr(),
         .gmem_a_ptr = a_km.data_ptr(),
@@ -430,6 +441,8 @@ static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = tensor_d.stride(0),
+        .stride_cd_batch = tensor_d.stride(1),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -489,6 +502,8 @@ static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = tensor_d.stride(0),
+        .stride_cd_batch = tensor_d.stride(1),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,

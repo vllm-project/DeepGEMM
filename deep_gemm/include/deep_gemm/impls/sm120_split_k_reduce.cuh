@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cutlass/bfloat16.h>
+#include <deep_gemm/epilogue/transform.cuh>
 
 namespace deep_gemm {
 
-template <typename cd_dtype_t, uint32_t kSplitKFactor>
+template <typename cd_dtype_t, uint32_t kSplitKFactor, bool kWithAccumulation,
+          typename epilogue_type_t = epilogue::transform::EpilogueIdentity>
 __global__ void sm120_split_k_reduce_impl(
     cd_dtype_t* __restrict__ gmem_d,
     const float* __restrict__ workspace,
@@ -26,7 +28,11 @@ __global__ void sm120_split_k_reduce_impl(
     for (uint32_t s = 1; s < kSplitKFactor; ++s)
         sum += workspace[s * ws_stride + idx];
 
-    gmem_d[static_cast<int64_t>(row) * stride_cd_m + static_cast<int64_t>(col) * stride_cd_n] = cd_dtype_t(sum);
+    const auto physical_col = epilogue_type_t::template apply_index_n<1>(col);
+    const auto d_idx = static_cast<int64_t>(row) * stride_cd_m + static_cast<int64_t>(physical_col) * stride_cd_n;
+    if constexpr (kWithAccumulation)
+        sum += static_cast<float>(gmem_d[d_idx]);
+    gmem_d[d_idx] = cd_dtype_t(sum);
 }
 
 } // namespace deep_gemm

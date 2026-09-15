@@ -128,6 +128,7 @@ public:
         deep_jit::cuda::LaunchOptions options;
         int stride_cd_m;
         int stride_cd_n;
+        std::optional<std::string> epilogue_type;
         void* gmem_d;
         void* workspace;
     };
@@ -139,11 +140,12 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}>);
+    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}, {}, {}>);
 }};
 )",
         to_string(args.gemm_desc.cd_dtype),
-        args.gemm_config.split_k_factor));
+        args.gemm_config.split_k_factor, args.gemm_desc.with_accumulation,
+        get_default_epilogue_type(args.epilogue_type)));
 
         // Launch
         jit->launch(
@@ -157,7 +159,9 @@ static void __instantiate_kernel() {{
 
 static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Tensor& d,
                                   const int& m, const int& n, const int& split_k,
-                                  const int stride_cd_m, const int stride_cd_n) {
+                                  const int stride_cd_m, const int stride_cd_n,
+                                  const bool with_accumulation,
+                                  const std::optional<std::string>& epilogue_type = std::nullopt) {
     const int total = m * n;
     const int threads = 256;
     const int blocks = ceil_div(total, threads);
@@ -169,7 +173,7 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
         .a_dtype = torch::kFloat, .b_dtype = torch::kFloat,
         .cd_dtype = d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
-        .with_accumulation = false,
+        .with_accumulation = with_accumulation,
         .num_sms = blocks,
         .tc_util = 100, .compiled_dims = ""
     };
@@ -189,6 +193,7 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
         },
         .stride_cd_m = stride_cd_m,
         .stride_cd_n = stride_cd_n,
+        .epilogue_type = epilogue_type,
         .gmem_d = d.data_ptr(),
         .workspace = workspace.data_ptr(),
     });
@@ -230,7 +235,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     auto config = get_best_config<SM120ArchSpec>(desc);
     config.split_k_factor = SM120ArchSpec::get_split_k_factor(desc, config.layout);
 
-    const auto cd = c.value_or(d);
+    const auto& cd = d;
     const bool fp4_unpacked = !is_fp4;
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
@@ -299,7 +304,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     if (split_k > 1) {
         const int reduce_stride_m = swap_ab ? static_cast<int>(d.stride(-1)) : d_stride;
         const int reduce_stride_n = swap_ab ? static_cast<int>(d.stride(-2)) : 1;
-        sm120_split_k_reduce(workspace, d, m, n, split_k, reduce_stride_m, reduce_stride_n);
+        sm120_split_k_reduce(workspace, d, m, n, split_k, reduce_stride_m, reduce_stride_n, c.has_value(), epilogue_type);
     }
 }
 
@@ -352,7 +357,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 
-    const auto cd = c.value_or(d);
+    const auto& cd = d;
     const bool fp4_unpacked = !is_fp4;
     const int effective_stride = (outer_stride_k_override > 0) ? outer_stride_k_override : first_k;
     const int outer_stride_k_a = is_fp4 ? (effective_stride / 2) : effective_stride;
@@ -492,7 +497,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .b_is_fp4 = b_is_fp4,
         .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
-        .stride_cd_m = n,
+        .stride_cd_m = static_cast<int>(d.stride(-2)),
         .stride_cd_n = 0,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
@@ -634,7 +639,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 
-    const auto cd = c.value_or(d);
+    const auto& cd = d;
     const bool fp4_unpacked = !is_fp4;
     const auto tensor_map_a = make_tma_3d_desc(a, k, m, batch_size,
                                                config.layout.block_k, config.storage_config.load_block_m, 1,

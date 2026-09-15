@@ -87,7 +87,8 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(grid_size, 1, 1),
             .block_dim = dim3(num_threads, 1, 1),
         },
-        m, tensor_map_a, tensor_map_b, d.data_ptr<float>(), sqr_sum.data_ptr<float>()
+        m, tensor_map_a, tensor_map_b, d.data_ptr<float>(), sqr_sum.data_ptr<float>(),
+        d.stride(-2), d.dim() == 3 ? d.stride(0) : int64_t(0)
     );
 }
 

@@ -22,6 +22,22 @@ namespace deep_gemm::einsum {
 
 static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
                        const std::optional<torch::Tensor>& c) {
+    if (jit->device.get_arch_major() == 12) {
+        DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
+        const auto [s, m, k] = get_shape<3>(a);
+        const auto [s_, n, k_] = get_shape<3>(b);
+        const auto [m_, n_] = get_shape<2>(d);
+        DG_HOST_ASSERT(s == s_ and k == k_ and m == m_ and n == n_);
+        if (d.scalar_type() == torch::kFloat) {
+            DG_HOST_ASSERT(c.has_value());
+            DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
+        } else {
+            DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and not c.has_value());
+        }
+        if (m == 0 or n == 0)
+            return;
+    }
+
     // Currently FP32 only support the accumulated expression
     if (d.scalar_type() == torch::kFloat) {
         DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());

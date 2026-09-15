@@ -243,22 +243,22 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         if constexpr (kKGroupedConstantStride) {
                             const uint64_t a_k_byte_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start));
                             const uint64_t b_k_byte_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start));
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_k_byte_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_k_byte_offset);
                             sm120::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
                             sm120::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
                         } else {
                             const uint64_t a_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) * shape_m / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start) * shape_m);
                             const uint64_t b_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) * shape_n / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start) * shape_n);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
                             const uint64_t a_new_stride = kIsFP4
@@ -273,6 +273,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 smem_tm_b, scheduler.current_shape_k, b_new_stride);
                         }
 
+                        cute::tma_desc_commit_group();
+                        cute::tma_desc_wait_group();
+                        __syncwarp(1u << lane_idx);
                         *gmem_tm_a = *smem_tm_a;
                         *gmem_tm_b = *smem_tm_b;
                         ptx::tensor_map_release_gpu();
@@ -374,7 +377,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             // SF-major loop: when gran_k >= BLOCK_K, one packed int32 SF covers
             // kNumSFAStagesPerLoad K-blocks. Load SF into registers once per SF tile,
             // extract with compile-time byte index via cute::for_each.
-            static constexpr bool kUseSFMajorLoop = (kGranKA >= BLOCK_K) and (kGranKB >= BLOCK_K);
+            static constexpr bool kUseSFMajorLoop = kUsePerNTileX4 and (kGranKA >= BLOCK_K) and (kGranKB >= BLOCK_K);
             static_assert(!kUseSFMajorLoop || kNumSFAStagesPerLoad == kNumSFBStagesPerLoad,
                 "SF-major loop requires matching A/B SF tile sizes");
             static constexpr uint32_t kSFTileKBlocks = kUseSFMajorLoop ? kNumSFAStagesPerLoad : 1;
@@ -815,8 +818,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             } // SF-major tail kb loop
 
             } else { // !kUseSFMajorLoop
-            // ORIGINAL PATH: gran_k < BLOCK_K (per-K-step SF loading)
-            // Flat K-block loop with runtime sf_byte, no SF caching.
+            // Flat K-block loop for mixed operands and per-K-step SF loading.
             for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
                 CUTE_TIE_DECL(get_pipeline(iter_idx++), stage, phase);
 
@@ -1190,7 +1192,15 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             const int64_t cd_batch_offset = kIsBatchedEpilogue
                 ? static_cast<int64_t>(scheduler.current_group_idx) * stride_cd_batch : 0;
 
+            const bool masked_boundary = kGemmType == GemmType::MGroupedMasked
+                and m_block_idx * BLOCK_M + BLOCK_M > shape_m;
+            const auto row_in_bounds = [&](uint32_t row) {
+                if constexpr (kGemmType == GemmType::MGroupedMasked)
+                    return m_block_idx * BLOCK_M + row - m_base < shape_m;
+                return row < total_shape_m;
+            };
             if constexpr (kUseTMAStoreEpilogue) {
+              if (not masked_boundary) {
                 #pragma unroll
                 for (uint32_t ms = 0; ms < kNumEpiMSubs; ++ms) {
                     const uint32_t epi_m_start = ms * kEpiSubM;
@@ -1280,7 +1290,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         cute::tma_store_arrive();
                     }
                 } // ms loop
-            } else {
+              }
+            }
+            if (not kUseTMAStoreEpilogue or masked_boundary) {
                 auto store_pair = [&](cd_dtype_t* ptr, float a, float b) {
                     if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                         *reinterpret_cast<float2*>(ptr) = make_float2(a, b);
@@ -1299,37 +1311,48 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                         const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
                         const uint32_t nt_global = n_tile_base + nt;
-                        const uint32_t col = epilogue_type_t::template apply_index_n<MMA_N>(n_base + nt_global * MMA_N) + thread_id * 2;
+                        const uint32_t logical_col = n_base + nt_global * MMA_N + thread_id * 2;
+                        const uint32_t col = epilogue_type_t::template apply_index_n<2>(logical_col);
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
                         if (can_pair) {
-                            if (row0 < total_shape_m and col + 1 < shape_n) {
+                            if (row_in_bounds(row0) and logical_col + 1 < shape_n) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                                 float v0 = accum[ai + 0], v1 = accum[ai + 1];
                                 if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
                                 store_pair(&gmem_d[idx], v0, v1);
+                            } else if (row_in_bounds(row0) and logical_col < shape_n) {
+                                auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
+                                float v0 = accum[ai + 0];
+                                if constexpr (kWithAccumulation) v0 += read_cd(gmem_c[idx]);
+                                gmem_d[idx] = cd_dtype_t(v0);
                             }
-                            if (row1 < total_shape_m and col + 1 < shape_n) {
+                            if (row_in_bounds(row1) and logical_col + 1 < shape_n) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                                 float v2 = accum[ai + 2], v3 = accum[ai + 3];
                                 if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }
                                 store_pair(&gmem_d[idx], v2, v3);
+                            } else if (row_in_bounds(row1) and logical_col < shape_n) {
+                                auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
+                                float v2 = accum[ai + 2];
+                                if constexpr (kWithAccumulation) v2 += read_cd(gmem_c[idx]);
+                                gmem_d[idx] = cd_dtype_t(v2);
                             }
                         } else {
                             // Strided store: per-element N bounds check (handles shape_n=1)
-                            if (row0 < total_shape_m) {
+                            if (row_in_bounds(row0)) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride;
-                                if (col < shape_n)
+                                if (logical_col < shape_n)
                                     gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 0]);
-                                if (col + 1 < shape_n)
+                                if (logical_col + 1 < shape_n)
                                     gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 1]);
                             }
-                            if (row1 < total_shape_m) {
+                            if (row_in_bounds(row1)) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride;
-                                if (col < shape_n)
+                                if (logical_col < shape_n)
                                     gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 2]);
-                                if (col + 1 < shape_n)
+                                if (logical_col + 1 < shape_n)
                                     gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 3]);
                             }
                         }

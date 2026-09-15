@@ -45,6 +45,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      int* grouped_layout,
                      cute::TmaDescriptor* tensor_map_buffer,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                     int64_t stride_cd_m, int64_t stride_cd_batch,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
@@ -78,7 +79,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(kMTilesPerWarp >= 1, "Need at least 1 M-tile per warp");
     DG_STATIC_ASSERT(kBKMajor or kNTilesPerWarp > 0, "Need at least one N tile per warp");
-    DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp % 2 == 0, "kNTilesPerWarp must be even for ldmatrix.x2 B loading");
+    DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp == 1 or kNTilesPerWarp % 2 == 0, "kNTilesPerWarp must be one or even");
 
     static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = 232;
@@ -184,8 +185,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         const auto a_base = reinterpret_cast<const char*>(gmem_a_ptr);
                         const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
-                        const uint64_t a_offset = static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m * 2;
-                        const uint64_t b_offset = static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n * 2;
+                        const uint64_t a_offset = static_cast<uint64_t>(scheduler.current_k_start) * shape_m * 2;
+                        const uint64_t b_offset = static_cast<uint64_t>(scheduler.current_k_start) * shape_n * 2;
 
                         ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
                         ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
@@ -196,6 +197,9 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
                             smem_tm_b, scheduler.current_shape_k, new_stride);
 
+                        cute::tma_desc_commit_group();
+                        cute::tma_desc_wait_group();
+                        __syncwarp(1u << lane_idx);
                         *gmem_tm_a = *smem_tm_a;
                         *gmem_tm_b = *smem_tm_b;
                         ptx::tensor_map_release_gpu();
@@ -355,13 +359,19 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             };
 
             constexpr bool kIsBatchedEpilogue = (kGemmType == GemmType::Batched);
-            // Batched D is [M, batch, N] physical layout: stride_m = kNumGroups * shape_n
-            const int64_t cd_m_stride = kIsBatchedEpilogue
-                ? static_cast<int64_t>(kNumGroups) * shape_n : static_cast<int64_t>(shape_n);
+            const int64_t cd_m_stride = stride_cd_m;
             const int64_t cd_batch_offset = kIsBatchedEpilogue
-                ? static_cast<int64_t>(scheduler.current_group_idx) * shape_n : 0;
+                ? static_cast<int64_t>(scheduler.current_group_idx) * stride_cd_batch : 0;
 
+            const bool masked_boundary = kGemmType == GemmType::MGroupedMasked
+                and m_block_idx * BLOCK_M + BLOCK_M > shape_m;
+            const auto row_in_bounds = [&](uint32_t row) {
+                if constexpr (kGemmType == GemmType::MGroupedMasked)
+                    return m_block_idx * BLOCK_M + row - m_base < shape_m;
+                return row < total_shape_m;
+            };
             if constexpr (kUseTMAStoreEpilogue) {
+              if (not masked_boundary) {
                 if (math_warp_idx == 0 and lane_idx == 0)
                     cute::tma_store_wait<0>();
                 cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
@@ -434,7 +444,9 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                     cute::tma_store_arrive();
                 }
-            } else {
+              }
+            }
+            if (not kUseTMAStoreEpilogue or masked_boundary) {
                 auto store_pair = [&](cd_dtype_t* ptr, float a, float b) {
                     if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                         *reinterpret_cast<float2*>(ptr) = make_float2(a, b);
@@ -454,13 +466,13 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
-                        if (row0 < total_shape_m and col + 1 < shape_n) {
+                        if (row_in_bounds(row0) and col + 1 < shape_n) {
                             auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                             float v0 = accum[ai + 0], v1 = accum[ai + 1];
                             if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
                             store_pair(&gmem_d[idx], v0, v1);
                         }
-                        if (row1 < total_shape_m and col + 1 < shape_n) {
+                        if (row_in_bounds(row1) and col + 1 < shape_n) {
                             auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                             float v2 = accum[ai + 2], v3 = accum[ai + 3];
                             if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }
