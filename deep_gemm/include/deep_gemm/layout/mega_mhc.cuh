@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/math.cuh>
