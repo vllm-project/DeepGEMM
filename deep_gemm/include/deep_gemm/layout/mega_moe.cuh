@@ -71,7 +71,7 @@ struct alignas(128) MegaMoESignals {
 
     // Combine readiness: a peer sets `combine_ready_grid_idx[peer]` to the grid index + 1 that this rank pushed into
     // the peer's `peer_grid_idx` during dispatch, once its L2 writes into this rank are done.
-    // SM90 kernels also clear it before the dispatch pull barrier.
+    // Dispatch resets readiness before the pull barrier because graph replay can reuse grid indices.
     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
     alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
 
