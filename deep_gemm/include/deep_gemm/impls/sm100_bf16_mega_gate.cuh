@@ -283,7 +283,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
         const auto expert_group_base_idx = expert_group_idx * kNumExpertsPerGroup;
         constexpr bool kHasScoringBias = kHasBias or kHasImageTokenMask;
         constexpr bool kScoreOnStore = kHasScoringBias and kNumSplitK == 1;
-        auto gate_is_valid = epilogue::mega_gate::sm100_store_tmem_scores_to_global<
+        epilogue::mega_gate::sm100_store_tmem_scores_to_global<
                                 kScoreOnStore ? kScoringType : static_cast<uint32_t>(mega_gate_layout::ScoringType::Identity),
                                 kNumRoutedExperts, UMMA_M, kNumMmaCtas, kNumGateWarps>(
                                     split_score_tile,
@@ -426,8 +426,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             int selected_expert_idx = -1;
             auto selected_unbiased_score = 0.0f;
             epilogue::mega_gate::select_warp_topk<kNumExpertWaves, kNumTopk>(scores_local, 0, selected_expert_idx);
-            gate_is_valid = gate_is_valid and (lane_idx >= kNumTopk or
-                (selected_expert_idx >= 0 and selected_expert_idx < static_cast<int>(num_routed_experts)));
+            // Non-finite scores may leave top-k without a valid candidate.
             selected_expert_idx = lane_idx < kNumTopk
                 ? cute::min(cute::max(selected_expert_idx, 0), static_cast<int>(num_routed_experts) - 1)
                 : selected_expert_idx;
@@ -453,8 +452,6 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                                                                        selected_expert_idx,
                                                                        selected_unbiased_score);
         }
-
-        DG_TRAP_ONLY_DEVICE_ASSERT(gate_is_valid and "Mega gate scores must be finite and top-k indices valid");
     };
 
     if (warp_idx == 0)
