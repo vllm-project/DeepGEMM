@@ -292,7 +292,9 @@ void sm100_sparse_mqa_logits_metadata(
 
         // Drop a duplicate carried across merge partitions
         if (num_remaining_inputs > 0 and q0_slot_idx > 0 and q1_slot_idx < num_kv_blocks_in_q1 and
-            ptx::ld_shared(smem.logical_kv_block_indices[0] + q0_slot_idx - 1) == ptx::ld_shared(smem.logical_kv_block_indices[1] + q1_slot_idx)) {
+            ptx::ld_shared(smem.logical_kv_block_indices[0] + q0_slot_idx - 1) == ptx::ld_shared(smem.logical_kv_block_indices[1] + q1_slot_idx) and
+            (q0_slot_idx == num_kv_blocks_in_q0 or ptx::ld_shared(smem.logical_kv_block_indices[0] + q0_slot_idx) != ptx::ld_shared(smem.logical_kv_block_indices[1] + q1_slot_idx)) and
+            (q1_slot_idx == 0 or ptx::ld_shared(smem.logical_kv_block_indices[1] + q1_slot_idx - 1) != ptx::ld_shared(smem.logical_kv_block_indices[1] + q1_slot_idx))) {
             ++ q1_slot_idx;
             -- num_remaining_inputs;
         }
@@ -313,7 +315,12 @@ void sm100_sparse_mqa_logits_metadata(
             const uint32_t q0_logical_kv_block_idx = q0_slot_idx < num_kv_blocks_in_q0 ? ptx::ld_shared(smem.logical_kv_block_indices[0] + q0_slot_idx) : ~0u;
             const uint32_t q1_logical_kv_block_idx = q1_slot_idx < num_kv_blocks_in_q1 ? ptx::ld_shared(smem.logical_kv_block_indices[1] + q1_slot_idx) : ~0u;
             const bool in_q0 = q0_logical_kv_block_idx <= q1_logical_kv_block_idx;
-            const bool in_q1 = q1_logical_kv_block_idx <= q0_logical_kv_block_idx;
+            // Stable merge-path puts all equal Q0 slots before Q1. Only pair
+            // the last equal Q0 slot with the first Q1 slot, including repeats.
+            const bool last_equal_q0 = q0_slot_idx + 1 >= num_kv_blocks_in_q0 or
+                ptx::ld_shared(smem.logical_kv_block_indices[0] + q0_slot_idx + 1) != q0_logical_kv_block_idx;
+            const bool in_q1 = q1_logical_kv_block_idx < q0_logical_kv_block_idx or
+                (q1_logical_kv_block_idx == q0_logical_kv_block_idx and last_equal_q0);
             // Carry a final duplicate into the next partition
             const bool consume_q1 = in_q1 and num_remaining_inputs > in_q0;
             packed_slots_in_thread[merged_kv_block_offset_in_thread] =

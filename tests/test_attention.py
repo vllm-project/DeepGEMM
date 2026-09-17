@@ -666,6 +666,67 @@ def test_paged_mqa_logits_zero_context():
 
 
 @test_filter(lambda: get_arch_major() == 10)
+def test_sparse_mqa_logits_repeated_blocks() -> None:
+    """Repeated padding must preserve every Q slot across merge partitions."""
+    torch.manual_seed(42)
+    num_heads, head_dim, sparse_block_kv, max_blocks = 32, 128, 8, 2048
+    # 389 repeated blocks make adjacent merge partitions consume different
+    # numbers of inputs. The old merge can move Q1's slot backwards here.
+    lengths = torch.tensor([3105, 3106], dtype=torch.int32, device='cuda')
+    for fmt in ('mxfp4', 'mxfp8'):
+        cast_fwd = per_token_cast_to_fp4 if fmt == 'mxfp4' else per_token_cast_to_fp8
+        elem_dim = head_dim // 2 if fmt == 'mxfp4' else head_dim
+        q_fp, q_sf = cast_fwd(torch.randn((2 * num_heads, head_dim), device='cuda', dtype=torch.bfloat16),
+                              use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        q = q_fp.view(2, num_heads, elem_dim), q_sf.view(2, num_heads)
+        weights = to_mqa_weights(torch.randn((2, num_heads), device='cuda', dtype=torch.bfloat16), torch.bfloat16)
+        for mode, start in (('aligned', 0), ('unaligned', 3), ('paged', 0)):
+            starts = torch.full_like(lengths, start)
+            ends = starts + lengths
+            num_kv_tokens = 3200
+            kv_input = torch.randn((num_kv_tokens, head_dim), device='cuda', dtype=torch.bfloat16)
+            kv_fp, kv_sf = cast_fwd(kv_input,
+                                    use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            kv = kv_fp, kv_sf.view(num_kv_tokens)
+            full = deep_gemm.fp8_fp4_mqa_logits(q, kv, weights, starts, ends,
+                                               clean_logits=False, max_seqlen_k=num_kv_tokens,
+                                               logits_dtype=torch.bfloat16)
+            if mode == 'paged':
+                page_kv = 64
+                cast_cache = kv_cache_cast_to_mxfp4 if fmt == 'mxfp4' else kv_cache_cast_to_mxfp8
+                pages, _ = cast_cache(kv_input.view(-1, page_kv, 1, head_dim))
+                page_stride = ceil_div(page_kv * (elem_dim + 4), 512) * 512
+                storage = torch.empty((pages.shape[0], page_stride), device='cuda', dtype=torch.uint8)
+                cache = storage.as_strided(pages.shape, (page_stride, elem_dim + 4, elem_dim + 4, 1))
+                cache.copy_(pages)
+                table = torch.arange(pages.shape[0], device='cuda', dtype=torch.int32).repeat(2, 1)
+                requests = torch.zeros_like(lengths)
+                paged_q = q[0].unsqueeze(1), q[1].unsqueeze(1)
+            for prefix in (0, 8):
+                sparse_indices = torch.full((2, max_blocks), 388, dtype=torch.int32, device='cuda')
+                sparse_indices[:, :prefix] = torch.arange(prefix, dtype=torch.int32, device='cuda')
+                if mode == 'paged':
+                    metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+                        lengths, table, requests, page_kv, sparse_indices, q_fp.dtype, sparse_block_kv)
+                    actual = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+                        paged_q, cache, weights, metadata, max_blocks, sparse_block_kv)
+                else:
+                    metadata = deep_gemm.get_sparse_mqa_logits_metadata(
+                        starts, ends, num_kv_tokens, sparse_indices, q_fp.dtype, sparse_block_kv,
+                        use_unaligned_ks=bool(start))
+                    actual = deep_gemm.fp8_fp4_sparse_mqa_logits(
+                        q, kv, weights, metadata, max_blocks, sparse_block_kv, use_unaligned_ks=bool(start))
+                token_indices = (sparse_indices[:, :, None] * sparse_block_kv + start
+                                 + torch.arange(sparse_block_kv, device='cuda')).flatten(1).long()
+                counts = ceil_div(lengths, sparse_block_kv) * sparse_block_kv
+                valid = ((torch.arange(actual.shape[1], device='cuda')[None, :] < counts[:, None])
+                         & (token_indices < ends[:, None]))
+                expected = full.gather(1, token_indices - start)
+                assert_bitwise_equal(actual[valid], expected[valid], f'repeated sparse blocks: {fmt}, {mode}, {prefix=}')
+    print(' > Repeated sparse blocks passed\n')
+
+
+@test_filter(lambda: get_arch_major() == 10)
 def test_sparse_mqa_logits() -> None:
     num_heads, head_dim = 32, 128
     page_kv = 64
@@ -909,4 +970,5 @@ if __name__ == '__main__':
     test_mqa_logits()
     test_paged_mqa_logits()
     test_paged_mqa_logits_zero_context()
+    test_sparse_mqa_logits_repeated_blocks()
     test_sparse_mqa_logits()

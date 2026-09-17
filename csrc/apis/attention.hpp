@@ -239,7 +239,7 @@ static const torch::Tensor& get_sparse_mqa_logits_workspace(const torch::TensorO
 }
 
 // Each sparse-index row starts with the valid blocks inferred from its KV length. This prefix must
-// contain unique, strictly increasing absolute block indices within the corresponding KV range.
+// contain nondecreasing absolute block indices within the corresponding KV range; repeats are allowed.
 // With unaligned ks, block i starts at i * sparse_block_kv + ks % sparse_block_kv.
 static torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_start,
                                                     const torch::Tensor& cu_seq_len_k_end,
@@ -269,8 +269,8 @@ static torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_
     return metadata;
 }
 
-// Queries belonging to one request must be consecutive. Each sparse-index row starts with unique,
-// strictly increasing logical block indices within its context length. Paired queries must also
+// Queries belonging to one request must be consecutive. Each sparse-index row starts with nondecreasing
+// logical block indices within its context length; repeats are allowed. Paired queries must also
 // have identical block-table rows.
 static torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& context_lens,
                                                           const torch::Tensor& block_table,
