@@ -22,6 +22,7 @@ public:
         deep_jit::cuda::LaunchOptions options;
         // TODO: move into descriptor
         EpilogueInput epilogue;
+        int stride_c_m = 0;
 
         int gran_k_a, gran_k_b;
         bool is_fp4;
@@ -31,6 +32,7 @@ public:
         int stride_cd_m;
         int stride_cd_n;
         int stride_cd_batch;
+        int shape_cd_m = 0;
 
         void* gmem_d;
         void* gmem_c;
@@ -102,8 +104,9 @@ static void __instantiate_kernel() {{
         args.gemm_config.split_k_factor));
 
         // Launch
-        // NOTES: the SM120 kernel consumes the epilogue operator purely as a template parameter
-        //        (it is stateless there), so `args.epilogue.args` is not part of the launch.
+        // NOTES: `epilogue_type_t` is instantiated stateless (it adds no members over
+        //        `EpilogueArgs`), so `args.epilogue.args` marshals as the runtime
+        //        epilogue argument, the same way the SM100 launchers pass it.
         jit->launch(
             kernel, args.options,
             args.gmem_d, args.gmem_c,
@@ -113,6 +116,8 @@ static void __instantiate_kernel() {{
             args.gmem_workspace,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.stride_cd_m, args.stride_cd_n, args.stride_cd_batch,
+            args.shape_cd_m != 0 ? args.shape_cd_m : args.gemm_desc.m,
+            args.epilogue.args, args.stride_c_m,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd
@@ -131,6 +136,8 @@ public:
         std::optional<std::string> epilogue_type;
         void* gmem_d;
         void* workspace;
+        void* gmem_c;
+        int stride_c_m, stride_c_n;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -140,11 +147,11 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}, {}>);
 }};
 )",
         to_string(args.gemm_desc.cd_dtype),
-        args.gemm_config.split_k_factor, args.gemm_desc.with_accumulation,
+        args.gemm_config.split_k_factor,
         get_default_epilogue_type(args.epilogue_type)));
 
         // Launch
@@ -152,7 +159,9 @@ static void __instantiate_kernel() {{
             kernel, args.options,
             args.gmem_d, args.workspace,
             args.gemm_desc.m, args.gemm_desc.n,
-            args.stride_cd_m, args.stride_cd_n
+            args.stride_cd_m, args.stride_cd_n,
+            args.gmem_c, args.stride_c_m, args.stride_c_n,
+            false, 0.0f
         );
     }
 };
@@ -181,7 +190,8 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
         .split_k_factor = split_k
     };
 
-    // Compile and launch
+    // The old `kWithAccumulation` template flag (accumulate onto D in place) is now a
+    // runtime C operand: gmem_c = D with D's own strides reproduces it exactly.
     SM120SplitKReduceRuntime::compile_and_launch("sm120_split_k_reduce", {
         .gemm_desc = desc,
         .gemm_config = config,
@@ -196,6 +206,9 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
         .epilogue_type = epilogue_type,
         .gmem_d = d.data_ptr(),
         .workspace = workspace.data_ptr(),
+        .gmem_c = with_accumulation ? d.data_ptr() : nullptr,
+        .stride_c_m = with_accumulation ? stride_cd_m : 0,
+        .stride_c_n = with_accumulation ? stride_cd_n : 0,
     });
 }
 
@@ -355,7 +368,13 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
     };
-    const auto config = get_best_config<SM120ArchSpec>(desc);
+    auto config = get_best_config<SM120ArchSpec>(desc);
+    // The vendored kernel's TMA-store epilogue writes full BLOCK_M tiles with no
+    // boundary fallback; for m % BLOCK_M != 0 a group's tail tile would spill into the
+    // next group's slab (D is one flat 2D descriptor, so TMA can only clamp at the
+    // outermost M dim). Force the group-bounded scalar store path for such shapes.
+    if (m % config.layout.block_m != 0)
+        config.storage_config.swizzle_cd_mode = 0;
 
     const auto& cd = d;
     const bool fp4_unpacked = !is_fp4;
@@ -546,7 +565,13 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
-    const auto config = get_best_config<SM120ArchSpec>(desc);
+    auto config = get_best_config<SM120ArchSpec>(desc);
+    // The vendored kernel's TMA-store epilogue writes full BLOCK_M tiles with no
+    // masked-boundary fallback; for m % BLOCK_M != 0 a boundary tile would spill into
+    // the next group's rows (groups are interior to the flat M dim, so TMA cannot
+    // clamp them). Force the masked-aware scalar store path for such shapes.
+    if (m % config.layout.block_m != 0)
+        config.storage_config.swizzle_cd_mode = 0;
 
     const bool fp4_unpacked = !is_fp4;
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,

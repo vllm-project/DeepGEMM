@@ -311,6 +311,44 @@ def test_sm120_kgroup_zero_and_unequal_k() -> None:
 
 
 @test_filter(lambda: get_arch_major() == 12)
+def test_sm120_kgroup_unaligned_m_tail_tile_isolation() -> None:
+    old_sms = deep_gemm.get_num_sms()
+    old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    try:
+        deep_gemm.set_num_sms(2)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        # m=48 is not a multiple of BLOCK_M=64: a group's partial tail M tile must
+        # stay inside its own slab (the D descriptor is one flat 2D map over all
+        # groups, so TMA cannot clamp at group boundaries). The asymmetric ks make
+        # group 0's tile finish last, so a tail-tile spill would overwrite group 1's
+        # already-stored head rows.
+        m, n, ks = 48, 128, [8192, 128]
+        layout = torch.tensor(ks, dtype=torch.int32, device='cuda')
+        ap = [torch.full((m, k), g + 1, device='cuda').to(torch.float8_e4m3fn) for g, k in enumerate(ks)]
+        bp = [torch.full((n, k), 2 * g + 1, device='cuda').to(torch.float8_e4m3fn) for g, k in enumerate(ks)]
+        sa = torch.ones((sum(ks) // 128, m), device='cuda')
+        sb = torch.ones((sum(ks) // 128, n), device='cuda')
+        for transposed in (False, True):
+            storage = torch.full((len(ks) * m * n + 32,), -7, dtype=torch.float32, device='cuda')
+            d = storage[16:-16].view(len(ks), m, n)
+            d.fill_(3)
+            if transposed:
+                a, b = (torch.cat([x.T.contiguous() for x in ap]), sa), (torch.cat([x.T.contiguous() for x in bp]), sb)
+                fn = deep_gemm.k_grouped_fp8_gemm_tn_contiguous
+            else:
+                a, b = (torch.cat([x.flatten() for x in ap]), sa.T.contiguous()), (torch.cat([x.flatten() for x in bp]), sb.T.contiguous())
+                fn = deep_gemm.k_grouped_fp8_gemm_nt_contiguous
+            fn(a, b, d, ks, layout, d, recipe=(1, 1, 128))
+            torch.cuda.synchronize()
+            for g, k in enumerate(ks):
+                assert torch.all(d[g] == k * (g + 1) * (2 * g + 1) + 3), (ks, transposed, g)
+            assert torch.all(storage[:16] == -7) and torch.all(storage[-16:] == -7)
+    finally:
+        deep_gemm.set_num_sms(old_sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
+@test_filter(lambda: get_arch_major() == 12)
 def test_sm120_kgroup_descriptor_reuse_at_default_sms() -> None:
     old_sms = deep_gemm.get_num_sms()
     old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
@@ -356,6 +394,7 @@ if __name__ == '__main__':
 
     test_sm120_kgroup_descriptor_reuse_at_default_sms()
     test_sm120_kgroup_zero_and_unequal_k()
+    test_sm120_kgroup_unaligned_m_tail_tile_isolation()
     test_sm120_split_k_accumulation()
     test_sm120_mixed_fp8_fp4_scale_tile_k_tail()
     test_sm120_dense_strided_output_and_accumulation()

@@ -153,6 +153,40 @@ def test_sm120_kgroup_zero_and_unequal_k() -> None:
 
 
 @test_filter(lambda: get_arch_major() == 12)
+def test_sm120_kgroup_unaligned_m_tail_tile_isolation() -> None:
+    old_sms = deep_gemm.get_num_sms()
+    old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    deep_gemm.use_deterministic_algorithms(True)
+    try:
+        deep_gemm.set_num_sms(2)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        # m=48 is not a multiple of BLOCK_M=64: a group's partial tail M tile must
+        # stay inside its own slab (the D descriptor is one flat 2D map over all
+        # groups, so TMA cannot clamp at group boundaries). The asymmetric ks make
+        # group 0's tile finish last, so a tail-tile spill would overwrite group 1's
+        # already-stored head rows.
+        m, n, ks = 48, 128, [8192, 128]
+        a = torch.cat([torch.full((k, m), g + 1, dtype=torch.bfloat16, device='cuda') for g, k in enumerate(ks)])
+        b = torch.cat([torch.full((k, n), 2 * g + 1, dtype=torch.bfloat16, device='cuda') for g, k in enumerate(ks)])
+        layout = torch.tensor(ks, dtype=torch.int32, device='cuda')
+        for out_dtype in (torch.float32, torch.bfloat16):
+            storage = torch.full((len(ks) * m * n + 32,), -7, dtype=out_dtype, device='cuda')
+            d = storage[16:-16].view(len(ks), m, n)
+            d.fill_(3)
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, layout, d)
+            torch.cuda.synchronize()
+            start = 0
+            for g, k in enumerate(ks):
+                ref = (a[start:start + k].float().T @ b[start:start + k].float() + 3).to(out_dtype)
+                assert torch.equal(d[g], ref), (out_dtype, ks, g)
+                start += k
+            assert torch.all(storage[:16] == -7) and torch.all(storage[-16:] == -7)
+    finally:
+        deep_gemm.set_num_sms(old_sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
+@test_filter(lambda: get_arch_major() == 12)
 def test_sm120_kgroup_descriptor_reuse_at_default_sms() -> None:
     old_sms = deep_gemm.get_num_sms()
     old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
@@ -196,6 +230,7 @@ if __name__ == '__main__':
 
     test_sm120_kgroup_descriptor_reuse_at_default_sms()
     test_sm120_kgroup_zero_and_unequal_k()
+    test_sm120_kgroup_unaligned_m_tail_tile_isolation()
     test_sm120_small_n_output_row_stride_and_accumulation()
     test_sm120_contiguous_grouped_output_row_stride()
     test_sm120_kgroup_unequal_k_accumulation()

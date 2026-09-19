@@ -25,7 +25,7 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                                 float* gmem_d, float* sqr_sum,
-                                int64_t stride_d_m, int64_t stride_d_split) {
+                                const int64_t stride_d_m, const int64_t stride_d_split) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
     namespace sm120_mma = mma::sm120;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;

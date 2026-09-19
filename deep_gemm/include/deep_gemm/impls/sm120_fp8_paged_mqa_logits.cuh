@@ -23,7 +23,7 @@
 namespace deep_gemm {
 
 template <uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t BLOCK_KV,
+          uint32_t kHeadDim, uint32_t PAGE_KV,
           bool kIsContextLens2D, bool kIsVarlen,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
@@ -49,10 +49,16 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     static constexpr uint32_t kKSteps = kHeadDim / MMA_K;
     static constexpr uint32_t kNTilesPerQ = kNumHeads / MMA_N;
 
+    // A 32-row page needs a 32-row compute tile: BLOCK_KV=64 would straddle two
+    // non-contiguous physical pages. Mirrors the FP4 sibling kernel.
+    static constexpr uint32_t BLOCK_KV = PAGE_KV < 64 ? PAGE_KV : 64;
+    DG_STATIC_ASSERT(PAGE_KV == 32 or PAGE_KV == 64 or PAGE_KV == 128 or PAGE_KV == 256, "Unsupported FP8 page size");
+
     // SM120a: 8 math warps grouped into kNumGroups (each group processes BLOCK_KV KV rows)
     static constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
     static constexpr uint32_t kWarpsPerGroup = BLOCK_KV / MMA_M;
     static constexpr uint32_t kNumGroups = kNumMathWarps / kWarpsPerGroup;
+    // Must match the TMA descriptor's swizzle (host passes swizzle_mode = head_dim)
     static constexpr uint32_t kSwizzleMode = kHeadDim;
     static constexpr uint32_t kSMEMKBytes = kHeadDim;
 
@@ -199,14 +205,16 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
             kv_idx = next_kv_idx;
             num_kv = next_num_kv;
 
-            // Read KV block index via block table
+            // Cache one physical page index per future compute tile, not per page.
             if (kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
-                kv_block_idx_storage = (kv_idx + kv_group_idx + lane_idx * kNumGroups < num_kv ?
+                const auto tile_idx = kv_idx + kv_group_idx + lane_idx * kNumGroups;
+                kv_block_idx_storage = (tile_idx < num_kv ?
                     block_table[scheduler.atom_to_block_table_row(q_idx) * static_cast<uint64_t>(block_table_stride) +
-                                (kv_idx + kv_group_idx + lane_idx * kNumGroups)] : 0);
+                                tile_idx * BLOCK_KV / PAGE_KV] : 0);
             }
             const auto kv_block_idx = __shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
+            const auto page_offset = (kv_idx + kv_group_idx) * BLOCK_KV % PAGE_KV;
 
             CUTE_TIE_DECL(get_kv_pipeline(kv_iter_idx ++), kv_stage_idx, kv_phase);
             empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
@@ -214,10 +222,10 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
             if (cute::elect_one_sync()) {
                 tma::copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(
                     &tensor_map_kv, full_kv_barriers[kv_stage_idx],
-                    smem_kv[kv_stage_idx], 0, 0, 1, kv_block_idx);
+                    smem_kv[kv_stage_idx], 0, page_offset, 1, kv_block_idx);
                 tma::copy<BLOCK_KV, 1, 0>(
                     &tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
-                    smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
+                    smem_kv_scales[kv_stage_idx], page_offset, kv_block_idx);
                 full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
             }
 

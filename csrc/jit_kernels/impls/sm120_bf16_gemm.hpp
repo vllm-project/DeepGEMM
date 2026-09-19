@@ -21,8 +21,10 @@ public:
         GemmConfig gemm_config;
         deep_jit::cuda::LaunchOptions options;
         const std::optional<std::string> epilogue_type;
-        int64_t stride_cd_m;
-        int64_t stride_cd_batch;
+        EpilogueArgs epilogue_args{};
+        int stride_d_m;
+        int stride_c_m = 0;
+        int stride_d_batch = 0;
 
         void* gmem_d;
         void* gmem_c;
@@ -80,8 +82,9 @@ static void __instantiate_kernel() {{
         k_n_warps));
 
         // Launch
-        // NOTES: `epilogue_type_t` is a template-only parameter of `sm120_bf16_gemm_impl`
-        //        (it carries no runtime state there), so no epilogue argument is launched.
+        // NOTES: `epilogue_type_t` is instantiated stateless (it adds no members over
+        //        `EpilogueArgs`), so `EpilogueArgs` marshals as the runtime epilogue
+        //        argument, the same way the SM100 launchers pass it.
         jit->launch(
             kernel, args.options,
             args.gmem_d, args.gmem_c,
@@ -89,7 +92,7 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.stride_cd_m, args.stride_cd_batch,
+            args.epilogue_args, args.stride_d_m, args.stride_c_m, args.stride_d_batch,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd
         );
@@ -146,8 +149,9 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
-        .stride_cd_m = d.stride(-2),
-        .stride_cd_batch = 0,
+        .stride_d_m = static_cast<int>(d.stride(-2)),
+        .stride_c_m = 0,
+        .stride_d_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,
@@ -220,8 +224,9 @@ static void sm120_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
-        .stride_cd_m = d.stride(-2),
-        .stride_cd_batch = 0,
+        .stride_d_m = static_cast<int>(d.stride(-2)),
+        .stride_c_m = 0,
+        .stride_d_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -257,7 +262,13 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .compiled_dims = compiled_dims,
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
-    const auto config = get_best_config<SM120ArchSpec>(desc);
+    auto config = get_best_config<SM120ArchSpec>(desc);
+    // The vendored kernel's TMA-store epilogue writes full BLOCK_M tiles with no
+    // masked-boundary fallback; for m % BLOCK_M != 0 a boundary tile would spill into
+    // the next group's rows (groups are interior to the flat M dim, so TMA cannot
+    // clamp them). Force the masked-aware scalar store path for such shapes.
+    if (m % config.layout.block_m != 0)
+        config.storage_config.swizzle_cd_mode = 0;
 
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
@@ -285,8 +296,9 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
-        .stride_cd_m = n,
-        .stride_cd_batch = 0,
+        .stride_d_m = n,
+        .stride_c_m = 0,
+        .stride_d_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -345,7 +357,13 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
         .tc_util = runtime->get_tc_util(), .compiled_dims = compiled_dims,
         .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
     };
-    const auto config = get_best_config<SM120ArchSpec>(desc);
+    auto config = get_best_config<SM120ArchSpec>(desc);
+    // The vendored kernel's TMA-store epilogue writes full BLOCK_M tiles with no
+    // boundary fallback; for m % BLOCK_M != 0 a group's tail tile would spill into the
+    // next group's slab (D is one flat 2D descriptor, so TMA can only clamp at the
+    // outermost M dim). Force the group-bounded scalar store path for such shapes.
+    if (m % config.layout.block_m != 0)
+        config.storage_config.swizzle_cd_mode = 0;
 
     // Allocate tensor map buffer for dynamic replacement (A + B per SM)
     const auto num_sms = runtime->get_num_sms();
@@ -385,8 +403,9 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
-        .stride_cd_m = d.stride(-2),
-        .stride_cd_batch = 0,
+        .stride_d_m = static_cast<int>(d.stride(-2)),
+        .stride_c_m = 0,
+        .stride_d_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = cd.data_ptr(),
         .gmem_a_ptr = a_km.data_ptr(),
@@ -441,8 +460,9 @@ static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
-        .stride_cd_m = tensor_d.stride(0),
-        .stride_cd_batch = tensor_d.stride(1),
+        .stride_d_m = static_cast<int>(tensor_d.stride(0)),
+        .stride_c_m = 0,
+        .stride_d_batch = static_cast<int>(tensor_d.stride(1)),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -502,8 +522,9 @@ static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
             .cluster_dim = dim3(1, 1, 1),
         },
         .epilogue_type = std::nullopt,
-        .stride_cd_m = tensor_d.stride(0),
-        .stride_cd_batch = tensor_d.stride(1),
+        .stride_d_m = static_cast<int>(tensor_d.stride(0)),
+        .stride_c_m = 0,
+        .stride_d_batch = static_cast<int>(tensor_d.stride(1)),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,

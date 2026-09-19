@@ -2,16 +2,12 @@
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)) || defined(__CLION_IDE__)
 
-// Duplicate of the CUDA>=13 guard in `common/sm120_utils.cuh` -- see that file for the full
-// rationale and for why it sits before the includes, inside the `__CUDA_ARCH__ >= 1200` block.
-// It is repeated here because THIS is the file that actually emits the `block_scale` MMA PTX
-// that a pre-13 ptxas is reported to drop. Today the same 8 impls include both headers, so the
-// duplicate adds no coverage; it makes coverage structural rather than incidental, so a future
-// kernel that includes only this header is still guarded. Both files are Category A, so the
-// duplication costs zero rebase surface.
-// NOTES: the guard probe used during development exercised the `common/sm120_utils.cuh`
-//        copy only; this copy is identical text in an identical preprocessor context, but
-//        was not itself exercised by that probe.
+// Duplicate of the CUDA>=13 guard in `common/sm120_utils.cuh` -- see that file for the
+// full rationale and for why it sits before the includes, inside the `__CUDA_ARCH__ >= 1200`
+// block. It is repeated here because THIS is the file that actually emits the
+// `block_scale` MMA PTX. Today the SM120 MMA kernels include both headers, so the
+// duplicate adds no coverage; it makes coverage structural rather than incidental, so a
+// future kernel that includes only this header is still guarded.
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ < 13)
 #error "DeepGEMM SM120 kernels require CUDA 13.0 or newer"
 #endif
