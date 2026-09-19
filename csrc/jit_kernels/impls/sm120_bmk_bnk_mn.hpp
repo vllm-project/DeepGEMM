@@ -2,7 +2,7 @@
 
 #include <cstdio>
 #include <format>
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"

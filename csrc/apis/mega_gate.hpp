@@ -1,5 +1,8 @@
 #pragma once
 
+#include <torch/library.h>
+#include "../torch_library_utils.hpp"
+
 #include <cmath>
 #include <optional>
 #include <string>
@@ -7,7 +10,7 @@
 #include <unordered_map>
 
 #include <c10/cuda/CUDAGraphsC10Utils.h>
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_gate.hpp"
@@ -191,7 +194,7 @@ bf16_mega_gate(const torch::Tensor& x,
     return {topk_idx, topk_weights};
 }
 
-static pybind11::dict get_bf16_mega_gate_config(const int& num_tokens, const int& hidden,
+static c10::Dict<std::string, int64_t> get_bf16_mega_gate_config(const int& num_tokens, const int& hidden,
                                                 const int& num_routed_experts, const int& num_topk) {
     DG_HOST_ASSERT(num_tokens > 0 and num_tokens <= static_cast<int>(layout::mega_gate::kNumMaxTokens));
     DG_HOST_ASSERT(hidden > 0 and hidden % 256 == 0);
@@ -200,35 +203,64 @@ static pybind11::dict get_bf16_mega_gate_config(const int& num_tokens, const int
     const auto num_device_sms = runtime->get_num_sms();
     const auto config = get_sm100_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts,
                                                         num_device_sms, true, true, true);
-    pybind11::dict result;
-    result["block_tokens"] = config.block_tokens;
-    result["num_mma_ctas"] = config.num_mma_ctas;
-    result["num_split_k"] = config.num_split_k;
-    result["num_expert_groups"] = config.num_expert_groups;
-    result["num_gate_warpgroups"] = config.num_gate_warpgroups;
-    result["num_sms"] = config.num_launch_sms;
+    c10::Dict<std::string, int64_t> result;
+    result.insert("block_tokens", config.block_tokens);
+    result.insert("num_mma_ctas", config.num_mma_ctas);
+    result.insert("num_split_k", config.num_split_k);
+    result.insert("num_expert_groups", config.num_expert_groups);
+    result.insert("num_gate_warpgroups", config.num_gate_warpgroups);
+    result.insert("num_sms", config.num_launch_sms);
     return result;
 }
 
-static void register_apis(pybind11::module_& m) {
-    m.def("get_bf16_mega_gate_config", &get_bf16_mega_gate_config,
-          py::arg("num_tokens"), py::arg("hidden"),
-          py::arg("num_routed_experts"), py::arg("num_topk"));
-    m.def("bf16_mega_gate", &bf16_mega_gate,
-          py::arg("x"), py::arg("weight"), py::arg("num_topk"),
-          py::arg("use_shared_as_routed"), py::arg("num_shared_experts"),
-          py::arg("routed_scaling_factor"), py::arg("ep_rank"),
-          py::arg("scoring_func") = "identity",
-          py::arg("mask") = std::nullopt,
-          py::arg("bias") = std::nullopt,
-          py::arg("image_bias") = std::nullopt,
-          py::arg("image_token_mask") = std::nullopt,
-          py::arg("fix_routing_mask") = std::nullopt,
-          py::arg("to_physical_map") = std::nullopt,
-          py::arg("logical_count") = std::nullopt,
-          py::arg("unmapped_topk_idx") = std::nullopt,
-          py::arg("force_random") = std::nullopt,
-          py::arg("out") = std::nullopt);
+} // namespace deep_gemm::mega_gate
+
+namespace deep_gemm::torch_registration {
+using namespace deep_gemm::torch_utils;
+
+static c10::Dict<std::string, int64_t> get_bf16_mega_gate_config(
+    const int64_t& num_tokens,
+    const int64_t& hidden,
+    const int64_t& num_routed_experts,
+    const int64_t& num_topk) {
+    return mega_gate::get_bf16_mega_gate_config(
+        num_tokens, hidden, num_routed_experts, num_topk);
 }
 
-} // namespace deep_gemm::mega_gate
+static void bf16_mega_gate(const torch::Tensor& x,
+               const torch::Tensor& weight,
+               const int64_t& num_topk,
+               const bool& use_shared_as_routed,
+               const int64_t& num_shared_experts,
+               const double& routed_scaling_factor,
+               const int64_t& ep_rank,
+               const std::string& scoring_func,
+               const std::optional<torch::Tensor>& mask,
+               const std::optional<torch::Tensor>& bias,
+               const std::optional<torch::Tensor>& image_bias,
+               const std::optional<torch::Tensor>& image_token_mask,
+               const std::optional<torch::Tensor>& fix_routing_mask,
+               const std::optional<torch::Tensor>& to_physical_map,
+               const std::optional<torch::Tensor>& logical_count,
+               const std::optional<torch::Tensor>& unmapped_topk_idx,
+               const std::optional<torch::Tensor>& force_random,
+               const torch::Tensor& topk_idx, const torch::Tensor& topk_weights) {
+    mega_gate::bf16_mega_gate(x, weight, num_topk, use_shared_as_routed, num_shared_experts, routed_scaling_factor,
+        ep_rank, scoring_func, mask, bias, image_bias, image_token_mask, fix_routing_mask, to_physical_map,
+        logical_count, unmapped_topk_idx, force_random, std::make_tuple(topk_idx, topk_weights));
+}
+} // namespace deep_gemm::torch_registration
+
+TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def("get_bf16_mega_gate_config(int num_tokens, int hidden, int num_routed_experts, int num_topk) -> Dict(str, int)");
+
+    m.def("bf16_mega_gate(Tensor x, Tensor weight, int num_topk, bool use_shared_as_routed, int num_shared_experts, float routed_scaling_factor, int ep_rank, str scoring_func, Tensor? mask, Tensor? bias, Tensor? image_bias, Tensor? image_token_mask, Tensor? fix_routing_mask, Tensor? to_physical_map, Tensor? logical_count, Tensor(c!)? unmapped_topk_idx, Tensor? force_random, Tensor(a!) topk_idx, Tensor(b!) topk_weights) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(deep_gemm, CatchAll, m) {
+    m.impl("get_bf16_mega_gate_config", TORCH_FN(deep_gemm::torch_registration::get_bf16_mega_gate_config));
+}
+
+TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    m.impl("bf16_mega_gate", TORCH_FN(deep_gemm::torch_registration::bf16_mega_gate));
+}

@@ -15,6 +15,8 @@
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
 
 #include "layout.hpp"
+#include <torch/library.h>
+#include "../torch_library_utils.hpp"
 #include "sm120_dispatch.hpp"
 
 namespace deep_gemm::attention {
@@ -614,57 +616,194 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                     context_lens, block_table, schedule_meta,
                                     max_context_len, clean_logits, torch::kFloat, indices);
 }
-static void register_apis(pybind11::module_& m) {
-    m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("head_splits"),
-          py::arg("recipe") = std::nullopt,
-          py::arg("compiled_dims") = "nk",
-          py::arg("disable_ue8m0_cast") = false);
-    m.def("fp8_fp4_mqa_logits", &fp8_fp4_mqa_logits,
-          py::arg("q"), py::arg("kv"), py::arg("weights"),
-          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
-          py::arg("clean_logits") = true,
-          py::arg("max_seqlen_k") = 0,
-          py::arg("logits_dtype") = torch::kFloat32,
-          py::arg("schedule_meta") = std::nullopt);
-    m.def("get_mqa_logits_metadata", &get_mqa_logits_metadata,
-          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
-          py::arg("num_kv_tokens"), py::arg("num_heads"));
-    m.def("get_sparse_mqa_logits_metadata", &get_sparse_mqa_logits_metadata,
-          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("num_kv_tokens"),
-          py::arg("sparse_kv_block_indices"), py::arg("qk_dtype"), py::arg("sparse_block_kv"),
-          py::arg("use_unaligned_ks") = false);
-    m.def("get_paged_sparse_mqa_logits_metadata", &get_paged_sparse_mqa_logits_metadata,
-          py::arg("context_lens"), py::arg("block_table"), py::arg("indices"), py::arg("page_kv"),
-          py::arg("sparse_kv_block_indices"), py::arg("qk_dtype"), py::arg("sparse_block_kv"));
-    m.def("fp8_fp4_sparse_mqa_logits", &fp8_fp4_sparse_mqa_logits,
-          py::arg("q"), py::arg("kv"), py::arg("weights"), py::arg("metadata"),
-          py::arg("num_max_sparse_blocks"), py::arg("sparse_block_kv"),
-          py::arg("use_unaligned_ks") = false);
-    m.def("fp8_fp4_paged_sparse_mqa_logits", &fp8_fp4_paged_sparse_mqa_logits,
-          py::arg("q"), py::arg("kv_cache"), py::arg("weights"), py::arg("metadata"),
-          py::arg("num_max_sparse_blocks"), py::arg("sparse_block_kv"));
-    m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
-          py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
-          py::arg("indices") = std::nullopt);
-    m.def("fp8_fp4_paged_mqa_logits", &fp8_fp4_paged_mqa_logits,
-          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
-          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-          py::arg("max_context_len"),
-          py::arg("clean_logits") = false,
-          py::arg("logits_dtype") = torch::kFloat32,
-          py::arg("indices") = std::nullopt);
-    // Legacy API
-    m.def("fp8_mqa_logits", &fp8_mqa_logits,
-          py::arg("q"), py::arg("kv"), py::arg("weights"),
-          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
-          py::arg("clean_logits") = true,
-          py::arg("max_seqlen_k") = 0);
-    m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
-          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
-          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-          py::arg("max_context_len"), py::arg("clean_logits") = false,
-          py::arg("indices") = std::nullopt);
+}  // namespace deep_gemm::attention
+
+namespace deep_gemm::torch_registration {
+using namespace deep_gemm::torch_utils;
+
+static void fp8_gemm_nt_skip_head_mid(
+    const torch::Tensor& a, const torch::Tensor& sfa,
+    const torch::Tensor& b, const torch::Tensor& sfb,
+    const torch::Tensor& d,
+    const std::vector<int64_t>& head_splits,
+    const c10::optional<std::vector<int64_t>>& recipe,
+    const std::string& compiled_dims,
+    const bool& disable_ue8m0_cast) {
+    attention::fp8_gemm_nt_skip_head_mid(
+        {a, sfa}, {b, sfb}, d,
+        list_to_tuple3(head_splits),
+        list_to_recipe3(recipe),
+        compiled_dims, disable_ue8m0_cast);
 }
 
-} // namespace deep_gemm::attention
+static torch::Tensor fp8_fp4_mqa_logits(
+    const torch::Tensor& q, const c10::optional<torch::Tensor>& q_sf,
+    const torch::Tensor& kv, const torch::Tensor& kv_sf,
+    const torch::Tensor& weights,
+    const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end,
+    const bool& clean_logits,
+    const int64_t& max_seqlen_k,
+    at::ScalarType logits_dtype,
+    const std::optional<torch::Tensor>& schedule_meta) {
+    return attention::fp8_fp4_mqa_logits(
+        std::make_tuple(q, q_sf),
+        std::make_tuple(kv, kv_sf),
+        weights, cu_seq_len_k_start, cu_seq_len_k_end,
+        clean_logits, static_cast<int>(max_seqlen_k),
+        logits_dtype, schedule_meta);
+}
+
+static torch::Tensor get_paged_mqa_logits_metadata(
+    const torch::Tensor& context_lens, const int64_t& block_kv,
+    const int64_t& num_sms, const c10::optional<torch::Tensor>& indices) {
+    return attention::get_paged_mqa_logits_metadata(
+        context_lens, static_cast<int>(block_kv),
+        static_cast<int>(num_sms), indices);
+}
+
+static torch::Tensor fp8_fp4_paged_mqa_logits(
+    const torch::Tensor& q, const c10::optional<torch::Tensor>& q_sf,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& context_lens,
+    const torch::Tensor& block_table,
+    const torch::Tensor& schedule_meta,
+    const int64_t& max_context_len,
+    const bool& clean_logits,
+    at::ScalarType logits_dtype,
+    const c10::optional<torch::Tensor>& indices) {
+    return attention::fp8_fp4_paged_mqa_logits(
+        std::make_tuple(q, q_sf),
+        kv_cache, weights, context_lens, block_table, schedule_meta,
+        static_cast<int>(max_context_len), clean_logits,
+        logits_dtype, indices);
+}
+
+static torch::Tensor fp8_mqa_logits(
+    const torch::Tensor& q,
+    const torch::Tensor& kv, const torch::Tensor& kv_sf,
+    const torch::Tensor& weights,
+    const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end,
+    const bool& clean_logits,
+    const int64_t& max_seqlen_k) {
+    return attention::fp8_mqa_logits(
+        q, std::make_tuple(kv, kv_sf), weights,
+        cu_seq_len_k_start, cu_seq_len_k_end,
+        clean_logits, static_cast<int>(max_seqlen_k));
+}
+
+static torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& context_lens,
+    const torch::Tensor& block_table,
+    const torch::Tensor& schedule_meta,
+    const int64_t& max_context_len,
+    const bool& clean_logits,
+    const c10::optional<torch::Tensor>& indices) {
+    return attention::fp8_paged_mqa_logits(
+        q, kv_cache, weights,
+        context_lens, block_table, schedule_meta,
+        static_cast<int>(max_context_len), clean_logits, indices);
+}
+
+static torch::Tensor get_mqa_logits_metadata(
+    const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end,
+    const int64_t& num_kv_tokens,
+    const int64_t& num_heads) {
+    return attention::get_mqa_logits_metadata(
+        cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads);
+}
+
+static torch::Tensor get_sparse_mqa_logits_metadata(
+    const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end,
+    const int64_t& num_kv_tokens,
+    const torch::Tensor& sparse_kv_block_indices,
+    const at::ScalarType& qk_dtype,
+    const int64_t& sparse_block_kv,
+    const bool& use_unaligned_ks) {
+    return attention::get_sparse_mqa_logits_metadata(
+        cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, sparse_kv_block_indices, qk_dtype, sparse_block_kv, use_unaligned_ks);
+}
+
+static torch::Tensor get_paged_sparse_mqa_logits_metadata(
+    const torch::Tensor& context_lens,
+    const torch::Tensor& block_table,
+    const torch::Tensor& indices,
+    const int64_t& page_kv,
+    const torch::Tensor& sparse_kv_block_indices,
+    const at::ScalarType& qk_dtype,
+    const int64_t& sparse_block_kv) {
+    return attention::get_paged_sparse_mqa_logits_metadata(
+        context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv);
+}
+
+static torch::Tensor fp8_fp4_sparse_mqa_logits(
+    const torch::Tensor& q,
+    const std::optional<torch::Tensor>& q_sf,
+    const torch::Tensor& kv,
+    const torch::Tensor& kv_sf,
+    const torch::Tensor& weights,
+    const torch::Tensor& metadata,
+    const int64_t& num_max_sparse_blocks,
+    const int64_t& sparse_block_kv,
+    const bool& use_unaligned_ks) {
+    return attention::fp8_fp4_sparse_mqa_logits(
+        {q, q_sf}, {kv, kv_sf}, weights, metadata, num_max_sparse_blocks, sparse_block_kv, use_unaligned_ks);
+}
+
+static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(
+    const torch::Tensor& q,
+    const std::optional<torch::Tensor>& q_sf,
+    const torch::Tensor& fused_kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& metadata,
+    const int64_t& num_max_sparse_blocks,
+    const int64_t& sparse_block_kv) {
+    return attention::fp8_fp4_paged_sparse_mqa_logits(
+        {q, q_sf}, fused_kv_cache, weights, metadata, num_max_sparse_blocks, sparse_block_kv);
+}
+} // namespace deep_gemm::torch_registration
+
+TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def(
+        "fp8_gemm_nt_skip_head_mid(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, int[3] head_splits, int[3]? recipe=None, str compiled_dims='nk', bool disable_ue8m0_cast=False) -> ()");
+    m.def(
+        "fp8_fp4_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv, Tensor kv_sf, Tensor weights, Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, bool clean_logits=True, int max_seqlen_k=0, ScalarType logits_dtype=float, Tensor? schedule_meta=None) -> Tensor");
+    m.def("get_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, int num_heads) -> Tensor");
+    m.def("get_sparse_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv, bool use_unaligned_ks=False) -> Tensor");
+    m.def("get_paged_sparse_mqa_logits_metadata(Tensor context_lens, Tensor block_table, Tensor indices, int page_kv, Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv) -> Tensor");
+    m.def("fp8_fp4_sparse_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv, Tensor kv_sf, Tensor weights, Tensor metadata, int num_max_sparse_blocks, int sparse_block_kv, bool use_unaligned_ks=False) -> Tensor");
+    m.def("fp8_fp4_paged_sparse_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_cache, Tensor weights, Tensor metadata, int num_max_sparse_blocks, int sparse_block_kv) -> Tensor");
+    m.def(
+        "get_paged_mqa_logits_metadata(Tensor context_lens, int block_kv, int num_sms, Tensor? indices=None) -> Tensor");
+    m.def(
+        "fp8_fp4_paged_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_cache, Tensor weights, Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, bool clean_logits=False, ScalarType logits_dtype=float, Tensor? indices=None) -> Tensor");
+    // Legacy API
+    m.def(
+        "fp8_mqa_logits(Tensor q, Tensor kv, Tensor kv_sf, Tensor weights, Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, bool clean_logits=True, int max_seqlen_k=0) -> Tensor");
+    m.def(
+        "fp8_paged_mqa_logits(Tensor q, Tensor kv_cache, Tensor weights, Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, bool clean_logits=False, Tensor? indices=None) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    using namespace deep_gemm::torch_registration;
+
+    m.impl("fp8_gemm_nt_skip_head_mid", TORCH_FN(fp8_gemm_nt_skip_head_mid));
+    m.impl("fp8_fp4_mqa_logits", TORCH_FN(fp8_fp4_mqa_logits));
+    m.impl("get_mqa_logits_metadata", TORCH_FN(deep_gemm::torch_registration::get_mqa_logits_metadata));
+    m.impl("get_sparse_mqa_logits_metadata", TORCH_FN(deep_gemm::torch_registration::get_sparse_mqa_logits_metadata));
+    m.impl("get_paged_sparse_mqa_logits_metadata", TORCH_FN(deep_gemm::torch_registration::get_paged_sparse_mqa_logits_metadata));
+    m.impl("fp8_fp4_sparse_mqa_logits", TORCH_FN(deep_gemm::torch_registration::fp8_fp4_sparse_mqa_logits));
+    m.impl("fp8_fp4_paged_sparse_mqa_logits", TORCH_FN(deep_gemm::torch_registration::fp8_fp4_paged_sparse_mqa_logits));
+    m.impl("get_paged_mqa_logits_metadata", TORCH_FN(get_paged_mqa_logits_metadata));
+    m.impl("fp8_fp4_paged_mqa_logits", TORCH_FN(fp8_fp4_paged_mqa_logits));
+    // Legacy API
+    m.impl("fp8_mqa_logits", TORCH_FN(fp8_mqa_logits));
+    m.impl("fp8_paged_mqa_logits", TORCH_FN(fp8_paged_mqa_logits));
+}
