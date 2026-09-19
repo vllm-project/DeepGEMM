@@ -56,6 +56,8 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     static constexpr uint32_t kSwizzleMode = kHeadDim;
     static constexpr uint32_t kSMEMKBytes = kHeadDim;
 
+    DG_STATIC_ASSERT(BLOCK_KV == 32 or BLOCK_KV == 64, "Unsupported KV page size");
+    DG_STATIC_ASSERT(kNumTMAThreads / 32 >= kNumGroups, "One TMA warp per KV group");
     DG_STATIC_ASSERT(kNumTMAThreads == 128, "Expected 128 TMA threads");
     DG_STATIC_ASSERT(SPLIT_KV == BLOCK_KV * kNumGroups, "SPLIT_KV = BLOCK_KV * groups");
     DG_STATIC_ASSERT(BLOCK_KV % MMA_M == 0 and kNumMathWarps == kWarpsPerGroup * kNumGroups, "Warp grouping error");

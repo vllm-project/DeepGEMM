@@ -117,6 +117,60 @@ def test_metadata_prefix_visibility(batch, varlen):
         assert torch.equal(captured, expected)
 
 
+@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.parametrize('page_kv', [32, 64])
+@pytest.mark.parametrize('heads', [16, 32, 64])
+@pytest.mark.parametrize('next_n,varlen', [(1, False), (2, False), (3, False), (1, True)])
+@pytest.mark.parametrize('head_dim', [32, 64, 128])
+def test_fp8_paged_mqa_page_geometry(page_kv, heads, next_n, varlen, head_dim):
+    """Check native FP8 MMA with shuffled pages, padded strides and partial tails."""
+    torch.manual_seed(17)
+    lengths = [0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 257]
+    batch, tokens = len(lengths), 384
+    pages_per_request = tokens // page_kv
+    num_pages = batch * pages_per_request
+    q_cpu = torch.randint(-4, 5, (batch, next_n, heads, head_dim)).float() / 2
+    k_cpu = torch.randint(-4, 5, (num_pages, page_kv, head_dim)).float() / 2
+    scale_cpu = 2.0 ** torch.randint(-3, 3, (num_pages, page_kv)).float()
+    weights_cpu = torch.randint(-4, 5, (batch * next_n, heads)).float() / 8
+    q = q_cpu.to(torch.float8_e4m3fn).cuda()
+    weights = weights_cpu.cuda()
+    # Distinct physical pages, including a gap between pages as in hybrid caches.
+    row_bytes = page_kv * (head_dim + 4)
+    fused = torch.zeros((num_pages, row_bytes + 128), dtype=torch.uint8, device='cuda')
+    fused[:, :page_kv * head_dim] = k_cpu.to(torch.float8_e4m3fn).cuda().reshape(num_pages, -1).view(torch.uint8)
+    fused[:, page_kv * head_dim:row_bytes] = scale_cpu.cuda().view(torch.uint8)
+    cache = fused[:, :row_bytes].view(num_pages, page_kv, 1, head_dim + 4)
+    table_cpu = torch.randperm(num_pages).view(batch, pages_per_request)
+    indices_cpu = torch.arange(batch, dtype=torch.int32) // 2 if varlen else None
+    if varlen:
+        # Adjacent paired tokens share one request's page table; its second row
+        # must be at least as long as the first for the paired scheduler atom.
+        table_cpu = table_cpu[indices_cpu.long()].clone()
+    context_cpu = torch.tensor(lengths, dtype=torch.int32)[:, None]
+    context_cpu = (context_cpu - next_n + 1 + torch.arange(next_n, dtype=torch.int32)).clamp_min(0)
+    context = context_cpu.cuda()
+    table = table_cpu.to(device='cuda', dtype=torch.int32)
+    indices = indices_cpu.cuda() if varlen else None
+    reference = torch.empty((batch * next_n, tokens), dtype=torch.float64)
+    for b in range(batch):
+        keys = k_cpu[table_cpu[b]].reshape(tokens, head_dim).double()
+        scales = scale_cpu[table_cpu[b]].reshape(tokens).double()
+        score = torch.einsum('nhd,kd->nhk', q_cpu[b].double(), keys).relu()
+        score = (score * weights_cpu[b * next_n:(b + 1) * next_n].double()[..., None]).sum(1)
+        reference[b * next_n:(b + 1) * next_n] = score * scales
+    valid = torch.arange(tokens, device='cuda')[None, :] < context.flatten()[:, None]
+
+    def call():
+        metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            context, page_kv, deep_gemm.get_num_sms(), indices=indices)
+        return deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q, None), cache, weights, context, table, metadata, tokens,
+            clean_logits=False, logits_dtype=torch.float32, indices=indices)
+
+    check_outputs(call, reference.cuda(), valid)
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
