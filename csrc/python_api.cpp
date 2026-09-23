@@ -11,6 +11,7 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega_moe.hpp"
+#include "apis/nvfp4_mega_moe.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"
 
@@ -36,6 +37,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::gemm::register_apis(m);
     deep_gemm::layout::register_apis(m);
     deep_gemm::mega::register_apis(m);
+    deep_gemm::nvfp4_mega::register_apis(m);
     deep_gemm::mega_mhc::register_apis(m);
     deep_gemm::mega_gate::register_apis(m);
 }

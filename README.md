@@ -150,6 +150,12 @@ SwiGLU.
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
+For native NVFP4 routed experts with fused MXFP8 or BF16 shared experts, use
+`NVFP4SymmBuffer(...)` and `deep_gemm.nvfp4_mega_moe`.
+Set `shared_dtype=torch.bfloat16` on the buffer for BF16 shared experts.
+See [NVFP4 MegaMoE](AI/nvfp4-mega-moe.md) for scale layouts, global scales,
+and the MiniMax M3 correctness/performance sweep in `tests/test_nvfp4_mega_moe.py`.
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

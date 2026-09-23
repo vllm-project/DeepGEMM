@@ -95,6 +95,8 @@ from .mega import (
     fp8_fp4_mega_moe,
     bf16_mega_moe,
 )
+from .mega.nvfp4 import NVFP4SymmBuffer, nvfp4_mega_moe
+from ._C import get_block_m_for_nvfp4_mega_moe
 
 # Some utils
 from . import testing
