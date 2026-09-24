@@ -1,5 +1,8 @@
 #pragma once
 
+#include <torch/library.h>
+#include "../torch_library_utils.hpp"
+
 #include <unordered_map>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 
@@ -251,37 +254,48 @@ static void mega_mhc(const torch::Tensor& x,
         shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
 }
 
-static void register_apis(pybind11::module_& m) {
-    m.def(
-        "mega_mhc",
-        &mega_mhc,
-        py::arg("x"),
-        py::arg("residual"),
-        py::arg("shifted_prev_mix"),
-        py::arg("post_mix"),
-        py::arg("comb_res_mix"),
-        py::arg("fn"),
-        py::arg("mix_scales"),
-        py::arg("mix_bases"),
-        py::arg("hc_mult"),
-        py::arg("hc_norm_eps"),
-        py::arg("hc_pre_eps"),
-        py::arg("hc_post_scale"),
-        py::arg("sinkhorn_eps"),
-        py::arg("num_sinkhorn_iters"),
-        py::arg("rmsnorm_weight"),
-        py::arg("rmsnorm_eps"),
-        py::arg("rmsnorm_scale"),
-        py::arg("new_residual"),
-        py::arg("new_prev_mix"),
-        py::arg("new_post_mix"),
-        py::arg("new_comb_res_mix"),
-        py::arg("y_bf16") = std::nullopt,
-        py::arg("y_fp8") = std::nullopt,
-        py::arg("y_gemm_sf") = std::nullopt,
-        py::arg("y_routed_sf") = std::nullopt,
-        py::arg("y_shared_sf") = std::nullopt,
-        py::arg("shared_sf_block_m") = 0);
+} // namespace deep_gemm::mega_mhc
+
+namespace deep_gemm::torch_registration {
+using namespace deep_gemm::torch_utils;
+
+static void mega_mhc(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const std::optional<torch::Tensor>& shifted_prev_mix,
+    const torch::Tensor& post_mix,
+    const torch::Tensor& comb_res_mix,
+    const torch::Tensor& fn,
+    const torch::Tensor& mix_scales,
+    const torch::Tensor& mix_bases,
+    const int64_t& hc_mult,
+    const double& hc_norm_eps,
+    const double& hc_pre_eps,
+    const double& hc_post_scale,
+    const double& sinkhorn_eps,
+    const int64_t& num_sinkhorn_iters,
+    const torch::Tensor& rmsnorm_weight,
+    const double& rmsnorm_eps,
+    const double& rmsnorm_scale,
+    const torch::Tensor& new_residual,
+    const std::optional<torch::Tensor>& new_prev_mix,
+    const torch::Tensor& new_post_mix,
+    const torch::Tensor& new_comb_res_mix,
+    const std::optional<torch::Tensor>& y_bf16,
+    const std::optional<torch::Tensor>& y_fp8,
+    const std::optional<torch::Tensor>& y_gemm_sf,
+    const std::optional<torch::Tensor>& y_routed_sf,
+    const std::optional<torch::Tensor>& y_shared_sf,
+    const int64_t& shared_sf_block_m) {
+    mega_mhc::mega_mhc(
+        x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales, mix_bases, hc_mult, hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters, rmsnorm_weight, rmsnorm_eps, rmsnorm_scale, new_residual, new_prev_mix, new_post_mix, new_comb_res_mix, y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, shared_sf_block_m);
+}
+} // namespace deep_gemm::torch_registration
+
+TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def("mega_mhc(Tensor x, Tensor residual, Tensor? shifted_prev_mix, Tensor post_mix, Tensor comb_res_mix, Tensor fn, Tensor mix_scales, Tensor mix_bases, int hc_mult, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, int num_sinkhorn_iters, Tensor rmsnorm_weight, float rmsnorm_eps, float rmsnorm_scale, Tensor(a!) new_residual, Tensor(b!)? new_prev_mix, Tensor(c!) new_post_mix, Tensor(d!) new_comb_res_mix, Tensor(e!)? y_bf16=None, Tensor(f!)? y_fp8=None, Tensor(g!)? y_gemm_sf=None, Tensor(h!)? y_routed_sf=None, Tensor(i!)? y_shared_sf=None, int shared_sf_block_m=0) -> ()");
 }
 
-} // namespace deep_gemm::mega_mhc
+TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    m.impl("mega_mhc", TORCH_FN(deep_gemm::torch_registration::mega_mhc));
+}

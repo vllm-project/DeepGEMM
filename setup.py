@@ -25,6 +25,8 @@ DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 
 # Compiler flags
 cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
+             '-DPy_LIMITED_API=0x030a0000',
+             '-DDJ_DISABLE_GIL=1',
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
 
 # Sources
@@ -80,7 +82,7 @@ def get_platform():
 def get_wheel_url():
     torch_version = parse(torch.__version__)
     torch_version = f'{torch_version.major}.{torch_version.minor}'
-    python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
+    python_version = 'cp310-abi3'
     platform_name = get_platform()
     deep_gemm_version = get_package_version()
     cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
@@ -100,12 +102,13 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
-    return [CUDAExtension(name='deep_gemm._C',
+    return [CUDAExtension(name='deep_gemm._C_extension',
                           sources=sources,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,
-                          extra_compile_args=cxx_flags)]
+                          extra_compile_args=cxx_flags,
+                          py_limited_api=True)]
 
 
 class CustomBuildPy(build_py):
@@ -134,7 +137,7 @@ class CustomBuildPy(build_py):
             shutil.copytree(os.path.join(current_dir, name), dst)
 
     def generate_pyi_file(self):
-        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
+        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs', c_py_path='./deep_gemm/_C.py')
         pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
         pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
 
@@ -215,6 +218,7 @@ if __name__ == '__main__':
         },
         ext_modules=get_ext_modules(),
         zip_safe=False,
+        options={'bdist_wheel': {'py_limited_api': 'cp310'}},
         cmdclass={
             'build_py': CustomBuildPy,
             'bdist_wheel': CachedWheelsCommand,

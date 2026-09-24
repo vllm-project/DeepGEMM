@@ -8,7 +8,7 @@
 #include <utility>
 
 #include <cuda.h>
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include <deep_jit/backend/cuda/driver.hpp>
 #include <deep_jit/utils/env.hpp>
