@@ -167,7 +167,9 @@ def run(local_rank, local_world, args):
             else:
                 sw = [(q[0][0], q[1][0]) for q in make_weights(1, args.hidden, args.intermediate_hidden * args.shared_experts, 'fp8', 1)]
         shared_transformed = deep_gemm.transform_weights_for_mega_moe(*sw)
-    l1_alpha = torch.full((args.experts // world,), args.input_scale * args.weight_scale, dtype=torch.float32, device='cuda') if nv else None
+    # Per-token input scales replace the tensor-wide input scale
+    input_scale = 1.0 if args.x_scales else args.input_scale
+    l1_alpha = torch.full((args.experts // world,), input_scale * args.weight_scale, dtype=torch.float32, device='cuda') if nv else None
     l2_alpha = torch.full_like(l1_alpha, args.mid_scale * args.weight_scale) if nv else None
     results = []
     for m in args.tokens:
@@ -184,7 +186,15 @@ def run(local_rank, local_world, args):
         if args.masked:
             indices[torch.rand_like(weights) < args.masked] = -1
             weights.masked_fill_(indices < 0, 0)
-        qx = quantize(x, 'nvfp4' if nv else 'fp8', args.input_scale)
+        x_scales = None
+        if args.x_scales:
+            # Rows span four decades, which one tensor-wide scale cannot cover
+            x = (x.float() * torch.logspace(-3, 1, m, device='cuda')[:, None]).to(torch.bfloat16)
+            x_scales = x.float().abs().amax(-1).clamp_min(1e-12) / 2688
+            qx = quantize(x.float() / x_scales[:, None], 'nvfp4')
+            buf.x_scales[:m].copy_(x_scales)
+        else:
+            qx = quantize(x, 'nvfp4' if nv else 'fp8', args.input_scale)
         buf.x[:m].copy_(qx[0])
         buf.x_sf[:m].copy_(qx[1])
         buf.topk_idx[:m].copy_(indices)
@@ -210,7 +220,8 @@ def run(local_rank, local_world, args):
                       activation_clamp=args.clamp, activation_alpha=args.alpha, activation_beta=args.beta,
                       fast_math=not args.exact_math)
         if nv:
-            kwargs.update(l1_alpha=l1_alpha, l2_alpha=l2_alpha, l2_activation_scale=args.mid_scale)
+            kwargs.update(l1_alpha=l1_alpha, l2_alpha=l2_alpha, l2_activation_scale=args.mid_scale,
+                          use_x_scales=args.x_scales)
         kernel = deep_gemm.nvfp4_mega_moe if nv else deep_gemm.fp8_fp4_mega_moe
         fn = lambda: kernel(y, *transformed, buf, **kwargs)
         if args.check_api and m == args.tokens[0]:
@@ -252,13 +263,20 @@ def run(local_rank, local_world, args):
         torch.cuda.synchronize()
         row = {'m_per_rank': m, 'block_m': block_m}
         if not args.skip_check:
-            ref = reference(dequantize(qx, 'nvfp4' if nv else 'fp8', args.input_scale),
-                            shared_x, indices, weights, w, sw, mode, args, rank, world)
+            ref_x = (dequantize(qx, 'nvfp4') * x_scales[:, None] if args.x_scales else
+                     dequantize(qx, 'nvfp4' if nv else 'fp8', args.input_scale))
+            ref = reference(ref_x, shared_x, indices, weights, w, sw, mode, args, rank, world)
             error = (y.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
             diff = (y.float() - ref.float()).abs().max() if m else torch.zeros((), device='cuda')
             row.update(relative_l2_error=error.item(), max_abs_error=diff.item())
             assert torch.isfinite(y).all(), row
             assert error < 0.005, row
+            if args.x_scales and m:
+                # The small rows would be invisible in the tensor-wide error
+                row_error = ((y.float() - ref.float()).norm(dim=-1) /
+                             ref.float().norm(dim=-1).clamp_min(1e-12)).max()
+                row.update(max_row_relative_l2_error=row_error.item())
+                assert row_error < 0.02, row
             # Validate counts across rank boundaries as well as output values.
             count = torch.bincount(indices[indices >= 0], minlength=args.experts).int()
             dist.all_reduce(count)
@@ -338,6 +356,7 @@ def parse_args():
     p.add_argument('--input-scale', type=float, default=1.0)
     p.add_argument('--weight-scale', type=float, default=1.0)
     p.add_argument('--mid-scale', type=float, default=1.0)
+    p.add_argument('--x-scales', action='store_true', help='per-token FP32 input scales (NVFP4 only)')
     p.add_argument('--alpha', type=float, default=1.702)
     p.add_argument('--beta', type=float, default=1.0)
     p.add_argument('--clamp', type=float, default=7.0)
