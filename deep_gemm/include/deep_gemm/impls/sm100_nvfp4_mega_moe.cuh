@@ -41,6 +41,7 @@ template <
     typename weight_dtype_t,
     typename shared_dtype_t,
     uint32_t SHARED_BLOCK_K,
+    bool kUseXScales,
     bool kSharedBF16 = cute::is_same_v<shared_dtype_t, cutlass::bfloat16_t>,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -583,6 +584,12 @@ sm100_nvfp4_mega_moe_impl(void* y,
             const auto weight = *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
+            float x_scale = 1.0f;
+            if constexpr (kUseXScales) {
+                x_scale = *sym_buffer.map(
+                    buffer.input_x_scales_buffer.get_base_ptr<float>() + src_token_idx,
+                    current_rank_in_expert_idx);
+            }
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 64;
@@ -606,6 +613,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
             // Store weights and metadata
             if (cute::elect_one_sync()) {
                 *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
+                if constexpr (kUseXScales)
+                    *buffer.l1_x_scales_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = x_scale;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
@@ -1088,6 +1097,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 float stored_cached_weight = 1.0f;
+                float stored_cached_x_scale = 1.0f;
 
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
@@ -1112,6 +1122,11 @@ sm100_nvfp4_mega_moe_impl(void* y,
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
                                 .template get_base_ptr<float>();
+                            if constexpr (kUseXScales) {
+                                stored_cached_x_scale = *buffer.l1_x_scales_buffer
+                                    .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+                                    .template get_base_ptr<float>();
+                            }
                         }
 
                         // Load weights from register cache
@@ -1119,6 +1134,16 @@ sm100_nvfp4_mega_moe_impl(void* y,
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
                         };
+
+                        // Per-token input scales join the per-expert alpha before BF16 rounding
+                        float2 l1_scales = {gemm_alpha, gemm_alpha};
+                        if constexpr (kUseXScales) {
+                            const float2 x_scales = {
+                                ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                                ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                            };
+                            l1_scales = __fmul2_rn(x_scales, l1_scales);
+                        }
 
                         // Load from TMEM
                         uint2 raw_values[4];
@@ -1139,8 +1164,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
-                            auto bf16_gate = __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + 0], {gemm_alpha, gemm_alpha}));
-                            auto bf16_up =   __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + 1], {gemm_alpha, gemm_alpha}));
+                            auto bf16_gate = __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + 0], l1_scales));
+                            auto bf16_up =   __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + 1], l1_scales));
 
                             // Clamp
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {

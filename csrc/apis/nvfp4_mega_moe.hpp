@@ -29,7 +29,8 @@ static int get_block_m_for_nvfp4_mega_moe(
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                                                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+                                                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                                                    torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_nvfp4_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
@@ -139,9 +140,13 @@ get_symm_buffer_size_for_nvfp4_mega_moe(
             {num_sf_ring_tokens, intermediate_hidden / packed_sf_k},
             {1, num_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
+        auto x_scales = torch::from_blob(
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_x_scales_buffer.base)),
+            {num_max_tokens_per_rank},
+            torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
-                               l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
+                               l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, x_scales);
     };
     return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
@@ -163,7 +168,8 @@ static void nvfp4_mega_moe(
     const float& activation_beta,
     const std::optional<torch::Tensor>& l1_alpha_opt,
     const std::optional<torch::Tensor>& l2_alpha_opt,
-    const float& l2_activation_scale
+    const float& l2_activation_scale,
+    const bool& use_x_scales
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -273,7 +279,7 @@ static void nvfp4_mega_moe(
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights,
                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
-                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, x_scales] = slice(sym_buffer);
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -294,7 +300,7 @@ static void nvfp4_mega_moe(
                    num_tokens, num_topk,
                    hidden, intermediate_hidden,
                    activation_clamp, activation_alpha, activation_beta, fast_math,
-                   l1_alpha_opt, l2_alpha_opt, l2_activation_scale);
+                   l1_alpha_opt, l2_alpha_opt, l2_activation_scale, use_x_scales);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -322,7 +328,7 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("activation_clamp"),
           pybind11::arg("fast_math"), pybind11::arg("activation_alpha"), pybind11::arg("activation_beta"),
           pybind11::arg("l1_alpha") = pybind11::none(), pybind11::arg("l2_alpha") = pybind11::none(),
-          pybind11::arg("l2_activation_scale") = 1.0f);
+          pybind11::arg("l2_activation_scale") = 1.0f, pybind11::arg("use_x_scales") = false);
 }
 
 } // namespace deep_gemm::nvfp4_mega

@@ -67,7 +67,8 @@ class NVFP4SymmBuffer:
          self.shared_l1_acts, self.shared_l1_acts_sf,
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+         self.l2_acts, self.l2_acts_sf,
+         self.x_scales) = slice_input_buffers(self.buffer)
 
     def destroy(self):
         self.handle = None
@@ -75,6 +76,7 @@ class NVFP4SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.x_scales = None
 
 
 def nvfp4_mega_moe(y: torch.Tensor,
@@ -90,7 +92,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
                   activation_beta: float = 0.0,
                   l1_alpha: Optional[torch.Tensor] = None,
                   l2_alpha: Optional[torch.Tensor] = None,
-                  l2_activation_scale: float = 1.0):
+                  l2_activation_scale: float = 1.0,
+                  use_x_scales: bool = False):
     """Fused NVFP4 routed experts and MXFP8 or BF16 shared experts (SM100/SM103).
 
     Routed inputs/weights are packed E2M1 with one E4M3 scale per 16 values;
@@ -107,6 +110,9 @@ def nvfp4_mega_moe(y: torch.Tensor,
     when quantizing routed SwiGLU outputs; include it in ``l2_alpha``.
     Defaults use unit global scales. Routing weights are applied before L2
     activation quantization, as in the MXFP8 MegaMoE path.
+    With ``use_x_scales``, ``sym_buffer.x_scales`` holds one FP32 dequantization
+    scale per routed input token; it multiplies that token's L1 accumulator
+    together with ``l1_alpha``, before BF16 rounding and the activation.
     """
     assert isinstance(sym_buffer, NVFP4SymmBuffer), 'NVFP4 requires NVFP4SymmBuffer'
     assert (shared_l1_weights is not None) == (sym_buffer.num_shared_experts > 0)
@@ -131,5 +137,5 @@ def nvfp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         activation_clamp, fast_math,
         activation_alpha, activation_beta,
-        l1_alpha, l2_alpha, l2_activation_scale
+        l1_alpha, l2_alpha, l2_activation_scale, use_x_scales
     )

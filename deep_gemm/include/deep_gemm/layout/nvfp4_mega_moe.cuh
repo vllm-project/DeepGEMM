@@ -26,6 +26,10 @@ struct NVFP4MegaMoEBuffer {
            l2_sf_buffer,
            combine_token_buffer;
 
+    // Optional FP32 per-token outer scales of the routed L1 input
+    Buffer input_x_scales_buffer,
+           l1_x_scales_buffer;
+
     CUTLASS_HOST_DEVICE
     NVFP4MegaMoEBuffer(void* base,
                   const uint32_t& hidden,
@@ -61,6 +65,7 @@ struct NVFP4MegaMoEBuffer {
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+        const auto x_scales_layout = layout::Data(sizeof(float), false);
 
         // Input buffers
         input_token_buffer = Buffer(
@@ -114,11 +119,19 @@ struct NVFP4MegaMoEBuffer {
         combine_token_buffer = Buffer(
             bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             l2_sf_buffer.get_end_ptr());
+
+        // Appended so the offsets of all buffers above are unchanged
+        input_x_scales_buffer = Buffer(
+            x_scales_layout, 1, num_max_tokens_per_rank,
+            combine_token_buffer.get_end_ptr());
+        l1_x_scales_buffer = Buffer(
+            x_scales_layout, 1, num_ring_tokens,
+            input_x_scales_buffer.get_end_ptr());
     }
 
     CUTLASS_HOST_DEVICE
     int64_t get_num_bytes() const {
-        return static_cast<uint8_t*>(combine_token_buffer.get_end_ptr())
+        return static_cast<uint8_t*>(l1_x_scales_buffer.get_end_ptr())
                - reinterpret_cast<uint8_t*>(workspace.signals);
     }
 };

@@ -36,7 +36,8 @@ static void sm100_nvfp4_mega_moe(
     const bool& fast_math,
     const std::optional<torch::Tensor>& l1_alpha,
     const std::optional<torch::Tensor>& l2_alpha,
-    const float& l2_activation_scale
+    const float& l2_activation_scale,
+    const bool& use_x_scales
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -194,7 +195,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}, {}, {}
+        {}, {}, {},
+        {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -216,7 +218,8 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type(), false),
         shared_bf16 ? "cutlass::bfloat16_t" : "cutlass::float_e4m3_t",
-        shared_block_k));
+        shared_block_k,
+        use_x_scales ? "true" : "false"));
 
     // Launch
     jit->launch(
