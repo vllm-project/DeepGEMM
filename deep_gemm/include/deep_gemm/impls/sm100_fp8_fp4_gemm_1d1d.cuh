@@ -216,7 +216,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                                                   LOAD_BLOCK_N * BLOCK_K / (kIsFP4B ? 2 : 1);
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (scheduler.template get_next_block<true>(m_block_idx, n_block_idx)) {
             // Use dynamic load block M, when swap-AB is enabled
             const auto load_block_m = kSwapAB ? scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast : LOAD_BLOCK_M;
 
@@ -322,7 +322,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                          "Invalid MMA instruction shape");
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (scheduler.template get_next_block<true>(m_block_idx, n_block_idx)) {
             // Wait until this accumulator stage is fully reusable.
             // The overlap barrier is deferred to the first K block so that
             // the SF UTCCP can be issued while the preceding epilogue drains.
@@ -471,7 +471,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             ptx::st_shared(smem_ptr + lane_idx * 4, values[0], values[1], values[2], values[3]);
         };
 
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (scheduler.template get_next_block<true>(m_block_idx, n_block_idx)) {
             const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait SF TMA arrival
@@ -507,7 +507,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         uint32_t tma_stage_idx = 0;
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (scheduler.template get_next_block<true>(m_block_idx, n_block_idx)) {
             auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
 

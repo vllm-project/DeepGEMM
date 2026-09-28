@@ -157,6 +157,61 @@ def test_m_grouped_gemm_contiguous() -> None:
     print()
 
 
+def test_sm100_m_grouped_invalid_blocks() -> None:
+    """Skip wholly invalid CTA groups without desynchronizing the MMA pipeline."""
+    if get_arch_major() != 10:
+        return
+    previous_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+    try:
+        m, k, groups = 8192, 512, 4
+        x = torch.randint(-8, 9, (m, k), device='cuda').float() / 4
+        a = x.to(torch.float8_e4m3fn)
+        sa = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+            torch.ones((m, k // 128), device='cuda'))
+        # Odd/even N tile counts select 1-CTA and 2-CTA kernels respectively.
+        for n, fp4_weights in ((384, False), (4096, False), (384, True), (4096, True)):
+            if fp4_weights:
+                b = torch.full((groups, n, k // 2), 0x22, device='cuda', dtype=torch.int8)
+                b[1::2] = -86  # 0xaa: two E2M1 values of -1
+            else:
+                b = torch.ones((groups, n, k), device='cuda')
+                b[1::2] = -1
+                b = b.to(torch.float8_e4m3fn)
+            gran_k_b = 32 if fp4_weights else 128
+            sb = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                torch.ones((groups, n, k // gran_k_b), device='cuda'))
+            for pattern in ('none', 'all', 'leading', 'trailing', 'holes'):
+                block = torch.arange(m // 128, device='cuda')
+                active = {'none': block < 0, 'all': block >= 0,
+                          'leading': block >= 32, 'trailing': block < 32,
+                          'holes': block % 3 == 1}[pattern]
+                layout = torch.where(active, block % groups, -1).to(torch.int32).repeat_interleave(128)
+                valid = layout >= 0
+                signs = torch.where(layout % 2 == 0, 1, -1)
+                ref = (x.sum(dim=1) * signs).to(torch.bfloat16)
+                d = torch.full((m, n), 123, device='cuda', dtype=torch.bfloat16)
+                def invoke():
+                    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                        (a, sa), (b, sb), d, layout,
+                        recipe_a=(1, 128), recipe_b=(1, gran_k_b))
+                invoke()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    invoke()
+                for _ in range(3):
+                    graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(d[valid], ref[valid, None].expand(-1, n)), (fp4_weights, pattern)
+                # With B multicast, one valid M tile keeps its 2-CTA pair
+                # active. Only demand untouched output for wholly invalid pairs.
+                invalid_pairs = (~valid.view(-1, 256).any(dim=1)).repeat_interleave(256)
+                assert torch.all(d[invalid_pairs] == 123), (fp4_weights, pattern)
+        print(' > SM100 invalid-block and graph-replay checks passed')
+    finally:
+        deep_gemm.set_mk_alignment_for_contiguous_layout(previous_alignment)
+
+
 def test_m_grouped_gemm_masked() -> None:
     print('Testing m-grouped masked GEMM:')
 
@@ -376,5 +431,6 @@ if __name__ == '__main__':
 
     test_gemm()
     test_m_grouped_gemm_contiguous()
+    test_sm100_m_grouped_invalid_blocks()
     test_m_grouped_gemm_masked()
     test_k_grouped_gemm_contiguous()

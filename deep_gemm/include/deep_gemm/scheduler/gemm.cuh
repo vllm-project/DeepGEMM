@@ -59,6 +59,7 @@ struct Scheduler {
                      "branch decomposes the index into mn_block_idx/split_k_idx");
 
     int current_iter = -1;
+    int current_candidate_iter = -1;
 
     // Block configs
     uint32_t num_blocks;
@@ -203,7 +204,34 @@ struct Scheduler {
         return BLOCK_M;
     }
 
+    template <bool kSkipInvalidBlocks = false>
     CUTLASS_DEVICE bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        if constexpr (kSkipInvalidBlocks and kGemmType == GemmType::MGroupedContiguous) {
+            // Pipeline phases count executed tiles, not skipped candidates.
+            ++ current_iter;
+            while (true) {
+                const auto candidate_idx = (++ current_candidate_iter) * kNumSMs + blockIdx.x;
+                if (candidate_idx >= num_blocks)
+                    return false;
+                get_swizzled_block_idx(candidate_idx, m_block_idx, n_block_idx);
+                bool is_valid = grouped_layout[m_block_idx * BLOCK_M] >= 0;
+
+                // A 2-CTA MMA must be skipped by both peers. With B multicast,
+                // the peers own different M tiles; retain the pair if either
+                // tile is valid. A multicast peers already share the M tile.
+                if constexpr (kNumMulticast > 1 and not kIsMulticastOnA) {
+                    DG_STATIC_ASSERT(kNumMulticast == 2, "Invalid cluster size");
+                    if ((candidate_idx ^ 1u) < num_blocks) {
+                        uint32_t peer_m_idx, peer_n_idx;
+                        get_swizzled_block_idx(candidate_idx ^ 1u, peer_m_idx, peer_n_idx);
+                        is_valid |= grouped_layout[peer_m_idx * BLOCK_M] >= 0;
+                    }
+                }
+                if (is_valid)
+                    return true;
+            }
+        }
+
         const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
 
         if constexpr (kGemmType == GemmType::MGroupedMasked) {
