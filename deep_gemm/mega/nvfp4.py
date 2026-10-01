@@ -108,8 +108,11 @@ def nvfp4_mega_moe(y: torch.Tensor,
     the products of activation and weight global dequantization scales.
     ``l2_activation_scale`` is the positive global dequantization scale used
     when quantizing routed SwiGLU outputs; include it in ``l2_alpha``.
-    Defaults use unit global scales. Routing weights are applied before L2
-    activation quantization, as in the MXFP8 MegaMoE path.
+    Defaults use unit global scales. The routed L2 input is the unweighted
+    SwiGLU output, so calibrate ``l2_activation_scale`` on it (as for a
+    checkpoint's down-projection input scale). Combine multiplies each routed
+    BF16 output by its top-k weight and accumulates in FP32; the shared expert
+    output has unit weight.
     With ``use_x_scales``, ``sym_buffer.x_scales`` holds one FP32 dequantization
     scale per routed input token; it multiplies that token's L1 accumulator
     together with ``l1_alpha``, before BF16 rounding and the activation.

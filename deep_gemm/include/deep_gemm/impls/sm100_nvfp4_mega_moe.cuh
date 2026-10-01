@@ -580,10 +580,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
-            // Load the weight first, so that its remote latency overlaps with the SF copy below
-            const auto weight = *sym_buffer.map(
-                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                current_rank_in_expert_idx);
+            // Load the input scale first, so that its remote latency overlaps with the SF copy below
+            // NOTES: top-k weights are not dispatched, combine applies them on the source rank
             float x_scale = 1.0f;
             if constexpr (kUseXScales) {
                 x_scale = *sym_buffer.map(
@@ -610,9 +608,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
-            // Store weights and metadata
+            // Store input scales and metadata
             if (cute::elect_one_sync()) {
-                *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
                 if constexpr (kUseXScales)
                     *buffer.l1_x_scales_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = x_scale;
 
@@ -1096,7 +1093,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
 
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
-                float stored_cached_weight = 1.0f;
+                // NOTES: the routed intermediate is unweighted, combine applies the top-k weights
                 float stored_cached_x_scale = 1.0f;
 
                 #pragma unroll
@@ -1115,29 +1112,17 @@ sm100_nvfp4_mega_moe_impl(void* y,
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         const uint32_t j = s * kNumAtomsPerStore + i;
 
-                        // Load weights from global into register cache per 32 tokens
-                        DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
-                            (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
-                            stored_cached_weight = *buffer.l1_topk_weights_buffer
-                                .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
-                                .template get_base_ptr<float>();
-                            if constexpr (kUseXScales) {
+                        // Per-token input scales join the per-expert alpha before BF16 rounding
+                        float2 l1_scales = {gemm_alpha, gemm_alpha};
+                        if constexpr (kUseXScales) {
+                            // Load input scales from global into register cache per 32 tokens
+                            DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
+                            if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                                (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                                 stored_cached_x_scale = *buffer.l1_x_scales_buffer
                                     .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
                                     .template get_base_ptr<float>();
                             }
-                        }
-
-                        // Load weights from register cache
-                        const float2 weights = {
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
-                        };
-
-                        // Per-token input scales join the per-expert alpha before BF16 rounding
-                        float2 l1_scales = {gemm_alpha, gemm_alpha};
-                        if constexpr (kUseXScales) {
                             const float2 x_scales = {
                                 ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                                 ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
@@ -1194,8 +1179,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
                             auto up = __bfloat1622float2(bf16_up);
                             if constexpr (kActivationBeta != 0.0f)
                                 up = __fadd2_rn(up, {kActivationBeta, kActivationBeta});
-                            activation_values[i][k] = __fmul2_rn(
-                                __fmul2_rn(gated, up), weights);
+                            activation_values[i][k] = __fmul2_rn(gated, up);
                         }
 
                         // Amax reduction (thread-level)
@@ -1560,6 +1544,10 @@ sm100_nvfp4_mega_moe_impl(void* y,
                 (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
+            // Read top-k weights in the same way, the shared expert slot has unit weight
+            const float stored_topk_weight = lane_idx < kNumTopk ?
+                buffer.input_topk_weights_buffer.get_base_ptr<float>()[token_idx * kNumTopk + lane_idx] : 1.0f;
+
             // Wait for the ranks of the selected experts to finish their L2 writes
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
@@ -1571,11 +1559,12 @@ sm100_nvfp4_mega_moe_impl(void* y,
 
             // Move mask and load
             uint32_t mask = total_mask;
-            const auto move_mask_and_load = [&](const uint32_t& i) {
+            const auto move_mask_and_load = [&](const uint32_t& i, float& weight) {
                 if (mask) {
                     // Move
                     const uint32_t slot_idx = __ffs(mask) - 1;
                     mask ^= 1 << slot_idx;
+                    weight = ptx::exchange(stored_topk_weight, slot_idx);
 
                     // Load
                     if (cute::elect_one_sync()) {
@@ -1593,13 +1582,14 @@ sm100_nvfp4_mega_moe_impl(void* y,
             };
 
             // Load the first selection
-            bool do_reduce = move_mask_and_load(load_stage_idx);
+            float weight = 1.0f, next_weight = 1.0f;
+            bool do_reduce = move_mask_and_load(load_stage_idx, weight);
 
-            // Accumulate all top-k contributions for this chunk in float registers
+            // Accumulate all weighted top-k contributions for this chunk in float registers
             float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
             while (do_reduce) {
                 // Prefetch next top-k into the buffer while current is being accumulated
-                do_reduce = move_mask_and_load(load_stage_idx ^ 1);
+                do_reduce = move_mask_and_load(load_stage_idx ^ 1, next_weight);
 
                 // Accumulate
                 combine_load_barriers[load_stage_idx]->wait(combine_phase);
@@ -1609,11 +1599,13 @@ sm100_nvfp4_mega_moe_impl(void* y,
                     const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
                     #pragma unroll
                     for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                        ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        reduced[j * kNumElemsPerUint4 + l] = __ffma2_rn(
+                            __bfloat1622float2(bf16_values[l]), {weight, weight}, reduced[j * kNumElemsPerUint4 + l]);
                 }
                 cutlass::arch::fence_view_async_shared();
                 combine_phase ^= load_stage_idx;
                 load_stage_idx ^= 1;
+                weight = next_weight;
             }
 
             // Cast

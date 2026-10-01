@@ -21,7 +21,6 @@ struct NVFP4MegaMoEBuffer {
     // Routed expert ring buffers
     Buffer l1_token_buffer,
            l1_sf_buffer,
-           l1_topk_weights_buffer,
            l2_token_buffer,
            l2_sf_buffer,
            combine_token_buffer;
@@ -64,7 +63,6 @@ struct NVFP4MegaMoEBuffer {
         const auto shared_intermediate_sf_layout = layout::Data(shared_with_sf ? shared_intermediate_hidden / 32 : 0, false);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
-        const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
         const auto x_scales_layout = layout::Data(sizeof(float), false);
 
         // Input buffers
@@ -105,13 +103,11 @@ struct NVFP4MegaMoEBuffer {
         l1_sf_buffer = Buffer(
             input_sf_layout, 1, num_sf_ring_tokens,
             l1_token_buffer.get_end_ptr());
-        l1_topk_weights_buffer = Buffer(
-            l1_topk_weights_layout, 1, num_ring_tokens,
-            l1_sf_buffer.get_end_ptr());
 
+        // NOTES: top-k weights stay on the source rank and are applied in combine
         l2_token_buffer = Buffer(
             intermediate_token_layout, 1, num_ring_tokens,
-            l1_topk_weights_buffer.get_end_ptr());
+            l1_sf_buffer.get_end_ptr());
         l2_sf_buffer = Buffer(
             intermediate_sf_layout, 1, num_sf_ring_tokens,
             l2_token_buffer.get_end_ptr());
@@ -120,7 +116,7 @@ struct NVFP4MegaMoEBuffer {
             bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             l2_sf_buffer.get_end_ptr());
 
-        // Appended so the offsets of all buffers above are unchanged
+        // Optional per-token input scales
         input_x_scales_buffer = Buffer(
             x_scales_layout, 1, num_max_tokens_per_rank,
             combine_token_buffer.get_end_ptr());

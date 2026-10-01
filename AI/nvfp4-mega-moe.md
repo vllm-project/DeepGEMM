@@ -99,10 +99,16 @@ to nearest, clamps them to `[2^-9, 448]`, and rounds/saturates E2M1 values.
 Global scales should be calibrated to avoid block-scale underflow/saturation.
 
 SwiGLU is `gate * sigmoid(alpha * gate) * (up + beta)`, with the existing
-MegaMoE BF16 rounding and clamp semantics. Routing weights multiply its output
-before the routed intermediate is quantized. Shared output enters combine with
-unit weight. This is a layer kernel; it does not compute routing scores or
-load model checkpoints. NVFP4 SiTU is not implemented.
+MegaMoE BF16 rounding and clamp semantics. Unlike the MXFP8 and BF16 MegaMoE
+paths, the routed intermediate is quantized without routing weights: combine
+multiplies each routed BF16 L2 output by its top-k weight on the source rank and
+accumulates in FP32, and the shared output enters combine with unit weight. The
+per-16 E4M3 block scale is per token, so the weight placement does not change
+block-relative error, but an unweighted intermediate keeps `l2_activation_scale`
+calibrated on the down-projection input and avoids E4M3 scale saturation when
+weights exceed one (for example, a routed scaling factor folded into them).
+This is a layer kernel; it does not compute routing scores or load model
+checkpoints. NVFP4 SiTU is not implemented.
 
 ## Verification and timing
 

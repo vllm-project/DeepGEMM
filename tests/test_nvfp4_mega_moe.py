@@ -94,9 +94,12 @@ def reference(x, shared_x, indices, weights, w, sw, mode, args, rank, world):
             continue
         w1 = dequantize((w[0][0][e], w[0][1][e]), mode, args.weight_scale if mode == 'nvfp4' else 1)
         w2 = dequantize((w[1][0][e], w[1][1][e]), mode, args.weight_scale if mode == 'nvfp4' else 1)
-        mid = activation(gx[rows] @ w1.T, gw[rows, slots, None], args)
+        # NVFP4 weights BF16 expert outputs in combine; the legacy path weights the intermediate
+        routing = gw[rows, slots, None]
+        mid = activation(gx[rows] @ w1.T, 1.0 if mode == 'nvfp4' else routing, args)
         mid = dequantize(quantize(mid, act_mode, args.mid_scale), act_mode, args.mid_scale)
-        y.index_add_(0, rows, (mid @ w2.T).to(torch.bfloat16).float())
+        out = (mid @ w2.T).to(torch.bfloat16).float()
+        y.index_add_(0, rows, routing * out if mode == 'nvfp4' else out)
     dist.all_reduce(y)
     y = y[rank * x.size(0):(rank + 1) * x.size(0)]
     if sw is not None:
