@@ -23,6 +23,16 @@ inline void init_jit(const std::string& library_root_path) {
 
     jit = deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>>([config] {
         auto runtime = std::make_shared<deep_jit::Runtime<deep_jit::CUDA>>(config);
+
+        // Use the SM100 family target while the pinned CUTLASS lacks SM107 guards.
+        // Keep the physical capability unchanged for kernel dispatch. Remove this
+        // override once native SM107 JIT compilation and execution are validated:
+        // https://github.com/deepseek-ai/DeepGEMM/issues/461
+        const auto [major, minor] = runtime->device.get_arch_pair();
+        if (major == 10 and minor == 7) {
+            runtime->default_compiler_options.arch = "100f";
+        }
+
         runtime->default_compiler_options.nvcc_flags->
             emplace_back("--diag-suppress=39,161,174,177,186,940");
         runtime->default_compiler_options.nvcc_flags->
