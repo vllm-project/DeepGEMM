@@ -17,7 +17,7 @@
 //
 // UNVALIDATED: no sm120 hardware was available while porting; none of this has been run.
 
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm120_bf16_gemm.hpp"

@@ -1,10 +1,12 @@
 #pragma once
 
+#include <torch/library.h>
+#include "../torch_library_utils.hpp"
+
 #include <format>
 #include <variant>
 
-#include <pybind11/pybind11.h>
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/layout.hpp"
@@ -297,14 +299,33 @@ static void fp8_einsum(const std::string& expr,
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
     }
 }
-static void register_apis(pybind11::module_& m) {
-    m.def("einsum", &einsum,
-          py::arg("expr"), py::arg("a"), py::arg("b"),
-          py::arg("d"), py::arg("c") = std::nullopt);
-    m.def("fp8_einsum", &fp8_einsum,
-          py::arg("expr"), py::arg("a"), py::arg("b"),
-          py::arg("d"), py::arg("c") = std::nullopt,
-          py::arg("recipe") = std::make_tuple(1, 128, 128));
+}  // namespace deep_gemm::einsum
+
+namespace deep_gemm::torch_registration {
+using namespace deep_gemm::torch_utils;
+
+static void fp8_einsum(const std::string& expr,
+                       const torch::Tensor& a, const torch::Tensor& sfa,
+                       const torch::Tensor& b, const torch::Tensor& sfb,
+                       const torch::Tensor& d, const c10::optional<torch::Tensor>& c,
+                       const std::vector<int64_t>& recipe,
+                       const std::optional<torch::Tensor>& sfd) {
+    std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>> output = d;
+    if (sfd.has_value()) output = std::make_pair(d, *sfd);
+    einsum::fp8_einsum(expr, {a, sfa}, {b, sfb}, output, c, list_to_tuple3(recipe));
+}
+} // namespace deep_gemm::torch_registration
+
+TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def(
+        "einsum(str expr, Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None) -> ()");
+    m.def(
+        "fp8_einsum(str expr, Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3] recipe, Tensor(sfd!)? sfd=None) -> ()");
 }
 
-} // namespace deep_gemm::einsum
+TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    using namespace deep_gemm::torch_registration;
+
+    m.impl("einsum", TORCH_FN(deep_gemm::einsum::einsum));
+    m.impl("fp8_einsum", TORCH_FN(fp8_einsum));
+}

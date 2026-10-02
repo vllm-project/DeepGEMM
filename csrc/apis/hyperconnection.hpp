@@ -1,5 +1,7 @@
 #pragma once
 
+#include <torch/library.h>
+
 #include "../utils/compatibility.hpp"
 
 #include "../jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp"
@@ -58,10 +60,27 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
 }
 
 
-static void register_apis(pybind11::module_& m) {
-    m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("sqr_sum"),
-          py::arg("num_splits") = std::nullopt);
+}  // namespace deep_gemm::hyperconnection
+
+namespace deep_gemm::torch_registration {
+static void tf32_hc_prenorm_gemm(const torch::Tensor& a, const torch::Tensor& b,
+                                  const torch::Tensor& d, const torch::Tensor& sqr_sum,
+                                  const c10::optional<int64_t>& num_splits) {
+    hyperconnection::tf32_hc_prenorm_gemm(
+        a, b, d, sqr_sum,
+        num_splits.has_value()
+            ? std::make_optional(static_cast<int>(num_splits.value()))
+            : std::nullopt);
+}
+} // namespace deep_gemm::torch_registration
+
+TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def(
+        "tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor(d!) d, Tensor(sqr_sum!) sqr_sum, int? num_splits=None) -> ()");
 }
 
-} // namespace deep_gemm::hyperconnection
+TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    using namespace deep_gemm::torch_registration;
+
+    m.impl("tf32_hc_prenorm_gemm", TORCH_FN(tf32_hc_prenorm_gemm));
+}

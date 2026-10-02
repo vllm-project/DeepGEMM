@@ -1,7 +1,7 @@
 #pragma once
 
 #include <format>
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>

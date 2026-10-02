@@ -3,7 +3,7 @@
 #include <optional>
 #include <string>
 
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include <deep_gemm/common/types.cuh>
 
