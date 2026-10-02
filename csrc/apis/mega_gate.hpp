@@ -1,13 +1,16 @@
 #pragma once
 
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../utils/torch_compat.hpp"
+#include "../torch_library_utils.hpp"
+
 #include <cmath>
 #include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
 
-#include <c10/cuda/CUDAGraphsC10Utils.h>
-#include <torch/python.h>
 
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_gate.hpp"
@@ -26,25 +29,24 @@ static int get_scoring_type(const std::string& scoring_func) {
     DG_HOST_UNREACHABLE("Unsupported MoE scoring function");
 }
 
-static const torch::Tensor& get_score_barriers(const torch::TensorOptions& options) {
-    const auto stream = at::cuda::getCurrentCUDAStream();
-    DG_HOST_ASSERT(options.device() == stream.device());
-    static std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> score_barriers_by_stream;
+static const torch::stable::Tensor& get_score_barriers(const torch::stable::Tensor& reference) {
+    const auto stream = torch_compat::stream_key(reference);
+
+    static std::map<torch_compat::StreamKey, torch::stable::Tensor> score_barriers_by_stream;
     auto& score_barriers = score_barriers_by_stream[stream];
     if (not score_barriers.defined()) {
-        DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None);
-        score_barriers = torch::zeros({mega_gate_layout::kNumMaxTokenBlocks, mega_gate_layout::kScoreBarrierLineBytes},
-                                      options.dtype(torch::kByte));
+        DG_HOST_ASSERT(not torch_compat::is_capturing(stream.second));
+        score_barriers = torch::stable::new_zeros(reference, {mega_gate_layout::kNumMaxTokenBlocks, mega_gate_layout::kScoreBarrierLineBytes}, torch::headeronly::ScalarType::Byte);
     }
     return score_barriers;
 }
 
-static void check_same_cuda_device(const torch::Tensor& tensor, const torch::Tensor& reference) {
+static void check_same_cuda_device(const torch::stable::Tensor& tensor, const torch::stable::Tensor& reference) {
     DG_HOST_ASSERT(tensor.is_cuda() and tensor.get_device() == reference.get_device());
 }
 
-static void check_tensor(const torch::Tensor& tensor, const torch::Tensor& reference,
-                         const at::IntArrayRef& shape, const torch::ScalarType& scalar_type,
+static void check_tensor(const torch::stable::Tensor& tensor, const torch::stable::Tensor& reference,
+                         const torch::headeronly::IntHeaderOnlyArrayRef& shape, const torch::headeronly::ScalarType& scalar_type,
                          const bool& contiguous = true) {
     check_same_cuda_device(tensor, reference);
     DG_HOST_ASSERT(tensor.sizes() == shape and tensor.scalar_type() == scalar_type and
@@ -82,31 +84,31 @@ static void check_tensor(const torch::Tensor& tensor, const torch::Tensor& refer
  *     The kernel ranks experts on score + bias, while the emitted weights are the
  *     unbiased scores normalized over the top-k sum and scaled by routed_scaling_factor.
  */
-static std::tuple<torch::Tensor, torch::Tensor>
-bf16_mega_gate(const torch::Tensor& x,
-               const torch::Tensor& weight,
+static std::tuple<torch::stable::Tensor, torch::stable::Tensor>
+bf16_mega_gate(const torch::stable::Tensor& x,
+               const torch::stable::Tensor& weight,
                const int& num_topk,
                const bool& use_shared_as_routed,
                const int& num_shared_experts,
                const float& routed_scaling_factor,
                const int& ep_rank,
                const std::string& scoring_func,
-               const std::optional<torch::Tensor>& mask,
-               const std::optional<torch::Tensor>& bias,
-               const std::optional<torch::Tensor>& image_bias,
-               const std::optional<torch::Tensor>& image_token_mask,
-               const std::optional<torch::Tensor>& fix_routing_mask,
-               const std::optional<torch::Tensor>& to_physical_map,
-               const std::optional<torch::Tensor>& logical_count,
-               const std::optional<torch::Tensor>& unmapped_topk_idx,
-               const std::optional<torch::Tensor>& force_random,
-               const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& out) {
+               const std::optional<torch::stable::Tensor>& mask,
+               const std::optional<torch::stable::Tensor>& bias,
+               const std::optional<torch::stable::Tensor>& image_bias,
+               const std::optional<torch::stable::Tensor>& image_token_mask,
+               const std::optional<torch::stable::Tensor>& fix_routing_mask,
+               const std::optional<torch::stable::Tensor>& to_physical_map,
+               const std::optional<torch::stable::Tensor>& logical_count,
+               const std::optional<torch::stable::Tensor>& unmapped_topk_idx,
+               const std::optional<torch::stable::Tensor>& force_random,
+               const std::optional<std::tuple<torch::stable::Tensor, torch::stable::Tensor>>& out) {
     const auto [num_tokens, hidden] = get_shape<2>(x);
     const auto [num_routed_experts, weight_hidden] = get_shape<2>(weight);
     DG_HOST_ASSERT(hidden == weight_hidden);
     DG_HOST_ASSERT(hidden > 0 and hidden % 256 == 0);
     DG_HOST_ASSERT(num_routed_experts > 0 and num_routed_experts <= 512 and num_routed_experts % 4 == 0);
-    DG_HOST_ASSERT(x.scalar_type() == torch::kBFloat16 and weight.scalar_type() == torch::kBFloat16 and
+    DG_HOST_ASSERT(x.scalar_type() == torch::headeronly::ScalarType::BFloat16 and weight.scalar_type() == torch::headeronly::ScalarType::BFloat16 and
                    x.is_contiguous() and weight.is_contiguous());
     check_same_cuda_device(weight, x);
 
@@ -126,14 +128,14 @@ bf16_mega_gate(const torch::Tensor& x,
     DG_HOST_ASSERT(num_physical_topk <= 32);
 
     if (mask.has_value())
-        check_tensor(mask.value(), x, {num_tokens}, torch::kBool);
+        check_tensor(mask.value(), x, {num_tokens}, torch::headeronly::ScalarType::Bool);
     if (bias.has_value())
-        check_tensor(bias.value(), x, {num_routed_experts}, torch::kFloat32);
+        check_tensor(bias.value(), x, {num_routed_experts}, torch::headeronly::ScalarType::Float);
 
     DG_HOST_ASSERT(image_bias.has_value() == image_token_mask.has_value());
     if (image_bias.has_value()) {
-        check_tensor(image_bias.value(), x, {num_routed_experts}, torch::kFloat32);
-        check_tensor(image_token_mask.value(), x, {num_tokens}, torch::kBool);
+        check_tensor(image_bias.value(), x, {num_routed_experts}, torch::headeronly::ScalarType::Float);
+        check_tensor(image_token_mask.value(), x, {num_tokens}, torch::headeronly::ScalarType::Bool);
     }
 
     DG_HOST_ASSERT(to_physical_map.has_value() == logical_count.has_value());
@@ -142,30 +144,30 @@ bf16_mega_gate(const torch::Tensor& x,
         const auto& physical_map = to_physical_map.value();
         DG_HOST_ASSERT(physical_map.dim() == 2);
         DG_HOST_ASSERT(physical_map.size(1) > 0);
-        check_tensor(physical_map, x, {num_logical_experts, physical_map.size(1)}, torch::kInt32);
-        check_tensor(logical_count.value(), x, {num_logical_experts}, torch::kInt32);
+        check_tensor(physical_map, x, {num_logical_experts, physical_map.size(1)}, torch::headeronly::ScalarType::Int);
+        check_tensor(logical_count.value(), x, {num_logical_experts}, torch::headeronly::ScalarType::Int);
     }
 
     if (unmapped_topk_idx.has_value()) {
         const auto& unmapped = unmapped_topk_idx.value();
-        check_tensor(unmapped, x, {num_tokens, num_topk}, torch::kInt64, false);
+        check_tensor(unmapped, x, {num_tokens, num_topk}, torch::headeronly::ScalarType::Long, false);
         DG_HOST_ASSERT(unmapped.stride(1) == 1);
     }
     if (fix_routing_mask.has_value()) {
         DG_HOST_ASSERT(unmapped_topk_idx.has_value());
-        check_tensor(fix_routing_mask.value(), x, {num_tokens}, torch::kBool);
+        check_tensor(fix_routing_mask.value(), x, {num_tokens}, torch::headeronly::ScalarType::Bool);
     }
     if (force_random.has_value())
-        check_tensor(force_random.value(), x, {num_tokens}, torch::kBool);
+        check_tensor(force_random.value(), x, {num_tokens}, torch::headeronly::ScalarType::Bool);
 
-    torch::Tensor topk_idx, topk_weights;
+    torch::stable::Tensor topk_idx, topk_weights;
     if (out.has_value()) {
         std::tie(topk_idx, topk_weights) = out.value();
-        check_tensor(topk_idx, x, {num_tokens, num_physical_topk}, torch::kInt64);
-        check_tensor(topk_weights, x, {num_tokens, num_physical_topk}, torch::kFloat32);
+        check_tensor(topk_idx, x, {num_tokens, num_physical_topk}, torch::headeronly::ScalarType::Long);
+        check_tensor(topk_weights, x, {num_tokens, num_physical_topk}, torch::headeronly::ScalarType::Float);
     } else {
-        topk_idx = torch::empty({num_tokens, num_physical_topk}, x.options().dtype(torch::kInt64));
-        topk_weights = torch::empty({num_tokens, num_physical_topk}, x.options().dtype(torch::kFloat32));
+        topk_idx = torch::stable::new_empty(x, {num_tokens, num_physical_topk}, torch::headeronly::ScalarType::Long);
+        topk_weights = torch::stable::new_empty(x, {num_tokens, num_physical_topk}, torch::headeronly::ScalarType::Float);
     }
 
     if (num_tokens == 0)
@@ -181,8 +183,8 @@ bf16_mega_gate(const torch::Tensor& x,
     const auto num_token_blocks = ceil_div(num_tokens, config.block_tokens);
     const auto num_scratch_bytes = mega_gate_layout::Workspace<>::get_num_scratch_bytes(num_token_blocks, config.num_split_k,
                                                                                         config.block_tokens, num_aligned_experts);
-    const auto scratch = torch::empty({static_cast<int64_t>(num_scratch_bytes)}, x.options().dtype(torch::kByte));
-    const auto& score_barriers = get_score_barriers(x.options());
+    const auto scratch = torch::stable::new_empty(x, {static_cast<int64_t>(num_scratch_bytes)}, torch::headeronly::ScalarType::Byte);
+    const auto& score_barriers = get_score_barriers(x);
     sm100_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask,
                          to_physical_map, logical_count, topk_idx, unmapped_topk_idx,
                          topk_weights, force_random, num_tokens, hidden, num_routed_experts,
@@ -191,7 +193,7 @@ bf16_mega_gate(const torch::Tensor& x,
     return {topk_idx, topk_weights};
 }
 
-static pybind11::dict get_bf16_mega_gate_config(const int& num_tokens, const int& hidden,
+static std::vector<int64_t> get_bf16_mega_gate_config(const int& num_tokens, const int& hidden,
                                                 const int& num_routed_experts, const int& num_topk) {
     DG_HOST_ASSERT(num_tokens > 0 and num_tokens <= static_cast<int>(layout::mega_gate::kNumMaxTokens));
     DG_HOST_ASSERT(hidden > 0 and hidden % 256 == 0);
@@ -200,35 +202,64 @@ static pybind11::dict get_bf16_mega_gate_config(const int& num_tokens, const int
     const auto num_device_sms = runtime->get_num_sms();
     const auto config = get_sm100_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts,
                                                         num_device_sms, true, true, true);
-    pybind11::dict result;
-    result["block_tokens"] = config.block_tokens;
-    result["num_mma_ctas"] = config.num_mma_ctas;
-    result["num_split_k"] = config.num_split_k;
-    result["num_expert_groups"] = config.num_expert_groups;
-    result["num_gate_warpgroups"] = config.num_gate_warpgroups;
-    result["num_sms"] = config.num_launch_sms;
+    std::vector<int64_t> result;
+    result.push_back(config.block_tokens);
+    result.push_back(config.num_mma_ctas);
+    result.push_back(config.num_split_k);
+    result.push_back(config.num_expert_groups);
+    result.push_back(config.num_gate_warpgroups);
+    result.push_back(config.num_launch_sms);
     return result;
 }
 
-static void register_apis(pybind11::module_& m) {
-    m.def("get_bf16_mega_gate_config", &get_bf16_mega_gate_config,
-          py::arg("num_tokens"), py::arg("hidden"),
-          py::arg("num_routed_experts"), py::arg("num_topk"));
-    m.def("bf16_mega_gate", &bf16_mega_gate,
-          py::arg("x"), py::arg("weight"), py::arg("num_topk"),
-          py::arg("use_shared_as_routed"), py::arg("num_shared_experts"),
-          py::arg("routed_scaling_factor"), py::arg("ep_rank"),
-          py::arg("scoring_func") = "identity",
-          py::arg("mask") = std::nullopt,
-          py::arg("bias") = std::nullopt,
-          py::arg("image_bias") = std::nullopt,
-          py::arg("image_token_mask") = std::nullopt,
-          py::arg("fix_routing_mask") = std::nullopt,
-          py::arg("to_physical_map") = std::nullopt,
-          py::arg("logical_count") = std::nullopt,
-          py::arg("unmapped_topk_idx") = std::nullopt,
-          py::arg("force_random") = std::nullopt,
-          py::arg("out") = std::nullopt);
+} // namespace deep_gemm::mega_gate
+
+namespace deep_gemm::torch_registration {
+using namespace deep_gemm::torch_utils;
+
+static std::vector<int64_t> get_bf16_mega_gate_config(
+    const int64_t& num_tokens,
+    const int64_t& hidden,
+    const int64_t& num_routed_experts,
+    const int64_t& num_topk) {
+    return mega_gate::get_bf16_mega_gate_config(
+        num_tokens, hidden, num_routed_experts, num_topk);
 }
 
-} // namespace deep_gemm::mega_gate
+static void bf16_mega_gate(const torch::stable::Tensor& x,
+               const torch::stable::Tensor& weight,
+               const int64_t& num_topk,
+               const bool& use_shared_as_routed,
+               const int64_t& num_shared_experts,
+               const double& routed_scaling_factor,
+               const int64_t& ep_rank,
+               const std::string& scoring_func,
+               const std::optional<torch::stable::Tensor>& mask,
+               const std::optional<torch::stable::Tensor>& bias,
+               const std::optional<torch::stable::Tensor>& image_bias,
+               const std::optional<torch::stable::Tensor>& image_token_mask,
+               const std::optional<torch::stable::Tensor>& fix_routing_mask,
+               const std::optional<torch::stable::Tensor>& to_physical_map,
+               const std::optional<torch::stable::Tensor>& logical_count,
+               const std::optional<torch::stable::Tensor>& unmapped_topk_idx,
+               const std::optional<torch::stable::Tensor>& force_random,
+               const torch::stable::Tensor& topk_idx, const torch::stable::Tensor& topk_weights) {
+    mega_gate::bf16_mega_gate(x, weight, num_topk, use_shared_as_routed, num_shared_experts, routed_scaling_factor,
+        ep_rank, scoring_func, mask, bias, image_bias, image_token_mask, fix_routing_mask, to_physical_map,
+        logical_count, unmapped_topk_idx, force_random, std::make_tuple(topk_idx, topk_weights));
+}
+} // namespace deep_gemm::torch_registration
+
+STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def("_get_bf16_mega_gate_config(int num_tokens, int hidden, int num_routed_experts, int num_topk) -> int[]");
+
+    m.def("bf16_mega_gate(Tensor x, Tensor weight, int num_topk, bool use_shared_as_routed, int num_shared_experts, float routed_scaling_factor, int ep_rank, str scoring_func, Tensor? mask, Tensor? bias, Tensor? image_bias, Tensor? image_token_mask, Tensor? fix_routing_mask, Tensor? to_physical_map, Tensor? logical_count, Tensor(c!)? unmapped_topk_idx, Tensor? force_random, Tensor(a!) topk_idx, Tensor(b!) topk_weights) -> ()");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {
+    m.impl("_get_bf16_mega_gate_config", TORCH_BOX(&deep_gemm::torch_registration::get_bf16_mega_gate_config));
+}
+
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    m.impl("bf16_mega_gate", TORCH_BOX(&deep_gemm::torch_registration::bf16_mega_gate));
+}

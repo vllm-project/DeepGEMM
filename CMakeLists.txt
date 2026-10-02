@@ -14,7 +14,6 @@ set(CUDA_ARCH_LIST "9.0" CACHE STRING "List of CUDA architectures to compile")
 set(TORCH_CUDA_ARCH_LIST "${CUDA_ARCH_LIST}")
 
 find_package(CUDAToolkit REQUIRED)
-find_package(pybind11 REQUIRED)
 find_package(Torch REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -23,12 +22,17 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 include_directories(deep_gemm/include third-party/deep_jit/include third-party/cutlass/include third-party/cutlass/tools/util/include)
-include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include/cccl ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS})
+include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include/cccl ${TORCH_INCLUDE_DIRS})
 link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib64 ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs)
 
 # The main Python API entrance
-pybind11_add_module(_C csrc/python_api.cpp)
-target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python)
+add_library(_C_extension MODULE csrc/python_api.cpp)
+set_target_properties(_C_extension PROPERTIES PREFIX "")
+target_compile_definitions(_C_extension PRIVATE
+    DJ_DISABLE_GIL=1
+    TORCH_TARGET_VERSION=0x020a000000000000
+    USE_CUDA)
+target_link_libraries(_C_extension PRIVATE ${TORCH_LIBRARIES} CUDA::cudart)
 
 # Enable kernel code indexing with CMake-based IDEs
 cuda_add_library(deep_gemm_indexing_cuda STATIC csrc/indexing/main.cu)

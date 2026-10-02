@@ -1,7 +1,9 @@
 #pragma once
 
 #include <format>
-#include <torch/python.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
@@ -76,15 +78,15 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
-                               const torch::Tensor& b, const torch::Tensor& sfb,
-                               const std::optional<torch::Tensor>& c,
-                               const torch::Tensor& d,
+static void sm90_fp8_gemm_1d2d(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                               const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                               const std::optional<torch::stable::Tensor>& c,
+                               const torch::stable::Tensor& d,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                const std::string& compiled_dims,
                                const std::optional<std::string>& epilogue_type = std::nullopt) {
-    DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::headeronly::ScalarType::BFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto desc = GemmDesc {
@@ -134,7 +136,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         },
         .epilogue_type = epilogue_type,
         .major_sfb = major_sfb,
-        .sfb = sfb.data_ptr(),
+        .sfb = sfb.mutable_data_ptr(),
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -143,16 +145,16 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
     });
 }
 
-static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                                    const torch::Tensor& b, const torch::Tensor& sfb,
-                                                    const torch::Tensor& d,
-                                                    const torch::Tensor& m_indices,
+static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                                                    const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                                                    const torch::stable::Tensor& d,
+                                                    const torch::stable::Tensor& m_indices,
                                                     const int& num_groups, const int& m, const int& n, const int& k,
                                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                     const std::string& compiled_dims,
                                                     const bool& use_psum_layout,
                                                     const std::optional<int>& expected_m_for_psum_layout) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto gemm_type = use_psum_layout ?
@@ -212,8 +214,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         },
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
-        .sfb = sfb.data_ptr(),
-        .grouped_layout = m_indices.data_ptr(),
+        .sfb = sfb.mutable_data_ptr(),
+        .grouped_layout = m_indices.mutable_data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -221,15 +223,15 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     });
 }
 
-static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                                const torch::Tensor& b, const torch::Tensor& sfb,
-                                                const torch::Tensor& d,
-                                                const torch::Tensor& masked_m,
+static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                                                const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                                                const torch::stable::Tensor& d,
+                                                const torch::stable::Tensor& masked_m,
                                                 const int& num_groups, const int& m, const int& n, const int& k,
                                                 const int& expected_m,
                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                 const std::string& compiled_dims) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto desc = GemmDesc {
@@ -280,8 +282,8 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         },
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
-        .sfb = sfb.data_ptr(),
-        .grouped_layout = masked_m.data_ptr(),
+        .sfb = sfb.mutable_data_ptr(),
+        .grouped_layout = masked_m.mutable_data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -289,14 +291,14 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
     });
 }
 
-static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
-                         const torch::Tensor& b, const torch::Tensor& sfb,
-                         const std::optional<torch::Tensor>& c,
-                         const torch::Tensor& d,
+static void sm90_fp8_bmm(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                         const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                         const std::optional<torch::stable::Tensor>& c,
+                         const torch::stable::Tensor& d,
                          const int& batch_size, const int& m, const int& n, const int& k,
                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto desc = GemmDesc {
@@ -352,7 +354,7 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         },
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
-        .sfb = sfb.data_ptr(),
+        .sfb = sfb.mutable_data_ptr(),
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,

@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <format>
-#include <torch/python.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include <deep_gemm/layout/mega_gate.cuh>
 
@@ -15,25 +17,25 @@ namespace deep_gemm {
 
 namespace mega_gate_layout = layout::mega_gate;
 
-static void sm100_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weight,
-                                 const std::optional<torch::Tensor>& bias,
-                                 const std::optional<torch::Tensor>& image_bias,
-                                 const std::optional<torch::Tensor>& image_token_mask,
-                                 const std::optional<torch::Tensor>& mask,
-                                 const std::optional<torch::Tensor>& fix_routing_mask,
-                                 const std::optional<torch::Tensor>& to_physical_map,
-                                 const std::optional<torch::Tensor>& logical_count,
-                                 const torch::Tensor& topk_idx,
-                                 const std::optional<torch::Tensor>& unmapped_topk_idx,
-                                 const torch::Tensor& topk_weights,
-                                 const std::optional<torch::Tensor>& force_random,
+static void sm100_bf16_mega_gate(const torch::stable::Tensor& x, const torch::stable::Tensor& weight,
+                                 const std::optional<torch::stable::Tensor>& bias,
+                                 const std::optional<torch::stable::Tensor>& image_bias,
+                                 const std::optional<torch::stable::Tensor>& image_token_mask,
+                                 const std::optional<torch::stable::Tensor>& mask,
+                                 const std::optional<torch::stable::Tensor>& fix_routing_mask,
+                                 const std::optional<torch::stable::Tensor>& to_physical_map,
+                                 const std::optional<torch::stable::Tensor>& logical_count,
+                                 const torch::stable::Tensor& topk_idx,
+                                 const std::optional<torch::stable::Tensor>& unmapped_topk_idx,
+                                 const torch::stable::Tensor& topk_weights,
+                                 const std::optional<torch::stable::Tensor>& force_random,
                                  const int& num_tokens, const int& hidden,
                                  const int& num_routed_experts, const int& num_topk,
                                  const int& num_shared_experts, const float& routed_scaling_factor,
                                  const int& ep_rank, const int& scoring_type,
                                  const SM100BF16MegaGateConfig& config,
-                                 const torch::Tensor& scratch,
-                                 const torch::Tensor& score_barriers) {
+                                 const torch::stable::Tensor& scratch,
+                                 const torch::stable::Tensor& score_barriers) {
     const auto num_duplicate_experts = to_physical_map.has_value() ? static_cast<int>(to_physical_map->size(1)) : 0;
     const auto unmapped_topk_idx_stride = unmapped_topk_idx.has_value() ? unmapped_topk_idx->stride(0) : 0;
     const auto num_aligned_experts = align(num_routed_experts, static_cast<int>(mega_gate_layout::kExpertAlignment));
@@ -83,13 +85,13 @@ static void __instantiate_kernel() {{
         config.num_launch_sms,
         num_topk, scoring_type,
         num_routed_experts == num_aligned_experts,
-        (mask ? mask->data_ptr() : nullptr) != nullptr,
-        (unmapped_topk_idx ? unmapped_topk_idx->data_ptr() : nullptr) != nullptr,
-        (to_physical_map ? to_physical_map->data_ptr() : nullptr) != nullptr,
-        (bias ? bias->data_ptr() : nullptr) != nullptr,
-        (image_token_mask ? image_token_mask->data_ptr() : nullptr) != nullptr,
-        (fix_routing_mask ? fix_routing_mask->data_ptr() : nullptr) != nullptr,
-        (force_random ? force_random->data_ptr() : nullptr) != nullptr));
+        (mask ? mask->mutable_data_ptr() : nullptr) != nullptr,
+        (unmapped_topk_idx ? unmapped_topk_idx->mutable_data_ptr() : nullptr) != nullptr,
+        (to_physical_map ? to_physical_map->mutable_data_ptr() : nullptr) != nullptr,
+        (bias ? bias->mutable_data_ptr() : nullptr) != nullptr,
+        (image_token_mask ? image_token_mask->mutable_data_ptr() : nullptr) != nullptr,
+        (fix_routing_mask ? fix_routing_mask->mutable_data_ptr() : nullptr) != nullptr,
+        (force_random ? force_random->mutable_data_ptr() : nullptr) != nullptr));
 
     // Launch
     jit->launch(
@@ -100,24 +102,24 @@ static void __instantiate_kernel() {{
             .cluster_dim = dim3(config.num_mma_ctas, 1, 1),
         },
         tensor_map_x, tensor_map_weight,
-        bias ? bias->data_ptr() : nullptr,
-        image_bias ? image_bias->data_ptr() : nullptr,
-        image_token_mask ? image_token_mask->data_ptr() : nullptr,
-        mask ? mask->data_ptr() : nullptr,
-        to_physical_map ? to_physical_map->data_ptr() : nullptr,
-        logical_count ? logical_count->data_ptr() : nullptr,
-        topk_idx.data_ptr(),
-        unmapped_topk_idx ? unmapped_topk_idx->data_ptr() : nullptr,
-        topk_weights.data_ptr(),
-        scratch.data_ptr(), score_barriers.data_ptr(),
+        bias ? bias->mutable_data_ptr() : nullptr,
+        image_bias ? image_bias->mutable_data_ptr() : nullptr,
+        image_token_mask ? image_token_mask->mutable_data_ptr() : nullptr,
+        mask ? mask->mutable_data_ptr() : nullptr,
+        to_physical_map ? to_physical_map->mutable_data_ptr() : nullptr,
+        logical_count ? logical_count->mutable_data_ptr() : nullptr,
+        topk_idx.mutable_data_ptr(),
+        unmapped_topk_idx ? unmapped_topk_idx->mutable_data_ptr() : nullptr,
+        topk_weights.mutable_data_ptr(),
+        scratch.mutable_data_ptr(), score_barriers.mutable_data_ptr(),
         static_cast<uint32_t>(num_tokens),
         static_cast<uint32_t>(num_routed_experts),
         static_cast<uint32_t>(num_shared_experts),
         static_cast<uint32_t>(num_duplicate_experts),
         routed_scaling_factor, static_cast<int>(ep_rank),
         unmapped_topk_idx_stride,
-        fix_routing_mask ? fix_routing_mask->data_ptr() : nullptr,
-        force_random ? force_random->data_ptr() : nullptr);
+        fix_routing_mask ? fix_routing_mask->mutable_data_ptr() : nullptr,
+        force_random ? force_random->mutable_data_ptr() : nullptr);
 }
 
 } // namespace deep_gemm

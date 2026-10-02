@@ -26,7 +26,7 @@ struct SM90ArchSpec {
             if (desc.m <= 32) block_m_candidates.push_back(32);
 
             // BF16 output GEMM supports 256
-            if (desc.cd_dtype != torch::kFloat)
+            if (desc.cd_dtype != torch::headeronly::ScalarType::Float)
                 block_m_candidates.push_back(256);
         } else if (desc.gemm_type == GemmType::MGroupedContiguous or
                    desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) {
@@ -40,7 +40,7 @@ struct SM90ArchSpec {
         int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
         int start = step;
         // Avoid bank conflicts for 1D1D kernel FP32 output
-        if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::kFloat) {
+        if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::headeronly::ScalarType::Float) {
             DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K);
             DG_HOST_ASSERT(desc.major_b == cute::UMMA::Major::K);
             start = 24;
@@ -131,12 +131,12 @@ struct SM90ArchSpec {
 
         // Decide swizzling by the inner dim
         const auto swizzle_mode_a = get_swizzle_mode(
-            desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m, c10::elementSize(desc.a_dtype));
+            desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m, desc.a_element_size);
         const auto swizzle_mode_b = get_swizzle_mode(
-            desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n, c10::elementSize(desc.b_dtype));
+            desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n, desc.b_element_size);
         // We only enable swizzling for non-FP32 outputs
-        const auto swizzle_mode_cd = desc.cd_dtype != torch::kFloat ?
-            get_swizzle_mode(store_block_n, c10::elementSize(desc.cd_dtype)) : 0;
+        const auto swizzle_mode_cd = desc.cd_dtype != torch::headeronly::ScalarType::Float ?
+            get_swizzle_mode(store_block_n, desc.cd_element_size) : 0;
 
         return {
             load_block_m, load_block_n,
@@ -152,12 +152,12 @@ struct SM90ArchSpec {
         // C/D for TMA stores
         // NOTES: 1024 is for TMA swizzling alignment requirement
         const int smem_cd =
-            align(layout.block_m * layout.block_n * static_cast<int>(c10::elementSize(desc.cd_dtype)), 1024);
+            align(layout.block_m * layout.block_n * static_cast<int>(desc.cd_element_size), 1024);
         const int smem_barriers = kNumMaxStages * 8 * 2;
 
         // Calculate A/B per stages
-        const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
-        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
+        const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * desc.a_element_size;
+        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * desc.b_element_size;
 
         // Calculate SF A/B per stages
         const int smem_sfa_per_stage = desc.kernel_type == KernelType::KernelNoSF ?
@@ -212,8 +212,8 @@ struct SM90ArchSpec {
         const int l2_bandwidth_per_cycle = std::min(64. * desc.num_sms, 8e6 / (1.3e3)); // B/cycle
         const int l1_bandwidth_per_cycle = 128 * desc.num_sms; // B/cycle
         const int wgmma_m = 64;
-        const int elem_size_ab = c10::elementSize(desc.a_dtype);
-        const int elem_size_cd = c10::elementSize(desc.cd_dtype);
+        const int elem_size_ab = desc.a_element_size;
+        const int elem_size_cd = desc.cd_element_size;
         DG_HOST_ASSERT(desc.a_dtype == desc.b_dtype);
 
         // Data movement per block

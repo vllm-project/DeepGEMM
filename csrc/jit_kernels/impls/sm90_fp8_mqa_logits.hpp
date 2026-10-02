@@ -8,13 +8,13 @@
 
 namespace deep_gemm {
 
-static void sm90_fp8_mqa_logits(const torch::Tensor& q,
-                                const torch::Tensor& kv, const torch::Tensor& kv_scales,
-                                const torch::Tensor& weights,
-                                const torch::Tensor& cu_seq_len_k_start,
-                                const torch::Tensor& cu_seq_len_k_end,
-                                const torch::Tensor& logits,
-                                const at::ScalarType& logits_dtype,
+static void sm90_fp8_mqa_logits(const torch::stable::Tensor& q,
+                                const torch::stable::Tensor& kv, const torch::stable::Tensor& kv_scales,
+                                const torch::stable::Tensor& weights,
+                                const torch::stable::Tensor& cu_seq_len_k_start,
+                                const torch::stable::Tensor& cu_seq_len_k_end,
+                                const torch::stable::Tensor& logits,
+                                const torch::headeronly::ScalarType& logits_dtype,
                                 const int& seq_len, const int& seq_len_kv,
                                 const int& max_seqlen_k, const int& stride_logits,
                                 const int& num_heads, const int& head_dim,
@@ -91,15 +91,15 @@ static void __instantiate_kernel() {{
         },
         seq_len, seq_len_kv,
         max_seqlen_k, stride_logits,
-        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
-        logits.data_ptr(),
+        cu_seq_len_k_start.mutable_data_ptr<int>(), cu_seq_len_k_end.mutable_data_ptr<int>(),
+        logits.mutable_data_ptr(),
         tensor_map_q, tensor_map_kv,
         tensor_map_kv_scales, tensor_map_weights
     );
 }
 
-static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
-                                           const torch::Tensor& schedule_metadata,
+static void sm90_paged_mqa_logits_metadata(const torch::stable::Tensor& context_lens,
+                                           const torch::stable::Tensor& schedule_metadata,
                                            const int& batch_size, const int& next_n,
                                            const int& block_kv, const int& num_clusters,
                                            const bool& is_context_lens_2d,
@@ -138,22 +138,22 @@ static void __instantiate_kernel() {{
         next_n,
         is_context_lens_2d,
         num_next_n_atoms,
-        context_lens.data_ptr<int>(),
+        context_lens.mutable_data_ptr<int>(),
         const_cast<int*>(indices_ptr),
-        schedule_metadata.data_ptr<int>()
+        schedule_metadata.mutable_data_ptr<int>()
     );
 }
 
-static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
-                                      const torch::Tensor& kv_cache,
-                                      const torch::Tensor& kv_cache_scales,
-                                      const torch::Tensor& weights,
-                                      const torch::Tensor& context_lens,
-                                      const torch::Tensor& logits,
-                                      const torch::Tensor& block_table,
-                                      const torch::Tensor& indices,
-                                      const torch::Tensor& schedule_meta,
-                                      const at::ScalarType& logits_dtype,
+static void sm90_fp8_paged_mqa_logits(const torch::stable::Tensor& q,
+                                      const torch::stable::Tensor& kv_cache,
+                                      const torch::stable::Tensor& kv_cache_scales,
+                                      const torch::stable::Tensor& weights,
+                                      const torch::stable::Tensor& context_lens,
+                                      const torch::stable::Tensor& logits,
+                                      const torch::stable::Tensor& block_table,
+                                      const torch::stable::Tensor& indices,
+                                      const torch::stable::Tensor& schedule_meta,
+                                      const torch::headeronly::ScalarType& logits_dtype,
                                       const int& batch_size, const int& next_n,
                                       const int& num_heads, const int& head_dim,
                                       const int& num_kv_blocks, const int& block_kv,
@@ -247,8 +247,8 @@ static void __instantiate_kernel() {{
         },
         batch_size,
         logits_stride, block_table_stride,
-        context_lens.data_ptr<int>(), logits.data_ptr(),
-        block_table.data_ptr<int>(), is_varlen ? indices.data_ptr<int>() : nullptr, schedule_meta.data_ptr<int>(),
+        context_lens.mutable_data_ptr<int>(), logits.mutable_data_ptr(),
+        block_table.mutable_data_ptr<int>(), is_varlen ? indices.mutable_data_ptr<int>() : nullptr, schedule_meta.mutable_data_ptr<int>(),
         tensor_map_q, tensor_map_kv,
         tensor_map_kv_scales, tensor_map_weights
     );

@@ -3,7 +3,9 @@
 #include <optional>
 #include <string>
 
-#include <torch/python.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include <deep_gemm/common/types.cuh>
 
@@ -27,11 +29,11 @@ struct EpilogueInput {
 static EpilogueInput make_epilogue_input(const int& m, const int& n,
                                          const std::optional<std::string>& epilogue_type = std::nullopt,
                                          const std::optional<float>& alpha = std::nullopt,
-                                         const std::optional<torch::Tensor>& sfd = std::nullopt) {
+                                         const std::optional<torch::stable::Tensor>& sfd = std::nullopt) {
     if (sfd.has_value()) {
         DG_HOST_ASSERT(not epilogue_type.has_value() and not alpha.has_value());
         return {"epilogue::transform::EpilogueDynamicScaledFP8",
-                {.sfd = static_cast<uint32_t*>(sfd->data_ptr()),
+                {.sfd = static_cast<uint32_t*>(sfd->mutable_data_ptr()),
                  .sfd_stride = static_cast<uint32_t>(sfd->stride(-1)),
                  .shape_m = static_cast<uint32_t>(m), .shape_n = static_cast<uint32_t>(n)}};
     }

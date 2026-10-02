@@ -1,7 +1,9 @@
 #pragma once
 
 #include <format>
-#include <torch/python.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -14,12 +16,12 @@
 namespace deep_gemm {
 
 static void sm100_bf16_mega_moe(
-    const torch::Tensor& y,
-    const torch::Tensor& l1_acts, const torch::Tensor& l2_acts,
-    const torch::Tensor& shared_l1_acts, const torch::Tensor& shared_l2_acts,
-    const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
-    const torch::Tensor& shared_l1_weights, const torch::Tensor& shared_l2_weights,
-    const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const torch::stable::Tensor& y,
+    const torch::stable::Tensor& l1_acts, const torch::stable::Tensor& l2_acts,
+    const torch::stable::Tensor& shared_l1_acts, const torch::stable::Tensor& shared_l2_acts,
+    const torch::stable::Tensor& l1_weights, const torch::stable::Tensor& l2_weights,
+    const torch::stable::Tensor& shared_l1_weights, const torch::stable::Tensor& shared_l2_weights,
+    const std::optional<torch::stable::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
@@ -103,7 +105,7 @@ static void sm100_bf16_mega_moe(
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
-        cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+        cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->mutable_data_ptr<int>();
 
     const auto num_sms = runtime->get_num_sms();
 
@@ -156,7 +158,7 @@ static void __instantiate_kernel() {{
             .block_dim = dim3(config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads, 1, 1),
             .cluster_dim = dim3(2, 1, 1),
         },
-        y.data_ptr(),
+        y.mutable_data_ptr(),
         cumulative_local_expert_recv_stats_ptr,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),

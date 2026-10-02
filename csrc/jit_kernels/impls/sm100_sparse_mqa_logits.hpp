@@ -12,8 +12,8 @@ namespace deep_gemm {
 
 using namespace layout::sparse_mqa_logits;
 
-static int get_sparse_mqa_split_kv(const at::ScalarType qk_dtype) {
-    DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::kFloat8_e4m3fn);
+static int get_sparse_mqa_split_kv(const torch::headeronly::ScalarType qk_dtype) {
+    DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::headeronly::ScalarType::Float8_e4m3fn);
     return qk_dtype == kPackedFP4 ? 640 : 512;
 }
 
@@ -37,10 +37,10 @@ static int64_t get_num_metadata_bytes(const int num_q_tokens, const int num_max_
 
 static void launch_sm100_sparse_mqa_logits(const bool is_paged, const bool use_unaligned_ks,
                                            const int sparse_block_kv,
-                                           const torch::Tensor& q, const torch::Tensor& sf_q,
-                                           const torch::Tensor& kv, const torch::Tensor& sf_kv,
-                                           const torch::Tensor& weights, const torch::Tensor& metadata,
-                                           const torch::Tensor& logits) {
+                                           const torch::stable::Tensor& q, const torch::stable::Tensor& sf_q,
+                                           const torch::stable::Tensor& kv, const torch::stable::Tensor& sf_kv,
+                                           const torch::stable::Tensor& weights, const torch::stable::Tensor& metadata,
+                                           const torch::stable::Tensor& logits) {
     constexpr int kNumQStages = 2;
     constexpr int kNumTmemStages = 5;
     const bool is_fp4 = q.scalar_type() == kPackedFP4;
@@ -50,7 +50,7 @@ static void launch_sm100_sparse_mqa_logits(const bool is_paged, const bool use_u
     const auto qk_dtype_name = is_fp4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t";
     DG_HOST_ASSERT(not is_paged or not use_unaligned_ks);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
-    DG_HOST_ASSERT(metadata.dim() == 1 and metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous() and
+    DG_HOST_ASSERT(metadata.dim() == 1 and metadata.scalar_type() == torch::headeronly::ScalarType::Byte and metadata.is_contiguous() and
                    metadata.numel() >= static_cast<int64_t>(sizeof(MetadataHeader)));
     const int num_q_tokens = static_cast<int>(q.size(0));
     const int swizzle_mode = is_fp4 ? kHeadDim / 2 : kHeadDim;
@@ -115,8 +115,8 @@ static void __instantiate_kernel() {{
                 .grid_dim = dim3(num_sms, 1, 1),
                 .block_dim = dim3(get_num_threads(num_math_warpgroups), 1, 1),
             },
-            static_cast<int>(logits.stride(0)), static_cast<int>(kv.stride(0)), logits.data_ptr(),
-            kv.data_ptr(), metadata.data_ptr<uint8_t>(), tensor_map_q, tensor_map_sf_q, tensor_map_weights
+            static_cast<int>(logits.stride(0)), static_cast<int>(kv.stride(0)), logits.mutable_data_ptr(),
+            kv.mutable_data_ptr(), metadata.mutable_data_ptr<uint8_t>(), tensor_map_q, tensor_map_sf_q, tensor_map_weights
         );
     } else {
         jit->launch(
@@ -125,8 +125,8 @@ static void __instantiate_kernel() {{
                 .grid_dim = dim3(num_sms, 1, 1),
                 .block_dim = dim3(get_num_threads(num_math_warpgroups), 1, 1),
             },
-            static_cast<int>(logits.stride(0)), logits.data_ptr(), kv.data_ptr(), sf_kv.data_ptr<int>(),
-            metadata.data_ptr<uint8_t>(), tensor_map_q, tensor_map_sf_q, tensor_map_weights,
+            static_cast<int>(logits.stride(0)), logits.mutable_data_ptr(), kv.mutable_data_ptr(), sf_kv.mutable_data_ptr<int>(),
+            metadata.mutable_data_ptr<uint8_t>(), tensor_map_q, tensor_map_sf_q, tensor_map_weights,
             tensor_map_kv, tensor_map_sf_kv
         );
     }
@@ -137,9 +137,9 @@ static void launch_sm100_sparse_mqa_logits_metadata(const bool is_paged,
                                                     const int page_kv,
                                                     const int num_kv_tokens,
                                                     const int block_table_stride,
-                                                    const torch::Tensor& sparse_kv_block_indices,
-                                                    const torch::Tensor& metadata,
-                                                    const torch::Tensor& workspace,
+                                                    const torch::stable::Tensor& sparse_kv_block_indices,
+                                                    const torch::stable::Tensor& metadata,
+                                                    const torch::stable::Tensor& workspace,
                                                     const int split_kv,
                                                     const int sparse_block_kv,
                                                     const int* cu_seq_len_k_start,
@@ -195,7 +195,7 @@ static void __instantiate_kernel() {{
         cu_seq_len_k_start, cu_seq_len_k_end,
         context_lens, block_table, block_table_stride,
         indices,
-        sparse_kv_block_indices.data_ptr<int>(), metadata.data_ptr<uint8_t>(), workspace.data_ptr<uint8_t>()
+        sparse_kv_block_indices.mutable_data_ptr<int>(), metadata.mutable_data_ptr<uint8_t>(), workspace.mutable_data_ptr<uint8_t>()
     );
 }
 

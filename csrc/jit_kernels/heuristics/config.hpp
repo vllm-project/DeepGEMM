@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cute/arch/mma_sm100_desc.hpp>
-#include <c10/core/ScalarType.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 #include <deep_gemm/common/types.cuh>
 
 #include "../../utils/math.hpp"
@@ -13,7 +15,12 @@ struct GemmDesc {
     GemmType gemm_type;
     KernelType kernel_type;
     int m, n, k, num_groups;
-    at::ScalarType a_dtype, b_dtype, cd_dtype;
+    const torch::headeronly::ScalarType a_dtype, b_dtype, cd_dtype;
+    // Filled once so layout enumeration does not repeatedly
+    // cross the stable ABI just to look up the same dtype sizes.
+    size_t a_element_size = torch_compat::element_size(a_dtype);
+    size_t b_element_size = torch_compat::element_size(b_dtype);
+    size_t cd_element_size = torch_compat::element_size(cd_dtype);
     cute::UMMA::Major major_a;
     cute::UMMA::Major major_b;
     bool with_accumulation;
@@ -44,7 +51,7 @@ struct GemmDesc {
     }
 
     MmaKind get_mma_kind() const {
-        if (a_dtype == torch::kBFloat16)
+        if (a_dtype == torch::headeronly::ScalarType::BFloat16)
             return MmaKind::BF16;
         return is_mxf4_mma() ? MmaKind::MXF4 : MmaKind::MXFP8FP4;
     }
@@ -55,14 +62,14 @@ struct GemmDesc {
 
     void check_validity() const {
         if (get_mma_kind() == MmaKind::BF16) {
-            DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
+            DG_HOST_ASSERT(a_dtype == torch::headeronly::ScalarType::BFloat16 and b_dtype == torch::headeronly::ScalarType::BFloat16);
         } else {
-            DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
-            DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
+            DG_HOST_ASSERT(a_dtype == torch::headeronly::ScalarType::Float8_e4m3fn or a_dtype == kPackedFP4);
+            DG_HOST_ASSERT(b_dtype == torch::headeronly::ScalarType::Float8_e4m3fn or b_dtype == kPackedFP4);
         }
         // FP8 D implies casting with dynamic per-32 UE8M0 SFD output, only exposed for batched GEMMs
-        DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat or
-                       (cd_dtype == torch::kFloat8_e4m3fn and gemm_type == GemmType::Batched and
+        DG_HOST_ASSERT(cd_dtype == torch::headeronly::ScalarType::BFloat16 or cd_dtype == torch::headeronly::ScalarType::Float or
+                       (cd_dtype == torch::headeronly::ScalarType::Float8_e4m3fn and gemm_type == GemmType::Batched and
                         not with_accumulation));
         DG_HOST_ASSERT(num_sms % 2 == 0);
     }
@@ -76,9 +83,9 @@ struct GemmDesc {
            << ", major_a=" << static_cast<int>(desc.major_a)
            << ", major_b=" << static_cast<int>(desc.major_b)
            << ", mma_kind=" << static_cast<int>(mma_kind)
-           << ", a_dtype=" << c10::toString(desc.a_dtype)
-           << ", b_dtype=" << c10::toString(desc.b_dtype)
-           << ", cd_dtype=" << c10::toString(desc.cd_dtype)
+           << ", a_dtype=" << torch::headeronly::toString(desc.a_dtype)
+           << ", b_dtype=" << torch::headeronly::toString(desc.b_dtype)
+           << ", cd_dtype=" << torch::headeronly::toString(desc.cd_dtype)
            << ", with_accumulation=" << static_cast<int>(desc.with_accumulation)
            << ", num_sms=" << desc.num_sms
            << ", tc_util=" << desc.tc_util

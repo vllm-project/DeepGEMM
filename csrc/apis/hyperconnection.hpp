@@ -1,5 +1,9 @@
 #pragma once
 
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../utils/torch_compat.hpp"
+
 #include "../utils/compatibility.hpp"
 
 #include "../jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp"
@@ -8,10 +12,10 @@
 
 namespace deep_gemm::hyperconnection {
 
-static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
-                                 const torch::Tensor& b,
-                                 const torch::Tensor& d,
-                                 const torch::Tensor& sqr_sum,
+static void tf32_hc_prenorm_gemm(const torch::stable::Tensor& a,
+                                 const torch::stable::Tensor& b,
+                                 const torch::stable::Tensor& d,
+                                 const torch::stable::Tensor& sqr_sum,
                                  const std::optional<int>& num_splits) {
     // A and B must be K-major, D must be N-major
     DG_HOST_ASSERT(get_major_type_ab(a) == cute::UMMA::Major::K);
@@ -35,10 +39,10 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
     }
     DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
-    DG_HOST_ASSERT(sqr_sum.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(a.scalar_type() == torch::headeronly::ScalarType::BFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::headeronly::ScalarType::Float);
+    DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::Float);
+    DG_HOST_ASSERT(sqr_sum.scalar_type() == torch::headeronly::ScalarType::Float);
 
     // Do nothing if the problem is empty
     if (m == 0)
@@ -58,10 +62,27 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
 }
 
 
-static void register_apis(pybind11::module_& m) {
-    m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("sqr_sum"),
-          py::arg("num_splits") = std::nullopt);
+}  // namespace deep_gemm::hyperconnection
+
+namespace deep_gemm::torch_registration {
+static void tf32_hc_prenorm_gemm(const torch::stable::Tensor& a, const torch::stable::Tensor& b,
+                                  const torch::stable::Tensor& d, const torch::stable::Tensor& sqr_sum,
+                                  const std::optional<int64_t>& num_splits) {
+    hyperconnection::tf32_hc_prenorm_gemm(
+        a, b, d, sqr_sum,
+        num_splits.has_value()
+            ? std::make_optional(static_cast<int>(num_splits.value()))
+            : std::nullopt);
+}
+} // namespace deep_gemm::torch_registration
+
+STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def(
+        "tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor(d!) d, Tensor(sqr_sum!) sqr_sum, int? num_splits=None) -> ()");
 }
 
-} // namespace deep_gemm::hyperconnection
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    using namespace deep_gemm::torch_registration;
+
+    m.impl("tf32_hc_prenorm_gemm", TORCH_BOX(&tf32_hc_prenorm_gemm));
+}

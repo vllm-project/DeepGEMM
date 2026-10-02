@@ -1,7 +1,9 @@
 #pragma once
 
 #include <format>
-#include <torch/python.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
@@ -74,10 +76,10 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm90_bf16_gemm(const torch::Tensor& a,
-                           const torch::Tensor& b,
-                           const std::optional<torch::Tensor>& c,
-                           const torch::Tensor& d,
+static void sm90_bf16_gemm(const torch::stable::Tensor& a,
+                           const torch::stable::Tensor& b,
+                           const std::optional<torch::stable::Tensor>& c,
+                           const torch::stable::Tensor& d,
                            const int& m, const int& n, const int& k,
                            const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                            const std::string& compiled_dims) {
@@ -129,16 +131,16 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
     });
 }
 
-static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
-                                                const torch::Tensor& b,
-                                                const torch::Tensor& d,
-                                                const torch::Tensor& m_indices,
+static void sm90_m_grouped_bf16_gemm_contiguous(const torch::stable::Tensor& a,
+                                                const torch::stable::Tensor& b,
+                                                const torch::stable::Tensor& d,
+                                                const torch::stable::Tensor& m_indices,
                                                 const int& num_groups, const int& m, const int& n, const int& k,
                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                 const std::string& compiled_dims,
                                                 const bool& use_psum_layout,
                                                 const std::optional<int>& expected_m_for_psum_layout) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
     DG_HOST_ASSERT(k % 64 == 0);
 
@@ -193,22 +195,22 @@ static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .grouped_layout = m_indices.data_ptr(),
+        .grouped_layout = m_indices.mutable_data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
     });
 }
 
-static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
-                                            const torch::Tensor& b,
-                                            const torch::Tensor& d,
-                                            const torch::Tensor& masked_m,
+static void sm90_bf16_m_grouped_gemm_masked(const torch::stable::Tensor& a,
+                                            const torch::stable::Tensor& b,
+                                            const torch::stable::Tensor& d,
+                                            const torch::stable::Tensor& masked_m,
                                             const int& num_groups, const int& m, const int& n, const int& k,
                                             const int& expected_m,
                                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                             const std::string& compiled_dims) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     DG_HOST_ASSERT(k % 64 == 0);
 
@@ -254,19 +256,19 @@ static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .grouped_layout = masked_m.data_ptr(),
+        .grouped_layout = masked_m.mutable_data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
     });
 }
 
-static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
-                                     const torch::Tensor& b,
-                                     const std::optional<torch::Tensor>& c,
-                                     const torch::Tensor& d,
+static void sm90_bf16_k_grouped_gemm(const torch::stable::Tensor& a,
+                                     const torch::stable::Tensor& b,
+                                     const std::optional<torch::stable::Tensor>& c,
+                                     const torch::stable::Tensor& d,
                                      const int& m, const int& n,
-                                     const std::vector<int>& ks_cpu, const torch::Tensor& grouped_layout,
+                                     const std::vector<int>& ks_cpu, const torch::stable::Tensor& grouped_layout,
                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                      const std::string& compiled_dims) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::MN and major_b == cute::UMMA::Major::MN);
@@ -322,16 +324,16 @@ static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .grouped_layout = grouped_layout.data_ptr(),
+        .grouped_layout = grouped_layout.mutable_data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
     });
 }
 
-static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
-                                  const torch::Tensor& tensor_b,
-                                  const torch::Tensor& tensor_d,
+static void sm90_bf16_bhr_hdr_bhd(const torch::stable::Tensor& tensor_a,
+                                  const torch::stable::Tensor& tensor_b,
+                                  const torch::stable::Tensor& tensor_d,
                                   const int& b, const int& h, const int& r, const int& d,
                                   const std::string& compiled_dims = "nk") {
     const auto desc = GemmDesc {
@@ -382,9 +384,9 @@ static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
     });
 }
 
-static void sm90_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
-                                  const torch::Tensor& tensor_b,
-                                  const torch::Tensor& tensor_d,
+static void sm90_bf16_bhd_hdr_bhr(const torch::stable::Tensor& tensor_a,
+                                  const torch::stable::Tensor& tensor_b,
+                                  const torch::stable::Tensor& tensor_d,
                                   const int& b, const int& h, const int& r, const int& d,
                                   const std::string& compiled_dims = "nk") {
     const auto desc = GemmDesc {
