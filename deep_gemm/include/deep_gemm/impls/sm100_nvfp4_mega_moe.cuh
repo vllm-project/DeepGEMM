@@ -96,6 +96,11 @@ sm100_nvfp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
 
+    // Decode-shaped instantiations (a token buffer of at most 3840 tokens per rank, at most 32 local experts and 32 ranks,
+    // so a launch gives each local expert about one M block) use schedule, dispatch and pipeline variants tuned for that
+    // case. Each of them leaves the output bitwise identical; every other instantiation compiles to the original code.
+    constexpr bool kDecodeShaped = kNumMaxTokensPerRank <= 3840 and kNumExpertsPerRank <= 32 and kNumRanks <= 32;
+
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const uint32_t sm_idx = blockIdx.x;
@@ -343,7 +348,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
         kNumRingBlocks,
-        kNumSharedExperts>(
+        kNumSharedExperts,
+        kDecodeShaped>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -419,11 +425,23 @@ sm100_nvfp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Get SM offset (~6.5 us)
-        #pragma unroll
-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
-            shared_storage.expert_token_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+        if constexpr (kDecodeShaped) {
+            // Only SMs that own tokens of an expert take a slot range, and the atomic adds the bare count: with few
+            // tokens, a few SMs per expert issue atomics instead of every SM for every expert. The per-SM arrival tag is
+            // not needed, because the receive totals are summed locally after the barrier below
+            #pragma unroll
+            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                const uint32_t count = shared_storage.expert_token_count[i];
+                shared_storage.expert_token_count[i] = count ? static_cast<uint32_t>(
+                    ptx::atomic_add(workspace.get_expert_send_count_ptr(i), static_cast<uint64_t>(count))) : 0u;
+            }
+        } else {
+            #pragma unroll
+            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
+                shared_storage.expert_token_count[i] = static_cast<uint32_t>(
+                    ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+            }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -458,9 +476,11 @@ sm100_nvfp4_mega_moe_impl(void* y,
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                if constexpr (not kDecodeShaped) {
+                    ptx::atomic_add_sys(
+                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                        expert_status);
+                }
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -473,6 +493,22 @@ sm100_nvfp4_mega_moe_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+
+        if constexpr (kDecodeShaped) {
+            // Every source rank stored its per-rank counts before it arrived at the barrier. Instead of remote
+            // system-scope atomics, SM 0 sums the local per-rank columns and publishes each total with the arrival tag
+            // that `fetch_expert_recv_count()` waits for (count and tag in one 64-bit word, released by one store)
+            if (sm_idx == 0) {
+                for (uint32_t i = thread_idx; i < kNumExpertsPerRank; i += kNumDispatchThreads) {
+                    uint64_t total = 0;
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumRanks; ++ j)
+                        total += *workspace.get_expert_recv_count_ptr(j, i);
+                    ptx::st_rel(workspace.get_expert_recv_count_sum_ptr(i),
+                                (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) | total);
+                }
+            }
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -490,7 +526,29 @@ sm100_nvfp4_mega_moe_impl(void* y,
         uint32_t expert_pool_block_offset = 0;
 
         // Wait token data arrival
-        scheduler.fetch_expert_recv_count();
+        if constexpr (kDecodeShaped) {
+            // The per-rank receive counts are visible here: peers store them before their barrier release, SM 0 acquired
+            // them in the barrier, and its grid sync ordered every dispatch thread after that (the chain the per-rank
+            // loads below rely on). Copy the whole [rank][local expert] table into the dispatch-phase shared memory
+            // array (one coalesced round trip; `expert_token_count` is dead after the grid sync) and sum each expert's
+            // column (lane = local expert) instead of waiting for SM 0's published totals; the per-rank counts of the
+            // slot computation below come from the same table
+            DG_STATIC_ASSERT(kNumExpertsPerRank <= 32 and kNumRanks <= 32, "One local expert and one rank per lane");
+            #pragma unroll
+            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
+                shared_storage.expert_token_count[i] = static_cast<uint32_t>(
+                    *workspace.get_expert_recv_count_ptr(i / kNumExpertsPerRank, i % kNumExpertsPerRank));
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            uint32_t total = 0;
+            if (lane_idx < kNumExpertsPerRank) {
+                #pragma unroll
+                for (uint32_t r = 0; r < kNumRanks; ++ r)
+                    total += shared_storage.expert_token_count[r * kNumExpertsPerRank + lane_idx];
+            }
+            scheduler.stored_num_tokens_per_expert[0] = total;
+        } else {
+            scheduler.fetch_expert_recv_count();
+        }
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
@@ -515,12 +573,17 @@ sm100_nvfp4_mega_moe_impl(void* y,
             // Load per-rank counts when expert changes
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    // TODO: this is not coalesced
-                    stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                if constexpr (kDecodeShaped) {
+                    stored_rank_count[0] = lane_idx < kNumRanks ?
+                        shared_storage.expert_token_count[lane_idx * kNumExpertsPerRank + current_expert_idx] : 0u;
+                } else {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        // TODO: this is not coalesced
+                        stored_rank_count[i] = j < kNumRanks ?
+                            static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                    }
                 }
             }
 
@@ -642,11 +705,29 @@ sm100_nvfp4_mega_moe_impl(void* y,
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
-            #pragma unroll
-            for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
-                const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFUint32)
-                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+            if constexpr (kDecodeShaped) {
+                // All remote loads first, then the local stores: one remote round trip instead of one per 32 words (a
+                // remote load cannot be moved past a possibly aliasing local store)
+                constexpr uint32_t kNumSFLoads = math::constexpr_ceil_div(kNumSFUint32, 32u);
+                uint32_t sf_values[kNumSFLoads];
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumSFLoads; ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    sf_values[i] = j < kNumSFUint32 ? remote_sf_ptr[j] : 0u;
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumSFLoads; ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    if (j < kNumSFUint32)
+                        local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = sf_values[i];
+                }
+            } else {
+                #pragma unroll
+                for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    if (j < kNumSFUint32)
+                        local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+                }
             }
             __syncwarp();
 
@@ -832,6 +913,10 @@ sm100_nvfp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights with SF
+        // Decode-shaped: each routed weight tile is read once per launch, so its L2 lines are marked evict-first and do
+        // not displace the reused data (tokens, scale factors, shared expert, L1 outputs, combine rows)
+        constexpr uint64_t kWeightCacheHint = static_cast<uint64_t>(kDecodeShaped ?
+            cute::TMA::CacheHintSm100::EVICT_FIRST : cute::TMA::CacheHintSm100::EVICT_NORMAL);
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
             const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
@@ -877,11 +962,11 @@ sm100_nvfp4_mega_moe_impl(void* y,
                     } else {
                         #pragma unroll
                         for (uint32_t r = 0; r < kNumRoutedTilesPerStage; ++ r) {
-                            tma::copy<BLOCK_K, LOAD_BLOCK_N, BLOCK_K / 2, weight_dtype_t>(
+                            tma::copy<BLOCK_K, LOAD_BLOCK_N, BLOCK_K / 2, weight_dtype_t, false, kWeightCacheHint>(
                                 tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx],
                                 reinterpret_cast<weight_dtype_t*>(reinterpret_cast<uint8_t*>(shared_storage.smem_b[stage_idx]) + r * kRoutedBBytes),
                                 k_idx + r * BLOCK_K, n_idx, 2);
-                            tma::copy<BLOCK_N, BLOCK_K / 64, 0>(
+                            tma::copy<BLOCK_N, BLOCK_K / 64, 0, uint32_t, false, kWeightCacheHint>(
                                 tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx],
                                 shared_storage.smem_sfb[stage_idx] + r * SF_BLOCK_N * (BLOCK_K / 64),
                                 sfb_n_idx, sfb_k_idx + r * (BLOCK_K / 64), 2);
