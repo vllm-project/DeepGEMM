@@ -158,6 +158,26 @@ GEMMs still cover the complete K dimension. For A/B experiments,
 `DG_NVFP4_MOE_SHARED_FULL_K=1` restores the larger shared K tile and storage
 footprint; it does not change arithmetic precision or the layer operation.
 
+Each launch also selects three kernel variants. None changes the output bits:
+
+- Compact dispatch: with at most 32 ranks and 32 local experts, one per warp
+  lane, the dispatch count exchange skips zero-count atomics, sums receive
+  counts locally, and reads them from shared memory. Used at every token count.
+- Batched scale-factor pulls: each token's scale factors are pulled in one
+  remote round trip. Used for decode-shaped launches, and for larger launches
+  when `intermediate_hidden` is at most 2048, where the token pulls stay on the
+  critical path. With longer L1 GEMMs, the pulls are hidden and batching costs
+  about 1%.
+- Decode-shaped: when the expected tokens per expert plus one standard
+  deviation fit in one M block, routed weight tiles are loaded evict-first
+  because each is read once. Tiles of at most 64 rows also claim all L1 tasks
+  before L2 tasks. With more M blocks per expert, an expert's blocks reuse the
+  weight tiles from L2, so this variant stays off.
+
+`DG_NVFP4_MOE_COMPACT_DISPATCH`, `DG_NVFP4_MOE_BATCHED_SF_PULLS`, and
+`DG_NVFP4_MOE_DECODE_SHAPED` set to 0 or 1 override these choices for tuning.
+`DG_PRINT_CONFIGS=1` prints the selection.
+
 The test harness supports `--shared-dtype bf16`, `--routing-scale`, and
 multi-node launches using the repository's `init_dist` convention: `WORLD_SIZE`
 is the number of nodes, `RANK` is the node index, and `--num-processes` is the

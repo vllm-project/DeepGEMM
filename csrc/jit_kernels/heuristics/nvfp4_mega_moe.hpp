@@ -44,6 +44,9 @@ struct NVFP4MegaMoEConfig {
     // Dispatch pull config
     int num_bytes_per_pull;
 
+    // Launch variants: compact dispatch count exchange, batched scale-factor pulls, decode-shaped weight loads and claims
+    bool compact_dispatch, batched_sf_pulls, decode_shaped;
+
     friend std::ostream& operator << (std::ostream& os, const NVFP4MegaMoEConfig& config) {
         os << "NVFP4MegaMoEConfig("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
@@ -57,7 +60,10 @@ struct NVFP4MegaMoEConfig {
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
-           << ", num_bytes_per_pull=" << config.num_bytes_per_pull << ")";
+           << ", num_bytes_per_pull=" << config.num_bytes_per_pull
+           << ", compact_dispatch=" << config.compact_dispatch
+           << ", batched_sf_pulls=" << config.batched_sf_pulls
+           << ", decode_shaped=" << config.decode_shaped << ")";
         return os;
     }
 };
@@ -117,6 +123,43 @@ static std::tuple<int, int, int, int, int> get_block_config_for_nvfp4_mega_moe(
 
     // Return configs: 2-CTA clusters and 2 epilogue warpgroups
     return {2, block_m, store_block_m, block_k, 2 * 128};
+}
+
+static std::tuple<bool, bool, bool> get_launch_variants_for_nvfp4_mega_moe(
+    const int& num_ranks, const int& num_experts, const int& num_tokens, const int& num_topk,
+    const int& intermediate_hidden, const int& block_m) {
+    // Decode-shaped launches use the routing statistics of the tile choice (expected tokens per expert plus a
+    // one-sigma margin): when one M block covers an expert, each routed weight tile is read once per launch, so
+    // evict-first weight loads protect the reused data in L2. With more M blocks, the blocks of an expert reuse the
+    // weight tiles from L2, and evict-first loads would re-read them from memory.
+    const float num_expected_tokens = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+    const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
+    bool decode_shaped = num_covered_tokens <= block_m;
+
+    // The compact count exchange maps one rank and one local expert to each lane of a warp. It only removes dispatch
+    // work (zero-count atomics, remote count sums, uncoalesced count loads), so it is used at every token count.
+    const int num_experts_per_rank = num_experts / num_ranks;
+    const bool fits_one_warp = num_ranks <= 32 and num_experts_per_rank <= 32;
+    bool compact_dispatch = fits_one_warp;
+
+    // Batched scale-factor pulls shorten each token pull: they help small launches, and large launches whose L1 GEMM
+    // per M block is short enough (`intermediate_hidden` up to 2048 measured on GB300) to keep the pulls on the
+    // critical path; with longer L1 GEMMs the pulls are hidden, and the burstier remote loads cost about 1%.
+    bool batched_sf_pulls = decode_shaped or intermediate_hidden <= 2048;
+
+    // Overrides for tuning: unset or negative values keep the heuristics
+    const auto override_compact_dispatch = deep_jit::get_env<int>("DG_NVFP4_MOE_COMPACT_DISPATCH", -1);
+    if (override_compact_dispatch >= 0) {
+        DG_HOST_ASSERT(override_compact_dispatch == 0 or fits_one_warp);
+        compact_dispatch = override_compact_dispatch != 0;
+    }
+    const auto override_batched_sf_pulls = deep_jit::get_env<int>("DG_NVFP4_MOE_BATCHED_SF_PULLS", -1);
+    if (override_batched_sf_pulls >= 0)
+        batched_sf_pulls = override_batched_sf_pulls != 0;
+    const auto override_decode_shaped = deep_jit::get_env<int>("DG_NVFP4_MOE_DECODE_SHAPED", -1);
+    if (override_decode_shaped >= 0)
+        decode_shaped = override_decode_shaped != 0;
+    return {compact_dispatch, batched_sf_pulls, decode_shaped};
 }
 
 static std::pair<int, int> get_pipeline_config_for_nvfp4_mega_moe(
@@ -230,6 +273,10 @@ static NVFP4MegaMoEConfig get_nvfp4_mega_moe_config(
         num_dispatch_threads / 32, num_epilogue_threads / 32,
         shared_bf16);
 
+    // Launch variants
+    const auto [compact_dispatch, batched_sf_pulls, decode_shaped] = get_launch_variants_for_nvfp4_mega_moe(
+        num_ranks, num_experts, num_tokens, num_topk, intermediate_hidden, block_m);
+
     const auto config = NVFP4MegaMoEConfig {
         block_m, block_n, block_k,
         load_block_m, load_block_n, store_block_m,
@@ -238,7 +285,8 @@ static NVFP4MegaMoEConfig get_nvfp4_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_bytes_per_pull
+        num_bytes_per_pull,
+        compact_dispatch, batched_sf_pulls, decode_shaped
     };
 
     // Print configs for the first time

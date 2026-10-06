@@ -369,22 +369,6 @@ struct MegaMoEScheduler {
                 // Create task
                 return create_task(BlockPhase::Linear1, l1_task_idx, kNumL1Clusters, L1_SHAPE_N, L1_SHAPE_K);
             } else {
-                if constexpr (kDecodeShaped) {
-                    // While L1 tasks remain, claim the next L2 task only if all L1 N blocks of its pool block are done
-                    // (otherwise its K blocks wait for them with the stages full of weights), else an L1 task first.
-                    // Only without ring reuse, so L1 running ahead cannot wrap the ring; each launch's cleanup zeroes the
-                    // masks, so "done" is all bits set
-                    if (num_sched_l1_waves != kNumSchedL1WavesDone and num_total_m_blocks <= kNumRingBlocks) {
-                        const uint32_t next_l2_task_idx = ptx::ld_volatile(workspace.get_l2_task_count_ptr());
-                        const uint32_t is_ready = next_l2_task_idx >= num_total_m_blocks * kNumL2Clusters or
-                            ptx::ld_volatile(workspace.get_l2_full_mask_ptr(next_l2_task_idx / kNumL2Clusters)) ==
-                                L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>::kFullMask;
-                        if (not ptx::exchange(is_ready, 0)) {
-                            num_sched_l1_waves = 1;
-                            continue;
-                        }
-                    }
-                }
                 const uint32_t l2_task_idx = get_next_task_idx(workspace.get_l2_task_count_ptr());
                 if (l2_task_idx >= num_total_m_blocks * kNumL2Clusters)
                     break;

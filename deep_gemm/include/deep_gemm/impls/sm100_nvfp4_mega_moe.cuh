@@ -42,6 +42,9 @@ template <
     typename shared_dtype_t,
     uint32_t SHARED_BLOCK_K,
     bool kUseXScales,
+    bool kCompactDispatch,
+    bool kBatchedSFPulls,
+    bool kDecodeShaped,
     bool kSharedBF16 = cute::is_same_v<shared_dtype_t, cutlass::bfloat16_t>,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -96,10 +99,14 @@ sm100_nvfp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
 
-    // Decode-shaped instantiations (a token buffer of at most 3840 tokens per rank, at most 32 local experts and 32 ranks,
-    // so a launch gives each local expert about one M block) use schedule, dispatch and pipeline variants tuned for that
-    // case. Each of them leaves the output bitwise identical; every other instantiation compiles to the original code.
-    constexpr bool kDecodeShaped = kNumMaxTokensPerRank <= 3840 and kNumExpertsPerRank <= 32 and kNumRanks <= 32;
+    // Launch variants chosen by the host heuristics, each leaving the output bitwise identical:
+    //   - `kCompactDispatch`: with one rank and one local expert per lane, the dispatch count exchange skips zero-count
+    //     atomics, sums the receive counts locally and reads them from shared memory
+    //   - `kBatchedSFPulls`: each token's scale factors are pulled in one remote round trip
+    //   - `kDecodeShaped`: each local expert receives about one M block, so routed weight tiles are read once per launch
+    //     (evict-first loads), and small tiles claim all L1 tasks before L2 tasks
+    DG_STATIC_ASSERT(not kCompactDispatch or (kNumExpertsPerRank <= 32 and kNumRanks <= 32),
+                     "Compact dispatch needs at most 32 ranks and 32 experts per rank");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -425,7 +432,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Get SM offset (~6.5 us)
-        if constexpr (kDecodeShaped) {
+        if constexpr (kCompactDispatch) {
             // Only SMs that own tokens of an expert take a slot range, and the atomic adds the bare count: with few
             // tokens, a few SMs per expert issue atomics instead of every SM for every expert. The per-SM arrival tag is
             // not needed, because the receive totals are summed locally after the barrier below
@@ -476,7 +483,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-                if constexpr (not kDecodeShaped) {
+                if constexpr (not kCompactDispatch) {
                     ptx::atomic_add_sys(
                         sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                         expert_status);
@@ -494,7 +501,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
             /* After the NVLink barrier, there is a grid sync */ true
         );
 
-        if constexpr (kDecodeShaped) {
+        if constexpr (kCompactDispatch) {
             // Every source rank stored its per-rank counts before it arrived at the barrier. Instead of remote
             // system-scope atomics, SM 0 sums the local per-rank columns and publishes each total with the arrival tag
             // that `fetch_expert_recv_count()` waits for (count and tag in one 64-bit word, released by one store)
@@ -526,7 +533,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
         uint32_t expert_pool_block_offset = 0;
 
         // Wait token data arrival
-        if constexpr (kDecodeShaped) {
+        if constexpr (kCompactDispatch) {
             // The per-rank receive counts are visible here: peers store them before their barrier release, SM 0 acquired
             // them in the barrier, and its grid sync ordered every dispatch thread after that (the chain the per-rank
             // loads below rely on). Copy the whole [rank][local expert] table into the dispatch-phase shared memory
@@ -573,7 +580,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
             // Load per-rank counts when expert changes
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
-                if constexpr (kDecodeShaped) {
+                if constexpr (kCompactDispatch) {
                     stored_rank_count[0] = lane_idx < kNumRanks ?
                         shared_storage.expert_token_count[lane_idx * kNumExpertsPerRank + current_expert_idx] : 0u;
                 } else {
@@ -705,7 +712,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
-            if constexpr (kDecodeShaped) {
+            if constexpr (kBatchedSFPulls) {
                 // All remote loads first, then the local stores: one remote round trip instead of one per 32 words (a
                 // remote load cannot be moved past a possibly aliasing local store)
                 constexpr uint32_t kNumSFLoads = math::constexpr_ceil_div(kNumSFUint32, 32u);

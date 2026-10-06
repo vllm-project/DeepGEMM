@@ -196,7 +196,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {},
-        {}
+        {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -219,7 +219,10 @@ static void __instantiate_kernel() {{
         to_string(l1_weights.scalar_type(), false),
         shared_bf16 ? "cutlass::bfloat16_t" : "cutlass::float_e4m3_t",
         shared_block_k,
-        use_x_scales ? "true" : "false"));
+        use_x_scales ? "true" : "false",
+        config.compact_dispatch ? "true" : "false",
+        config.batched_sf_pulls ? "true" : "false",
+        config.decode_shaped ? "true" : "false"));
 
     // Launch
     jit->launch(
