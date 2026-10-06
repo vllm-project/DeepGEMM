@@ -76,28 +76,26 @@ static std::tuple<int, int, int, int, int> get_block_config_for_nvfp4_mega_moe(
     const float num_expected_tokens = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
 
-    // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
-    // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
-    // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
+    // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks per
+    // expert. One block takes the smallest tile covering the expert: up to 240 rows with many local experts (about
+    // 14 or more blocks per rank), else up to 192 rows. With several blocks, 240-row tiles are slower than 192-row
+    // ones, so use the fewest blocks of at most 192 rows, with 128 rows when as many 128-row blocks cover the expert
+    // (measured on GB300 from 128 to 448 expected tokens per expert)
     int block_m = num_expected_tokens <= 10 ? 16 : 32;
     if (num_expected_tokens > 24) {
-        int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
-        if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
-            num_blocks = 2;
-        for (const int& candidate: {64, 128, 192, 240}) {
-            block_m = candidate;
-            if (num_blocks * candidate >= num_covered_tokens)
-                break;
+        const float max_single_block_m = num_experts / num_ranks >= 14 ? 240 : 192;
+        if (num_covered_tokens <= max_single_block_m) {
+            for (const int& candidate: {64, 128, 192, 240}) {
+                block_m = candidate;
+                if (candidate >= num_covered_tokens)
+                    break;
+            }
+        } else {
+            const int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 192));
+            block_m = num_blocks * 128 >= num_covered_tokens ? 128 : 192;
         }
     }
     {
-        // Around 256 tokens/expert, the narrower tile improves NVFP4's epilogue
-        // and pipeline occupancy enough to offset an occasional third M block.
-        // Measured on M3/GB300 at both EP1 and EP4.
-        if (num_expected_tokens >= 240 and num_expected_tokens <= 384)
-            block_m = 128;
-        else if (num_expected_tokens > 384)
-            block_m = std::min(block_m, 192);
         const auto override_m = deep_jit::get_env<int>("DG_NVFP4_MOE_BLOCK_M");
         if (override_m > 0) {
             DG_HOST_ASSERT(override_m == 16 or override_m == 32 or override_m == 64 or
