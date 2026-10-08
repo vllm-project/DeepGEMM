@@ -209,6 +209,7 @@ def _register_deep_gemm_kernels():
     _bind_guarded_ops(
         'einsum',                         # einsum.hpp
         'tf32_hc_prenorm_gemm',           # hyperconnection.hpp
+        'compile_tf32_hc_prenorm_gemm',   # hyperconnection.hpp
         'get_paged_mqa_logits_metadata',  # attention.hpp
     )
 
@@ -712,6 +713,7 @@ _PUBLIC_API = [
     'fp8_fp4_paged_mqa_logits',
     # Hyperconnection
     'tf32_hc_prenorm_gemm',
+    'compile_tf32_hc_prenorm_gemm',
     # Layout
     'transform_sf_into_required_layout',
     'get_tma_aligned_size',
