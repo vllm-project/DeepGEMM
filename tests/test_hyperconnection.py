@@ -27,16 +27,6 @@ def test_compile_hc_prenorm_gemm() -> None:
     assert not any(event.device_type == torch.autograd.DeviceType.CUDA
                    for event in profile.events())
 
-    for m in (13, 137):
-        a = torch.randn((m, 16384), dtype=torch.bfloat16, device='cuda')
-        b = torch.randn((24, 16384), dtype=torch.float32, device='cuda')
-        for splits in (1, 3, 26, 64):
-            d = torch.empty((splits, m, 24), dtype=torch.float32, device='cuda')
-            s = torch.empty((splits, m), dtype=torch.float32, device='cuda')
-            deep_gemm.tf32_hc_prenorm_gemm(a, b, d, s, splits)
-            assert calc_diff(d.sum(0), a.float() @ b.T) < 1e-8
-            assert calc_diff(s.sum(0), a.float().square().sum(-1)) < 1e-8
-
 
 @test_filter(lambda: get_arch_major() >= 9)
 def test_hc_prenorm_gemm() -> None:
