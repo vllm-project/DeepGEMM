@@ -118,7 +118,7 @@ def test_metadata_prefix_visibility(batch, varlen):
 
 
 @test_filter(lambda: get_arch_major() == 12)
-@pytest.mark.parametrize('page_kv', [32, 64])
+@pytest.mark.parametrize('page_kv', [32, 64, 128])
 @pytest.mark.parametrize('heads', [16, 32, 64])
 @pytest.mark.parametrize('next_n,varlen', [(1, False), (2, False), (3, False), (1, True)])
 @pytest.mark.parametrize('head_dim', [32, 64, 128])

@@ -482,12 +482,15 @@ static void sm120_fp8_paged_mqa_logits(
     constexpr int num_q_stages = 2;
     // Four 32-row KV groups exceed the 99 KiB SMEM budget with three
     // stages at 64 heads and paired queries. Keep the 64-row path unchanged.
+    // A page larger than 64 rows is processed as 64-row compute tiles
+    // (sm120_fp8_paged_mqa_logits.cuh: BLOCK_KV = min(PAGE_KV, 64)).
+    const int tile_kv = block_kv < 64 ? block_kv : 64;
     const int num_kv_stages =
-        (block_kv == 32 and num_heads == 64 and (is_varlen or next_n >= 2)) ? 2 : 3;
-    const int num_groups = split_kv / block_kv;
+        (tile_kv == 32 and num_heads == 64 and (is_varlen or next_n >= 2)) ? 2 : 3;
+    const int num_groups = split_kv / tile_kv;
     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
-    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
     DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
 
     const auto tensor_map_q = make_tma_2d_desc(
@@ -496,10 +499,10 @@ static void sm120_fp8_paged_mqa_logits(
         head_dim);
     const auto tensor_map_kv = make_tma_3d_desc(
         kv_cache, head_dim, block_kv, num_kv_blocks,
-        head_dim, block_kv, 1, static_cast<int>(kv_cache.stride(1)),
+        head_dim, tile_kv, 1, static_cast<int>(kv_cache.stride(1)),
         static_cast<int>(kv_cache.stride(0)), head_dim);
     const auto tensor_map_kv_scales = make_tma_2d_desc(
-        kv_cache_scales, block_kv, num_kv_blocks, block_kv, 1,
+        kv_cache_scales, block_kv, num_kv_blocks, tile_kv, 1,
         static_cast<int>(kv_cache_scales.stride(0)), 0);
     const auto tensor_map_weights = make_tma_2d_desc(
         weights, num_heads, batch_size * next_n, num_heads, next_n_atom,
@@ -516,9 +519,9 @@ static void sm120_fp8_paged_mqa_logits(
                         aligned_smem_weight_size_per_stage) +
         align(num_q_stages * 8 * 2, swizzle_alignment);
     const int smem_kv_size_per_stage =
-        block_kv * head_dim * static_cast<int>(kv_cache.element_size());
+        tile_kv * head_dim * static_cast<int>(kv_cache.element_size());
     const int aligned_smem_kv_scale_size_per_stage = align(
-        block_kv * static_cast<int>(kv_cache_scales.element_size()),
+        tile_kv * static_cast<int>(kv_cache_scales.element_size()),
         swizzle_alignment);
     const int smem_kv_pipe_size =
         num_kv_stages * (smem_kv_size_per_stage +
