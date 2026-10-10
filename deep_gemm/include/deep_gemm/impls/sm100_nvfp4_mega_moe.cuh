@@ -354,7 +354,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
-        kNumRingBlocks,
+        kNumRingBlocks, 1,
         kNumSharedExperts,
         kDecodeShaped>(
             workspace,
@@ -1174,7 +1174,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
-            scheduler.mainloop(num_tokens);
+            // NOTES: NVFP4 weights are never localized, so the scheduler uses a single locality domain
+            scheduler.mainloop(num_tokens, nullptr);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();

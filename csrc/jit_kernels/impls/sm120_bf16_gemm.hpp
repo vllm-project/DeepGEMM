@@ -9,7 +9,7 @@
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 
-#include "epilogue.hpp"
+#include "sm120_epilogue.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -21,7 +21,7 @@ public:
         GemmConfig gemm_config;
         deep_jit::cuda::LaunchOptions options;
         const std::optional<std::string> epilogue_type;
-        EpilogueArgs epilogue_args{};
+        EpilogueOperatorArgs epilogue_args{};
         int stride_d_m;
         int stride_c_m = 0;
         int stride_d_batch = 0;
@@ -83,7 +83,7 @@ static void __instantiate_kernel() {{
 
         // Launch
         // NOTES: `epilogue_type_t` is instantiated stateless (it adds no members over
-        //        `EpilogueArgs`), so `EpilogueArgs` marshals as the runtime epilogue
+        //        `EpilogueOperatorArgs`), so `EpilogueOperatorArgs` marshals as the runtime epilogue
         //        argument, the same way the SM100 launchers pass it.
         jit->launch(
             kernel, args.options,

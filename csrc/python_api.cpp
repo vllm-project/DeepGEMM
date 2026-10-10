@@ -9,11 +9,13 @@
 
 #include "runtime/runtime.hpp"
 #include "apis/config.hpp"
+#include "apis/epilogue_class.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
+#include "apis/locality_domain.hpp"
 #include "apis/mega_moe.hpp"
 #include "apis/nvfp4_mega_moe.hpp"
 #include "apis/mega_mhc.hpp"

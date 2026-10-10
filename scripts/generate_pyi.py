@@ -93,6 +93,8 @@ def schema_type_to_python(type_str: str) -> str:
         py_type = f"tuple[{', '.join(['int'] * n)}]"
     elif type_str == 'ScalarType':
         py_type = 'torch.dtype'
+    elif type_str.startswith('__torch__.torch.classes.'):
+        py_type = 'Any'
     else:
         print(f'Warning: unrecognized schema type {type_str!r}, using Any')
         py_type = 'Any'

@@ -5,6 +5,9 @@ operator registration from pybind to ``TORCH_LIBRARY``. It loads the compiled
 extension and forwards calls to ``torch.ops.deep_gemm``.
 """
 
+import sys
+import types
+
 import torch
 from pathlib import Path
 
@@ -34,6 +37,7 @@ def _bind_guarded_ops(*names):
 
 
 init = _torch_ops.init
+shutdown = _torch_ops.shutdown
 set_num_sms = _torch_ops.set_num_sms
 get_num_sms = _torch_ops.get_num_sms
 set_tc_util = _torch_ops.set_tc_util
@@ -75,115 +79,96 @@ def _as_int_list(value):
 def _register_deep_gemm_kernels():
     """Export compatibility wrappers for the registered DeepGEMM kernels."""
     def fp8_fp4_gemm_nt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None,
-                        compiled_dims='nk', disable_ue8m0_cast=False, alpha=None):
+                        compiled_dims='nk', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_nt(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha,
+            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
         )
 
     def fp8_fp4_gemm_nn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None,
-                        compiled_dims='nk', disable_ue8m0_cast=False, alpha=None):
+                        compiled_dims='nk', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_nn(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha,
+            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
         )
 
     def fp8_fp4_gemm_tn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None,
-                        compiled_dims='mn', disable_ue8m0_cast=False, alpha=None):
+                        compiled_dims='mn', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_tn(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha,
+            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
         )
 
     def fp8_fp4_gemm_tt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None,
-                        compiled_dims='mn', disable_ue8m0_cast=False, alpha=None):
+                        compiled_dims='mn', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_tt(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha,
+            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
         )
 
     def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None,
                                              compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False,
-                                             ensure_zero_padding=True, expected_m_for_psum_layout=None):
+                                             ensure_zero_padding=True, expected_m_for_psum_layout=None, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.m_grouped_fp8_fp4_gemm_nt_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, grouped_layout, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
             compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding,
-            expected_m_for_psum_layout,
+            expected_m_for_psum_layout, epilogue,
         )
 
     def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None,
                                              compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False,
-                                             ensure_zero_padding=True):
+                                             ensure_zero_padding=True, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.m_grouped_fp8_fp4_gemm_nn_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, grouped_layout, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding,
+            compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, epilogue,
         )
 
     def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None,
-                                         compiled_dims='nk', disable_ue8m0_cast=False):
+                                         compiled_dims='nk', disable_ue8m0_cast=False, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.m_grouped_fp8_fp4_gemm_nt_masked(
             a_tensor, sfa, b_tensor, sfb, d, masked_m, expected_m, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast,
+            compiled_dims, disable_ue8m0_cast, epilogue,
         )
 
     def k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 128),
-                                         compiled_dims='mn', use_psum_layout=False):
+                                         compiled_dims='mn', use_psum_layout=False, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.k_grouped_fp8_gemm_tn_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, ks_cpu, grouped_layout, c, list(recipe),
-            compiled_dims, use_psum_layout,
+            compiled_dims, use_psum_layout, epilogue,
         )
 
     def k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 128),
-                                         compiled_dims='mn', use_psum_layout=False):
+                                         compiled_dims='mn', use_psum_layout=False, epilogue=None):
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.k_grouped_fp8_gemm_nt_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, ks_cpu, grouped_layout, c, list(recipe),
-            compiled_dims, use_psum_layout,
+            compiled_dims, use_psum_layout, epilogue,
         )
 
-    def fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, recipe=None, compiled_dims='nk', disable_ue8m0_cast=False):
-        a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
-        return _torch_ops.fp8_gemm_nt_skip_head_mid(
-            a_tensor, sfa, b_tensor, sfb, d, list(head_splits), _as_int_list(recipe), compiled_dims, disable_ue8m0_cast,
-        )
-
-    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128)):
+    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None):
         d_tensor, sfd = d if isinstance(d, (tuple, list)) else (d, None)
-        return _torch_ops.fp8_einsum(expr, a[0], a[1], b[0], b[1], d_tensor, c, list(recipe), sfd)
+        return _torch_ops.fp8_einsum(expr, a[0], a[1], b[0], b[1], d_tensor, c, list(recipe), sfd, epilogue)
 
-    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits=True,
-                           max_seqlen_k=0, logits_dtype=torch.float32, schedule_meta=None):
+    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta=None):
         q_fp, q_sf = q[0], q[1]
         kv_fp, kv_sf = _unpack_kv(kv)
         return _torch_ops.fp8_fp4_mqa_logits(
-            q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
-            clean_logits, max_seqlen_k, logits_dtype, schedule_meta,
+            q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta,
         )
 
     def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len,
-                                 clean_logits=False, logits_dtype=torch.float32, indices=None):
+                                 indices=None):
         q_fp, q_sf = q[0], q[1]
         return _torch_ops.fp8_fp4_paged_mqa_logits(
-            q_fp, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len,
-            clean_logits, logits_dtype, indices,
-        )
-
-    def fp8_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits=True, max_seqlen_k=0):
-        kv_fp, kv_sf = _unpack_kv(kv)
-        return _torch_ops.fp8_mqa_logits(q, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k)
-
-    def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len,
-                             clean_logits=False, indices=None):
-        return _torch_ops.fp8_paged_mqa_logits(
-            q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices,
+            q_fp, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices,
         )
 
     globals().update({
@@ -203,12 +188,9 @@ def _register_deep_gemm_kernels():
         'm_grouped_fp8_gemm_nt_masked': m_grouped_fp8_fp4_gemm_nt_masked,
         'k_grouped_fp8_gemm_tn_contiguous': k_grouped_fp8_gemm_tn_contiguous,
         'k_grouped_fp8_gemm_nt_contiguous': k_grouped_fp8_gemm_nt_contiguous,
-        'fp8_gemm_nt_skip_head_mid': fp8_gemm_nt_skip_head_mid,
         'fp8_einsum': fp8_einsum,
         'fp8_fp4_mqa_logits': fp8_fp4_mqa_logits,
         'fp8_fp4_paged_mqa_logits': fp8_fp4_paged_mqa_logits,
-        'fp8_mqa_logits': fp8_mqa_logits,
-        'fp8_paged_mqa_logits': fp8_paged_mqa_logits,
     })
 
     # BF16 GEMMs
@@ -288,10 +270,10 @@ def fp8_fp4_paged_sparse_mqa_logits(q, kv_cache, weights, metadata, num_max_spar
 
 
 def k_grouped_fp4_gemm_nt_contiguous(
-    a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 32), compiled_dims='mn', use_psum_layout=False
+    a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 32), compiled_dims='mn', use_psum_layout=False, epilogue=None
 ):
     return _torch_ops.k_grouped_fp4_gemm_nt_contiguous(
-        a[0], a[1], b[0], b[1], d, ks_cpu, grouped_layout, c, list(recipe), compiled_dims, use_psum_layout
+        a[0], a[1], b[0], b[1], d, ks_cpu, grouped_layout, c, list(recipe), compiled_dims, use_psum_layout, epilogue
     )
 
 
@@ -531,10 +513,6 @@ m_grouped_fp4_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
 m_grouped_fp4_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
 
 
-def get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk):
-    return _torch_ops.get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk)
-
-
 def bf16_mega_gate(
     x,
     weight,
@@ -543,7 +521,7 @@ def bf16_mega_gate(
     num_shared_experts,
     routed_scaling_factor,
     ep_rank,
-    scoring_func='identity',
+    scoring_func='sqrtsoftplus',
     mask=None,
     bias=None,
     image_bias=None,
@@ -644,9 +622,34 @@ Runtime = torch.classes.deep_gemm.Runtime
 get_jit = _torch_ops.get_jit
 
 
+# GEMM epilogue classes for the `epilogue` argument, as `deep_gemm.epilogue.X`
+# NOTES: `alpha` and the FP8 `(d, sfd)` output pair are the shorthand for `Alpha` and `FP8Quantization`
+epilogue = types.ModuleType('deep_gemm.epilogue', 'GEMM epilogue classes')
+epilogue.Identity = lambda: _torch_ops.epilogue_identity()
+epilogue.Alpha = lambda alpha: _torch_ops.epilogue_alpha(alpha)
+epilogue.FP8Quantization = lambda sfd: _torch_ops.epilogue_fp8_quantization(sfd)
+epilogue.BF16StochasticRounding = lambda: _torch_ops.epilogue_bf16_stochastic_rounding()
+
+
+# Memory homed in the GPU's locality domains, re-exported by `deep_gemm.locality_domain`
+locality_domain = types.ModuleType('deep_gemm._C.locality_domain', "Memory homed in the GPU's locality domains")
+locality_domain.get_num_locality_domains = _torch_ops.locality_domain_get_num_locality_domains
+locality_domain.get_granularity = _torch_ops.locality_domain_get_granularity
+locality_domain.is_localization_available = _torch_ops.locality_domain_is_localization_available
+locality_domain.empty = lambda sizes, dtype, domain_idx: _torch_ops.locality_domain_empty(list(sizes), dtype, domain_idx)
+locality_domain.empty_per_domain = lambda sizes, dtype: _torch_ops.locality_domain_empty_per_domain(list(sizes), dtype)
+locality_domain.is_localized = _torch_ops.locality_domain_is_localized
+locality_domain.get_sm_locality_domains = _torch_ops.locality_domain_get_sm_locality_domains
+locality_domain.get_balanced_sm_locality_domains = _torch_ops.locality_domain_get_balanced_sm_locality_domains
+locality_domain.release_mlopart = _torch_ops.locality_domain_release_mlopart
+# NOTES: registered so that `from ._C.locality_domain import ...` resolves as with the former pybind submodule
+sys.modules[locality_domain.__name__] = locality_domain
+
+
 _PUBLIC_API = [
     # Runtime and configuration
-    'Runtime', 'get_jit', 'init',
+    'Runtime', 'get_jit', 'init', 'shutdown',
+    'epilogue', 'locality_domain',
     'set_num_sms', 'get_num_sms',
     'set_tc_util', 'get_tc_util',
     'set_pdl', 'get_pdl',
@@ -671,7 +674,7 @@ _PUBLIC_API = [
     'get_block_m_for_nvfp4_mega_moe',
     'get_symm_buffer_size_for_nvfp4_mega_moe',
     'nvfp4_mega_moe',
-    'get_bf16_mega_gate_config', 'bf16_mega_gate',
+    'bf16_mega_gate',
     # FP8/FP4 GEMMs
     'fp8_fp4_gemm_nt', 'fp8_fp4_gemm_nn',
     'fp8_fp4_gemm_tn', 'fp8_fp4_gemm_tt',
@@ -689,7 +692,6 @@ _PUBLIC_API = [
     'k_grouped_fp8_gemm_tn_contiguous',
     'k_grouped_fp8_gemm_nt_contiguous',
     'k_grouped_fp4_gemm_nt_contiguous',
-    'fp8_gemm_nt_skip_head_mid',
     # BF16 GEMMs
     'bf16_gemm_nt', 'bf16_gemm_nn',
     'bf16_gemm_tn', 'bf16_gemm_tt',
@@ -708,7 +710,6 @@ _PUBLIC_API = [
     'fp8_fp4_sparse_mqa_logits',
     'fp8_fp4_paged_sparse_mqa_logits',
     'fp8_fp4_paged_mqa_logits',
-    'fp8_mqa_logits', 'fp8_paged_mqa_logits',
     # Hyperconnection
     'tf32_hc_prenorm_gemm',
     # Layout

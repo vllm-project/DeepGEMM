@@ -10,6 +10,9 @@ TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("init(str library_root_path) -> ()", [&](const std::string& library_root_path) {
         init_jit(library_root_path);
     });
+    m.def("shutdown() -> ()", []() {
+        runtime = deep_jit::LazyInit<Runtime>(nullptr);
+    });
     m.def("set_num_sms(int new_num_sms) -> ()", [&](const int64_t& new_num_sms) {
         runtime->set_num_sms(new_num_sms);
     });

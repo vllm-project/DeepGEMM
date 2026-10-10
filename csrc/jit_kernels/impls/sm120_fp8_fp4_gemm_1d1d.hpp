@@ -9,7 +9,7 @@
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 
-#include "epilogue.hpp"
+#include "sm120_epilogue.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -105,7 +105,7 @@ static void __instantiate_kernel() {{
 
         // Launch
         // NOTES: `epilogue_type_t` is instantiated stateless (it adds no members over
-        //        `EpilogueArgs`), so `args.epilogue.args` marshals as the runtime
+        //        `EpilogueOperatorArgs`), so `args.epilogue.args` marshals as the runtime
         //        epilogue argument, the same way the SM100 launchers pass it.
         jit->launch(
             kernel, args.options,

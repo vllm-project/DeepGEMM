@@ -77,14 +77,13 @@ def test_fp8_mqa_logits_head_dimension_mapping(head_dim, paged):
         metadata = torch.tensor(metadata_reference(lengths, deep_gemm.get_num_sms()), dtype=torch.int32, device='cuda')
         call = lambda: deep_gemm.fp8_fp4_paged_mqa_logits(
             (q.view(batch, 1, heads, head_dim), None), cache, weights, context, table, metadata,
-            tokens, clean_logits=False, logits_dtype=torch.float32)
+            tokens)
     else:
         starts = torch.zeros(batch, dtype=torch.int32, device='cuda')
         ends = torch.tensor(lengths, dtype=torch.int32, device='cuda')
         scales = torch.ones(tokens, dtype=torch.float32, device='cuda')
         call = lambda: deep_gemm.fp8_fp4_mqa_logits(
-            (q, None), (kv, scales), weights, starts, ends, clean_logits=False,
-            max_seqlen_k=tokens, logits_dtype=torch.float32)
+            (q, None), (kv, scales), weights, starts, ends, max_seqlen_k=tokens)
     check_outputs(call, reference, valid)
 
 
@@ -165,8 +164,7 @@ def test_fp8_paged_mqa_page_geometry(page_kv, heads, next_n, varlen, head_dim):
         metadata = deep_gemm.get_paged_mqa_logits_metadata(
             context, page_kv, deep_gemm.get_num_sms(), indices=indices)
         return deep_gemm.fp8_fp4_paged_mqa_logits(
-            (q, None), cache, weights, context, table, metadata, tokens,
-            clean_logits=False, logits_dtype=torch.float32, indices=indices)
+            (q, None), cache, weights, context, table, metadata, tokens, indices=indices)
 
     check_outputs(call, reference.cuda(), valid)
 
