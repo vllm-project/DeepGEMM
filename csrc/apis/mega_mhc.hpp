@@ -1,10 +1,11 @@
 #pragma once
 
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../utils/torch_compat.hpp"
 #include "../torch_library_utils.hpp"
 
 #include <unordered_map>
-#include <c10/cuda/CUDAGraphsC10Utils.h>
 
 #include "../utils/compatibility.hpp"
 
@@ -26,17 +27,15 @@ static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidde
     return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
 }
 
-static const torch::Tensor& get_split_barriers(const torch::TensorOptions& options) {
-    const auto stream = at::cuda::getCurrentCUDAStream();
-    DG_HOST_ASSERT(options.device() == stream.device());
-    static std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> split_barriers_by_stream;
+static const torch::stable::Tensor& get_split_barriers(const torch::stable::Tensor& reference) {
+    const auto stream = torch_compat::stream_key(reference);
+
+    static std::map<torch_compat::StreamKey, torch::stable::Tensor> split_barriers_by_stream;
     auto& split_barriers = split_barriers_by_stream[stream];
     if (not split_barriers.defined()) {
         // Warm up each stream before capture so one-time zeroing is not replayed with the graph.
-        DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None);
-        split_barriers = torch::zeros(
-            {mhc_layout::kNumSplitBarriers, mhc_layout::kNumMaxMBlocks, mhc_layout::kSplitBarrierLineBytes},
-            options.dtype(torch::kByte));
+        DG_HOST_ASSERT(not torch_compat::is_capturing(stream.second));
+        split_barriers = torch::stable::new_zeros(reference, {mhc_layout::kNumSplitBarriers, mhc_layout::kNumMaxMBlocks, mhc_layout::kSplitBarrierLineBytes}, torch::headeronly::ScalarType::Byte);
     }
     return split_barriers;
 }
@@ -89,32 +88,32 @@ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& optio
  *     y_routed_sf is contiguous row-major, and y_shared_sf is the Mega MoE
  *     shared-expert layout and requires shared_sf_block_m > 0.
  */
-static void mega_mhc(const torch::Tensor& x,
-                     const torch::Tensor& residual,
-                     const std::optional<torch::Tensor>& shifted_prev_mix,
-                     const torch::Tensor& post_mix,
-                     const torch::Tensor& comb_res_mix,
-                     const torch::Tensor& fn,
-                     const torch::Tensor& mix_scales,
-                     const torch::Tensor& mix_bases,
+static void mega_mhc(const torch::stable::Tensor& x,
+                     const torch::stable::Tensor& residual,
+                     const std::optional<torch::stable::Tensor>& shifted_prev_mix,
+                     const torch::stable::Tensor& post_mix,
+                     const torch::stable::Tensor& comb_res_mix,
+                     const torch::stable::Tensor& fn,
+                     const torch::stable::Tensor& mix_scales,
+                     const torch::stable::Tensor& mix_bases,
                      const int& hc_mult,
                      const float& hc_norm_eps,
                      const float& hc_pre_eps,
                      const float& hc_post_scale,
                      const float& sinkhorn_eps,
                      const int& num_sinkhorn_iters,
-                     const torch::Tensor& rmsnorm_weight,
+                     const torch::stable::Tensor& rmsnorm_weight,
                      const float& rmsnorm_eps,
                      const float& rmsnorm_scale,
-                     const torch::Tensor& new_residual,
-                     const std::optional<torch::Tensor>& new_prev_mix,
-                     const torch::Tensor& new_post_mix,
-                     const torch::Tensor& new_comb_res_mix,
-                     const std::optional<torch::Tensor>& y_bf16,
-                     const std::optional<torch::Tensor>& y_fp8,
-                     const std::optional<torch::Tensor>& y_gemm_sf,
-                     const std::optional<torch::Tensor>& y_routed_sf,
-                     const std::optional<torch::Tensor>& y_shared_sf,
+                     const torch::stable::Tensor& new_residual,
+                     const std::optional<torch::stable::Tensor>& new_prev_mix,
+                     const torch::stable::Tensor& new_post_mix,
+                     const torch::stable::Tensor& new_comb_res_mix,
+                     const std::optional<torch::stable::Tensor>& y_bf16,
+                     const std::optional<torch::stable::Tensor>& y_fp8,
+                     const std::optional<torch::stable::Tensor>& y_gemm_sf,
+                     const std::optional<torch::stable::Tensor>& y_routed_sf,
+                     const std::optional<torch::stable::Tensor>& y_shared_sf,
                      const int& shared_sf_block_m) {
     // Shifted state is all-or-nothing; FP8 uses either GEMM SF or routed and shared SF together
     const bool is_shifted = shifted_prev_mix.has_value();
@@ -150,55 +149,55 @@ static void mega_mhc(const torch::Tensor& x,
     DG_HOST_ASSERT(num_hc_outputs == fn_num_outputs and fn_hidden == num_routes * hidden);
     DG_HOST_ASSERT(num_mix_scales == 3 and num_mix_bases == num_hc_outputs);
     DG_HOST_ASSERT(rmsnorm_hidden == hidden);
-    DG_HOST_ASSERT(new_residual.sizes() == residual.sizes());
-    DG_HOST_ASSERT(new_post_mix.sizes() == post_mix.sizes());
-    DG_HOST_ASSERT(new_comb_res_mix.sizes() == comb_res_mix.sizes());
+    DG_HOST_ASSERT(new_residual.sizes().equals(residual.sizes()));
+    DG_HOST_ASSERT(new_post_mix.sizes().equals(post_mix.sizes()));
+    DG_HOST_ASSERT(new_comb_res_mix.sizes().equals(comb_res_mix.sizes()));
 
     if (is_shifted) {
         const auto [prev_tokens, prev_num_routes, prev_width] = get_shape<3>(shifted_prev_mix.value());
         DG_HOST_ASSERT(prev_tokens == num_tokens and prev_num_routes == num_routes and prev_width == 1);
-        DG_HOST_ASSERT(new_prev_mix->sizes() == shifted_prev_mix->sizes());
+        DG_HOST_ASSERT(new_prev_mix->sizes().equals(shifted_prev_mix->sizes()));
     }
 
     const auto device = x.device();
-    const auto check_dense = [&](const torch::Tensor& tensor, const torch::ScalarType& dtype) {
+    const auto check_dense = [&](const torch::stable::Tensor& tensor, const torch::headeronly::ScalarType& dtype) {
         DG_HOST_ASSERT(tensor.scalar_type() == dtype);
         DG_HOST_ASSERT(tensor.is_contiguous());
         DG_HOST_ASSERT(tensor.device() == device);
     };
 
-    check_dense(x, torch::kBFloat16);
-    check_dense(residual, torch::kBFloat16);
-    check_dense(post_mix, torch::kFloat);
-    check_dense(comb_res_mix, torch::kFloat);
-    check_dense(fn, torch::kFloat);
-    check_dense(mix_scales, torch::kFloat);
-    check_dense(mix_bases, torch::kFloat);
-    check_dense(rmsnorm_weight, torch::kBFloat16);
-    check_dense(new_residual, torch::kBFloat16);
-    check_dense(new_post_mix, torch::kFloat);
-    check_dense(new_comb_res_mix, torch::kFloat);
+    check_dense(x, torch::headeronly::ScalarType::BFloat16);
+    check_dense(residual, torch::headeronly::ScalarType::BFloat16);
+    check_dense(post_mix, torch::headeronly::ScalarType::Float);
+    check_dense(comb_res_mix, torch::headeronly::ScalarType::Float);
+    check_dense(fn, torch::headeronly::ScalarType::Float);
+    check_dense(mix_scales, torch::headeronly::ScalarType::Float);
+    check_dense(mix_bases, torch::headeronly::ScalarType::Float);
+    check_dense(rmsnorm_weight, torch::headeronly::ScalarType::BFloat16);
+    check_dense(new_residual, torch::headeronly::ScalarType::BFloat16);
+    check_dense(new_post_mix, torch::headeronly::ScalarType::Float);
+    check_dense(new_comb_res_mix, torch::headeronly::ScalarType::Float);
     if (is_shifted) {
-        check_dense(shifted_prev_mix.value(), torch::kFloat);
-        check_dense(new_prev_mix.value(), torch::kFloat);
+        check_dense(shifted_prev_mix.value(), torch::headeronly::ScalarType::Float);
+        check_dense(new_prev_mix.value(), torch::headeronly::ScalarType::Float);
     }
 
-    const auto check_norm_output = [&](const torch::Tensor& tensor, const torch::ScalarType& dtype) {
+    const auto check_norm_output = [&](const torch::stable::Tensor& tensor, const torch::headeronly::ScalarType& dtype) {
         const auto [output_tokens, output_hidden] = get_shape<2>(tensor);
         DG_HOST_ASSERT(output_tokens == num_tokens and output_hidden == hidden);
         check_dense(tensor, dtype);
     };
 
     if (y_bf16.has_value())
-        check_norm_output(y_bf16.value(), torch::kBFloat16);
+        check_norm_output(y_bf16.value(), torch::headeronly::ScalarType::BFloat16);
     if (y_fp8.has_value())
-        check_norm_output(y_fp8.value(), torch::kFloat8_e4m3fn);
+        check_norm_output(y_fp8.value(), torch::headeronly::ScalarType::Float8_e4m3fn);
 
-    const auto check_sf = [&](const torch::Tensor& tensor) {
+    const auto check_sf = [&](const torch::stable::Tensor& tensor) {
         const auto [sf_tokens, num_sf_words] = get_shape<2>(tensor);
         DG_HOST_ASSERT(sf_tokens == num_tokens and
                        num_sf_words == hidden / static_cast<int>(mhc_layout::kHiddenPerSFWord));
-        DG_HOST_ASSERT(tensor.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(tensor.scalar_type() == torch::headeronly::ScalarType::Int);
         DG_HOST_ASSERT(tensor.device() == device);
     };
 
@@ -220,7 +219,7 @@ static void mega_mhc(const torch::Tensor& x,
         const auto num_required_elements = y_shared_sf->storage_offset() + num_required_rows +
                                            (hidden / mhc_layout::kHiddenPerSFWord - 1) * y_shared_sf->stride(1);
         const auto num_required_bytes = static_cast<uint64_t>(num_required_elements) * y_shared_sf->element_size();
-        DG_HOST_ASSERT(num_required_bytes <= y_shared_sf->storage().nbytes());
+        DG_HOST_ASSERT(num_required_bytes <= torch_compat::storage_nbytes(*y_shared_sf));
     }
 
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
@@ -230,15 +229,18 @@ static void mega_mhc(const torch::Tensor& x,
     const auto num_mhc_scratch_bytes = mhc_layout::Workspace<>::get_num_scratch_bytes(num_m_blocks, num_splits);
 
     const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted;
-    const auto num_bf16_scratch_bytes = needs_bf16_scratch ? static_cast<int64_t>(num_tokens) * hidden * x.element_size() : 0;
-    const auto scratch = torch::empty({static_cast<int64_t>(num_mhc_scratch_bytes) + num_bf16_scratch_bytes},
-                                      x.options().dtype(torch::kByte));
-    const auto& split_barriers = get_split_barriers(x.options());
+    const auto num_bf16_scratch_bytes = needs_bf16_scratch ?
+        static_cast<int64_t>(num_tokens) * hidden * static_cast<int64_t>(x.element_size()) : int64_t{0};
+    const auto num_scratch_bytes = static_cast<int64_t>(num_mhc_scratch_bytes) + num_bf16_scratch_bytes;
+    const auto scratch = torch::stable::new_empty(
+        x, {num_scratch_bytes}, torch::headeronly::ScalarType::Byte);
+    const auto& split_barriers = get_split_barriers(x);
 
     // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary.
-    const auto y_bf16_storage = needs_bf16_scratch ? scratch.narrow(0, num_mhc_scratch_bytes, num_bf16_scratch_bytes).
-                                                     view(torch::kBFloat16).view({num_tokens, hidden})
-                                                   : y_bf16.value_or(x);
+    const auto y_bf16_storage = needs_bf16_scratch ? torch::stable::view(
+        torch_compat::view_dtype(torch_compat::narrow(scratch, 0, num_mhc_scratch_bytes, num_bf16_scratch_bytes),
+                                torch::headeronly::ScalarType::BFloat16), {num_tokens, hidden})
+        : y_bf16.value_or(x);
 
     // GEMM and routed SF differ only in strides and share one primary writer.
     const auto& y_primary_sf = y_routed_sf.has_value() ? y_routed_sf : y_gemm_sf;
@@ -260,42 +262,42 @@ namespace deep_gemm::torch_registration {
 using namespace deep_gemm::torch_utils;
 
 static void mega_mhc(
-    const torch::Tensor& x,
-    const torch::Tensor& residual,
-    const std::optional<torch::Tensor>& shifted_prev_mix,
-    const torch::Tensor& post_mix,
-    const torch::Tensor& comb_res_mix,
-    const torch::Tensor& fn,
-    const torch::Tensor& mix_scales,
-    const torch::Tensor& mix_bases,
+    const torch::stable::Tensor& x,
+    const torch::stable::Tensor& residual,
+    const std::optional<torch::stable::Tensor>& shifted_prev_mix,
+    const torch::stable::Tensor& post_mix,
+    const torch::stable::Tensor& comb_res_mix,
+    const torch::stable::Tensor& fn,
+    const torch::stable::Tensor& mix_scales,
+    const torch::stable::Tensor& mix_bases,
     const int64_t& hc_mult,
     const double& hc_norm_eps,
     const double& hc_pre_eps,
     const double& hc_post_scale,
     const double& sinkhorn_eps,
     const int64_t& num_sinkhorn_iters,
-    const torch::Tensor& rmsnorm_weight,
+    const torch::stable::Tensor& rmsnorm_weight,
     const double& rmsnorm_eps,
     const double& rmsnorm_scale,
-    const torch::Tensor& new_residual,
-    const std::optional<torch::Tensor>& new_prev_mix,
-    const torch::Tensor& new_post_mix,
-    const torch::Tensor& new_comb_res_mix,
-    const std::optional<torch::Tensor>& y_bf16,
-    const std::optional<torch::Tensor>& y_fp8,
-    const std::optional<torch::Tensor>& y_gemm_sf,
-    const std::optional<torch::Tensor>& y_routed_sf,
-    const std::optional<torch::Tensor>& y_shared_sf,
+    const torch::stable::Tensor& new_residual,
+    const std::optional<torch::stable::Tensor>& new_prev_mix,
+    const torch::stable::Tensor& new_post_mix,
+    const torch::stable::Tensor& new_comb_res_mix,
+    const std::optional<torch::stable::Tensor>& y_bf16,
+    const std::optional<torch::stable::Tensor>& y_fp8,
+    const std::optional<torch::stable::Tensor>& y_gemm_sf,
+    const std::optional<torch::stable::Tensor>& y_routed_sf,
+    const std::optional<torch::stable::Tensor>& y_shared_sf,
     const int64_t& shared_sf_block_m) {
     mega_mhc::mega_mhc(
         x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales, mix_bases, hc_mult, hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters, rmsnorm_weight, rmsnorm_eps, rmsnorm_scale, new_residual, new_prev_mix, new_post_mix, new_comb_res_mix, y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, shared_sf_block_m);
 }
 } // namespace deep_gemm::torch_registration
 
-TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("mega_mhc(Tensor x, Tensor residual, Tensor? shifted_prev_mix, Tensor post_mix, Tensor comb_res_mix, Tensor fn, Tensor mix_scales, Tensor mix_bases, int hc_mult, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, int num_sinkhorn_iters, Tensor rmsnorm_weight, float rmsnorm_eps, float rmsnorm_scale, Tensor(a!) new_residual, Tensor(b!)? new_prev_mix, Tensor(c!) new_post_mix, Tensor(d!) new_comb_res_mix, Tensor(e!)? y_bf16=None, Tensor(f!)? y_fp8=None, Tensor(g!)? y_gemm_sf=None, Tensor(h!)? y_routed_sf=None, Tensor(i!)? y_shared_sf=None, int shared_sf_block_m=0) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
-    m.impl("mega_mhc", TORCH_FN(deep_gemm::torch_registration::mega_mhc));
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    m.impl("mega_mhc", TORCH_BOX(&deep_gemm::torch_registration::mega_mhc));
 }

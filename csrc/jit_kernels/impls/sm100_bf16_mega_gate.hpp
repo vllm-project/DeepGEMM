@@ -1,7 +1,8 @@
 #pragma once
 
 #include <format>
-#include <torch/all.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include <deep_gemm/layout/mega_gate.cuh>
 
@@ -12,15 +13,15 @@
 
 namespace deep_gemm {
 
-static void sm100_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weight,
-                                 const std::optional<torch::Tensor>& bias,
-                                 const std::optional<torch::Tensor>& image_bias,
-                                 const std::optional<torch::Tensor>& image_token_mask,
-                                 const std::optional<torch::Tensor>& mask,
-                                 const std::optional<torch::Tensor>& fix_routing_mask,
-                                 const std::optional<torch::Tensor>& force_random,
+static void sm100_bf16_mega_gate(const torch::stable::Tensor& x, const torch::stable::Tensor& weight,
+                                 const std::optional<torch::stable::Tensor>& bias,
+                                 const std::optional<torch::stable::Tensor>& image_bias,
+                                 const std::optional<torch::stable::Tensor>& image_token_mask,
+                                 const std::optional<torch::stable::Tensor>& mask,
+                                 const std::optional<torch::stable::Tensor>& fix_routing_mask,
+                                 const std::optional<torch::stable::Tensor>& force_random,
                                  const mega_gate_layout::RoutingArgs& routing_args,
-                                 const torch::Tensor& score_barriers,
+                                 const torch::stable::Tensor& score_barriers,
                                  const int& num_tokens, const int& hidden,
                                  const int& num_routed_experts, const int& num_topk) {
     const auto num_aligned_experts = align(num_routed_experts, static_cast<int>(mega_gate_layout::kExpertAlignment));
@@ -31,7 +32,8 @@ static void sm100_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& we
     const auto num_token_blocks = ceil_div(num_tokens, config.block_tokens);
     const auto num_scratch_bytes = mega_gate_layout::Workspace<>::get_num_scratch_bytes(
         num_token_blocks, config.num_split_k, config.block_tokens, num_aligned_experts);
-    const auto scratch = torch::empty({static_cast<int64_t>(num_scratch_bytes)}, x.options().dtype(torch::kByte));
+    const auto scratch = torch::stable::new_empty(
+        x, {static_cast<int64_t>(num_scratch_bytes)}, torch::headeronly::ScalarType::Byte);
 
     const auto tensor_map_x = make_tma_a_desc(cute::UMMA::Major::K, x, num_tokens, hidden,
                                               config.load_block_m, mega_gate_layout::BLOCK_K,
@@ -74,14 +76,14 @@ static void __instantiate_kernel() {{
             .cluster_dim = dim3(config.num_mma_ctas, 1, 1),
         },
         tensor_map_x, tensor_map_weight,
-        bias ? bias->data_ptr() : nullptr,
-        image_bias ? image_bias->data_ptr() : nullptr,
-        image_token_mask ? image_token_mask->data_ptr() : nullptr,
-        mask ? mask->data_ptr() : nullptr,
-        fix_routing_mask ? fix_routing_mask->data_ptr() : nullptr,
-        force_random ? force_random->data_ptr() : nullptr,
+        bias ? bias->mutable_data_ptr() : nullptr,
+        image_bias ? image_bias->mutable_data_ptr() : nullptr,
+        image_token_mask ? image_token_mask->mutable_data_ptr() : nullptr,
+        mask ? mask->mutable_data_ptr() : nullptr,
+        fix_routing_mask ? fix_routing_mask->mutable_data_ptr() : nullptr,
+        force_random ? force_random->mutable_data_ptr() : nullptr,
         routing_args,
-        scratch.data_ptr(), score_barriers.data_ptr(),
+        scratch.mutable_data_ptr(), score_barriers.mutable_data_ptr(),
         static_cast<uint32_t>(num_tokens),
         static_cast<uint32_t>(config.block_tokens),
         static_cast<uint32_t>(config.num_stages),

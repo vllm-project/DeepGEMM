@@ -4,9 +4,11 @@
 #include <memory>
 #include <unordered_map>
 
-#include <ATen/cuda/CUDAContext.h>
+#include <torch/csrc/stable/c/shim.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../utils/torch_compat.hpp"
 #include <cublasLt.h>
-#include <torch/all.h>
 
 #include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/lazy.hpp>
@@ -25,7 +27,7 @@ public:
     // cuBLAS will select worse heuristics when workspace > 16 MiB with shape, e.g. m=128, n=7168, k=16384
     static constexpr size_t kCublasLtWorkspaceSize = 16 * 1024 * 1024;
     // cuBLASLt may use the workspace asynchronously, so concurrent streams cannot share it.
-    std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> cublaslt_workspaces;
+    std::map<torch_compat::StreamKey, torch::stable::Tensor> cublaslt_workspaces;
 
     // Create the cuBLASLt handle ourselves
     cublasLtHandle_t cublaslt_handle;
@@ -33,9 +35,9 @@ public:
     bool use_temp_cublaslt_workspace;
 
     // The locality domain of every SM, probed lazily
-    torch::Tensor sm_locality_domains;
+    torch::stable::Tensor sm_locality_domains;
     // We need to balance the SMs across locality domains to provide simpler load balancing
-    torch::Tensor balanced_sm_locality_domains;
+    torch::stable::Tensor balanced_sm_locality_domains;
 
     explicit Runtime() {
         // Whether to use PyTorch cuBLASLt
@@ -57,21 +59,24 @@ public:
     }
 
     cublasLtHandle_t get_cublaslt_handle() const {
-        if (use_pytorch_managed_cublaslt_handle)
-            return at::cuda::getCurrentCUDABlasLtHandle();
+        if (use_pytorch_managed_cublaslt_handle) {
+            void* handle = nullptr;
+            TORCH_ERROR_CODE_CHECK(torch_get_current_cuda_blas_handle(&handle));
+            return reinterpret_cast<cublasLtHandle_t>(handle);
+        }
 
         // Self-managed handle
         return cublaslt_handle;
     }
 
-    torch::Tensor get_cublaslt_workspace(const c10::cuda::CUDAStream& stream) {
-        const auto options = dtype(torch::kByte).device(stream.device());
+    torch::stable::Tensor get_cublaslt_workspace(const torch::stable::Tensor& reference) {
+        const auto stream = torch_compat::stream_key(reference);
         if (use_temp_cublaslt_workspace)
-            return torch::empty({kCublasLtWorkspaceSize}, options);
+            return torch::stable::new_empty(reference, {kCublasLtWorkspaceSize}, torch::headeronly::ScalarType::Byte);
 
         auto& workspace = cublaslt_workspaces[stream];
         if (not workspace.defined())
-            workspace = torch::empty({kCublasLtWorkspaceSize}, options);
+            workspace = torch::stable::new_empty(reference, {kCublasLtWorkspaceSize}, torch::headeronly::ScalarType::Byte);
         return workspace;
     }
 

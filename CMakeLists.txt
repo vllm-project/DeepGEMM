@@ -28,7 +28,10 @@ link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib64 ${CU
 # The main Python API entrance
 add_library(_C_extension MODULE csrc/python_api.cpp)
 set_target_properties(_C_extension PROPERTIES PREFIX "")
-target_compile_definitions(_C_extension PRIVATE DJ_DISABLE_GIL=1)
+target_compile_definitions(_C_extension PRIVATE
+    DJ_DISABLE_GIL=1
+    TORCH_TARGET_VERSION=0x020a000000000000
+    USE_CUDA)
 target_link_libraries(_C_extension PRIVATE ${TORCH_LIBRARIES} CUDA::cudart)
 
 # Enable kernel code indexing with CMake-based IDEs

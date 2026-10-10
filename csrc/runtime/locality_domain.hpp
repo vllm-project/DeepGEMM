@@ -3,7 +3,7 @@
 #include <map>
 
 #include <cuda.h>
-#include <c10/cuda/CUDAFunctions.h>
+#include <cuda_runtime.h>
 
 #include <deep_gemm/common/types.cuh>
 #include <deep_jit/backend/cuda/driver.hpp>
@@ -27,7 +27,7 @@ class LocalityDomainAllocator {
     static CUmemLocation get_device_location() {
         CUmemLocation location{};
         location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        location.id = c10::cuda::current_device();
+        DG_CUDA_RUNTIME_CHECK(cudaGetDevice(&location.id));
         return location;
     }
 

@@ -562,6 +562,8 @@ def generate_pyi_file_content(
         'from typing import Any, Callable, Optional',
         'import torch',
         '',
+        'class Runtime: ...',
+        '',
         '',
     ]
 
@@ -574,6 +576,14 @@ def generate_pyi_file_content(
 def apply_python_wrappers(parsed_ops, c_py_path):
     """Use public wrapper signatures when packing differs from dispatcher schemas."""
     module = ast.parse(Path(c_py_path).read_text())
+    # These Python wrappers deliberately use different stable dispatcher returns.
+    for op in parsed_ops:
+        if op['python_function_name'] == '_get_bf16_mega_gate_config':
+            op['python_function_name'] = 'get_bf16_mega_gate_config'
+            op['return_type'] = 'dict[str, int]'
+        elif op['python_function_name'] == '_ensure_jit':
+            op['python_function_name'] = 'get_jit'
+            op['return_type'] = 'Runtime'
     by_name = {op['python_function_name']: op for op in parsed_ops}
     for node in ast.walk(module):
         if not isinstance(node, ast.FunctionDef) or node.name not in by_name:

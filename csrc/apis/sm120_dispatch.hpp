@@ -17,7 +17,9 @@
 //
 // UNVALIDATED: no sm120 hardware was available while porting; none of this has been run.
 
-#include <torch/all.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../utils/torch_compat.hpp"
 
 #include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm120_bf16_gemm.hpp"
@@ -35,7 +37,7 @@ constexpr int kMqaBlockKv   = 128;
 // Repack a packed-FP4 tensor (two 4-bit codes per int8) from MN-major into K-major.
 // File-local on purpose: this is its only consumer, so upstream-owned `csrc/utils/math.hpp`
 // (where nv_dev put it) stays untouched.
-static torch::Tensor fp4_repack_to_k_major(const torch::Tensor& a, int logical_mn) {
+static torch::stable::Tensor fp4_repack_to_k_major(const torch::stable::Tensor& a, int logical_mn) {
     DG_HOST_ASSERT(a.scalar_type() == kPackedFP4);
     const int ndim = a.dim();
     DG_HOST_ASSERT(ndim == 2 or ndim == 3);
@@ -43,39 +45,40 @@ static torch::Tensor fp4_repack_to_k_major(const torch::Tensor& a, int logical_m
     const int k = a.size(-1);
     DG_HOST_ASSERT(mn_packed * 2 == logical_mn and k % 2 == 0);
 
-    auto lo = a.bitwise_and(0x0F);
-    auto hi = a.to(torch::kByte).bitwise_right_shift(4).to(torch::kInt8).bitwise_and(0x0F);
+    auto lo = torch_compat::bitwise_and(a, 0x0F);
+    auto hi = torch_compat::bitwise_and(torch::stable::to(torch_compat::bitwise_right_shift(torch::stable::to(a, torch::headeronly::ScalarType::Byte), 4), torch::headeronly::ScalarType::Char), 0x0F);
 
     auto shape_full = a.sizes().vec();
     shape_full[ndim - 2] = logical_mn;
-    auto codes = torch::empty(shape_full, a.options());
-    using S = torch::indexing::Slice;
-    codes.index_put_({torch::indexing::Ellipsis, S(0, torch::indexing::None, 2), S()}, lo);
-    codes.index_put_({torch::indexing::Ellipsis, S(1, torch::indexing::None, 2), S()}, hi);
+    auto codes = torch::stable::new_empty(a, shape_full);
+    torch_compat::copy_(torch_compat::slice(codes, -2, 0, codes.size(-2), 2), lo);
+    torch_compat::copy_(torch_compat::slice(codes, -2, 1, codes.size(-2), 2), hi);
 
     auto shape_view = shape_full;
     shape_view[ndim - 1] = k / 2;
     shape_view.push_back(2);
-    auto codes2 = codes.view(shape_view);
-    auto result = codes2.select(-1, 0).bitwise_and(0x0F)
-                  .bitwise_or(codes2.select(-1, 1).bitwise_and(0x0F).to(torch::kByte)
-                              .bitwise_left_shift(4).to(torch::kInt8));
-    return result.contiguous();
+    auto codes2 = torch::stable::view(codes, shape_view);
+    auto result = torch_compat::bitwise_or(
+        torch_compat::bitwise_and(torch::stable::select(codes2, -1, 0), 0x0F),
+        torch::stable::to(torch_compat::bitwise_left_shift(
+            torch::stable::to(torch_compat::bitwise_and(torch::stable::select(codes2, -1, 1), 0x0F),
+                              torch::headeronly::ScalarType::Byte), 4), torch::headeronly::ScalarType::Char));
+    return torch::stable::contiguous(result);
 }
 
 // SM120 MMA consumes K-major operands: repack packed-FP4 (needs `logical_mn`) or copy
-static torch::Tensor to_k_major(const torch::Tensor& t, const cute::UMMA::Major& major,
+static torch::stable::Tensor to_k_major(const torch::stable::Tensor& t, const cute::UMMA::Major& major,
                                 const int& logical_mn) {
     if (major == cute::UMMA::Major::K)
         return t;
-    return t.scalar_type() == kPackedFP4 ? fp4_repack_to_k_major(t, logical_mn) : t.contiguous();
+    return t.scalar_type() == kPackedFP4 ? fp4_repack_to_k_major(t, logical_mn) : torch::stable::contiguous(t);
 }
 
 // SM120: AB-swap decision must precede the single SF transform, so it owns its own flow
-static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
-                            const std::pair<torch::Tensor, torch::Tensor>& b,
-                            const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
+static void fp8_fp4_gemm_nt(const std::pair<torch::stable::Tensor, torch::stable::Tensor>& a,
+                            const std::pair<torch::stable::Tensor, torch::stable::Tensor>& b,
+                            const torch::stable::Tensor& d,
+                            const std::optional<torch::stable::Tensor>& c,
                             const std::optional<std::tuple<int, int, int>>& recipe,
                             const std::optional<std::tuple<int, int>>& recipe_a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
@@ -124,7 +127,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         sf_a_raw, sf_b_raw, eff_m, eff_n, k, eff_recipe,
         eff_recipe_a, eff_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
-    DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::headeronly::ScalarType::Int and sfb.scalar_type() == torch::headeronly::ScalarType::Int);
 
     if (swap_ab) {
         sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
@@ -149,7 +152,7 @@ constexpr int kSwapAbMMax = 32;
 static bool bmm_swap_ab_eligible(const int& m,
                                  const cute::UMMA::Major& major_a,
                                  const cute::UMMA::Major& major_b,
-                                 const torch::Tensor& d,
+                                 const torch::stable::Tensor& d,
                                  const bool& with_accumulation) {
     return jit->device.get_arch_major() == 12 and m >= 1 and m <= kSwapAbMMax
         and major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K
@@ -159,10 +162,10 @@ static bool bmm_swap_ab_eligible(const int& m,
 
 // The swapped batched flow. Takes the operands in the caller's *unswapped* order and performs
 // the swap internally, because the swap has to happen before the single SF transform.
-static void fp8_fp4_bmm_swapped(const torch::Tensor& a, const torch::Tensor& sfa,
-                                const torch::Tensor& b, const torch::Tensor& sfb,
-                                const std::optional<torch::Tensor>& c,
-                                const torch::Tensor& d,
+static void fp8_fp4_bmm_swapped(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                                const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                                const std::optional<torch::stable::Tensor>& c,
+                                const torch::stable::Tensor& d,
                                 const int& batch_size,
                                 const int& m, const int& n, const int& k,
                                 const cute::UMMA::Major& major_a,

@@ -12,6 +12,22 @@ import torch
 from pathlib import Path
 
 
+class _EpilogueSpec:
+    __slots__ = ('kind', 'alpha', 'sfd')
+
+    def __init__(self, kind, alpha=None, sfd=None):
+        self.kind = kind
+        self.alpha = alpha
+        self.sfd = sfd
+
+
+def _unpack_epilogue(value):
+    if value is None:
+        return 0, None, None
+    assert isinstance(value, _EpilogueSpec), f'Unsupported epilogue value: {type(value)!r}'
+    return value.kind, value.alpha, value.sfd
+
+
 def _load_extension():
     so_files = list(Path(__file__).parent.glob('_C_extension*.so'))
     assert len(so_files) == 1, (
@@ -83,7 +99,7 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_nt(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
+            compiled_dims, disable_ue8m0_cast, alpha, *_unpack_epilogue(epilogue),
         )
 
     def fp8_fp4_gemm_nn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None,
@@ -91,7 +107,7 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_nn(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
+            compiled_dims, disable_ue8m0_cast, alpha, *_unpack_epilogue(epilogue),
         )
 
     def fp8_fp4_gemm_tn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None,
@@ -99,7 +115,7 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_tn(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
+            compiled_dims, disable_ue8m0_cast, alpha, *_unpack_epilogue(epilogue),
         )
 
     def fp8_fp4_gemm_tt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None,
@@ -107,7 +123,7 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.fp8_fp4_gemm_tt(
             a_tensor, sfa, b_tensor, sfb, d, c, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, alpha, epilogue,
+            compiled_dims, disable_ue8m0_cast, alpha, *_unpack_epilogue(epilogue),
         )
 
     def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None,
@@ -117,7 +133,7 @@ def _register_deep_gemm_kernels():
         return _torch_ops.m_grouped_fp8_fp4_gemm_nt_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, grouped_layout, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
             compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding,
-            expected_m_for_psum_layout, epilogue,
+            expected_m_for_psum_layout, *_unpack_epilogue(epilogue),
         )
 
     def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None,
@@ -126,7 +142,8 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.m_grouped_fp8_fp4_gemm_nn_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, grouped_layout, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, epilogue,
+            compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding,
+            *_unpack_epilogue(epilogue),
         )
 
     def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None,
@@ -134,7 +151,7 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.m_grouped_fp8_fp4_gemm_nt_masked(
             a_tensor, sfa, b_tensor, sfb, d, masked_m, expected_m, _as_int_list(recipe), _as_int_list(recipe_a), _as_int_list(recipe_b),
-            compiled_dims, disable_ue8m0_cast, epilogue,
+            compiled_dims, disable_ue8m0_cast, *_unpack_epilogue(epilogue),
         )
 
     def k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 128),
@@ -142,7 +159,7 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.k_grouped_fp8_gemm_tn_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, ks_cpu, grouped_layout, c, list(recipe),
-            compiled_dims, use_psum_layout, epilogue,
+            compiled_dims, use_psum_layout, *_unpack_epilogue(epilogue),
         )
 
     def k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 128),
@@ -150,12 +167,15 @@ def _register_deep_gemm_kernels():
         a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
         return _torch_ops.k_grouped_fp8_gemm_nt_contiguous(
             a_tensor, sfa, b_tensor, sfb, d, ks_cpu, grouped_layout, c, list(recipe),
-            compiled_dims, use_psum_layout, epilogue,
+            compiled_dims, use_psum_layout, *_unpack_epilogue(epilogue),
         )
 
     def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None):
         d_tensor, sfd = d if isinstance(d, (tuple, list)) else (d, None)
-        return _torch_ops.fp8_einsum(expr, a[0], a[1], b[0], b[1], d_tensor, c, list(recipe), sfd, epilogue)
+        return _torch_ops.fp8_einsum(
+            expr, a[0], a[1], b[0], b[1], d_tensor, c, list(recipe), sfd,
+            *_unpack_epilogue(epilogue),
+        )
 
     def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta=None):
         q_fp, q_sf = q[0], q[1]
@@ -194,20 +214,67 @@ def _register_deep_gemm_kernels():
     })
 
     # BF16 GEMMs
-    _bind_guarded_ops(
-        'bf16_gemm_nt',
-        'bf16_gemm_nn',
-        'bf16_gemm_tn',
-        'bf16_gemm_tt',
-        'm_grouped_bf16_gemm_nt_contiguous',
-        'm_grouped_bf16_gemm_nn_contiguous',
-        'm_grouped_bf16_gemm_nt_masked',
-        'k_grouped_bf16_gemm_tn_contiguous',
-    )
+    def _bf16_gemm(name, a, b, d, c, compiled_dims, alpha, epilogue):
+        return getattr(_torch_ops, name)(
+            a, b, d, c, compiled_dims, alpha, *_unpack_epilogue(epilogue))
+
+    def bf16_gemm_nt(a, b, d, c=None, compiled_dims='nk', alpha=None, epilogue=None):
+        return _bf16_gemm('bf16_gemm_nt', a, b, d, c, compiled_dims, alpha, epilogue)
+
+    def bf16_gemm_nn(a, b, d, c=None, compiled_dims='nk', alpha=None, epilogue=None):
+        return _bf16_gemm('bf16_gemm_nn', a, b, d, c, compiled_dims, alpha, epilogue)
+
+    def bf16_gemm_tn(a, b, d, c=None, compiled_dims='mn', alpha=None, epilogue=None):
+        return _bf16_gemm('bf16_gemm_tn', a, b, d, c, compiled_dims, alpha, epilogue)
+
+    def bf16_gemm_tt(a, b, d, c=None, compiled_dims='mn', alpha=None, epilogue=None):
+        return _bf16_gemm('bf16_gemm_tt', a, b, d, c, compiled_dims, alpha, epilogue)
+
+    def m_grouped_bf16_gemm_nt_contiguous(
+        a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False,
+        ensure_zero_padding=True, expected_m_for_psum_layout=None, epilogue=None,
+    ):
+        return _torch_ops.m_grouped_bf16_gemm_nt_contiguous(
+            a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding,
+            expected_m_for_psum_layout, *_unpack_epilogue(epilogue),
+        )
+
+    def m_grouped_bf16_gemm_nn_contiguous(
+        a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False,
+        ensure_zero_padding=True, epilogue=None,
+    ):
+        return _torch_ops.m_grouped_bf16_gemm_nn_contiguous(
+            a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding,
+            *_unpack_epilogue(epilogue),
+        )
+
+    def m_grouped_bf16_gemm_nt_masked(
+        a, b, d, masked_m, expected_m, compiled_dims='nk', epilogue=None,
+    ):
+        return _torch_ops.m_grouped_bf16_gemm_nt_masked(
+            a, b, d, masked_m, expected_m, compiled_dims, *_unpack_epilogue(epilogue),
+        )
+
+    def k_grouped_bf16_gemm_tn_contiguous(
+        a, b, d, ks_cpu, grouped_layout, c=None, compiled_dims='mn',
+        use_psum_layout=False, epilogue=None,
+    ):
+        return _torch_ops.k_grouped_bf16_gemm_tn_contiguous(
+            a, b, d, ks_cpu, grouped_layout, c, compiled_dims, use_psum_layout,
+            *_unpack_epilogue(epilogue),
+        )
+
+    def einsum(expr, a, b, d, c=None, epilogue=None):
+        return _torch_ops.einsum(expr, a, b, d, c, *_unpack_epilogue(epilogue))
+
+    globals().update({name: value for name, value in locals().items() if name in {
+        'bf16_gemm_nt', 'bf16_gemm_nn', 'bf16_gemm_tn', 'bf16_gemm_tt',
+        'm_grouped_bf16_gemm_nt_contiguous', 'm_grouped_bf16_gemm_nn_contiguous',
+        'm_grouped_bf16_gemm_nt_masked', 'k_grouped_bf16_gemm_tn_contiguous', 'einsum',
+    }})
 
     # Einsum, hyperconnection, and attention metadata
     _bind_guarded_ops(
-        'einsum',                         # einsum.hpp
         'tf32_hc_prenorm_gemm',           # hyperconnection.hpp
         'get_paged_mqa_logits_metadata',  # attention.hpp
     )
@@ -273,7 +340,8 @@ def k_grouped_fp4_gemm_nt_contiguous(
     a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 32), compiled_dims='mn', use_psum_layout=False, epilogue=None
 ):
     return _torch_ops.k_grouped_fp4_gemm_nt_contiguous(
-        a[0], a[1], b[0], b[1], d, ks_cpu, grouped_layout, c, list(recipe), compiled_dims, use_psum_layout, epilogue
+        a[0], a[1], b[0], b[1], d, ks_cpu, grouped_layout, c, list(recipe), compiled_dims,
+        use_psum_layout, *_unpack_epilogue(epilogue),
     )
 
 
@@ -618,30 +686,134 @@ def get_symm_buffer_size_for_nvfp4_mega_moe(
     return num_bytes, slice_input_buffers
 
 
-Runtime = torch.classes.deep_gemm.Runtime
-get_jit = _torch_ops.get_jit
+class Runtime:
+    """Opaque compatibility type formerly returned by the pybind custom class."""
+
+
+def get_jit() -> Runtime:
+    """Initialize and return the opaque runtime handle kept by the legacy API."""
+    _torch_ops._ensure_jit()
+    return Runtime()
 
 
 # GEMM epilogue classes for the `epilogue` argument, as `deep_gemm.epilogue.X`
 # NOTES: `alpha` and the FP8 `(d, sfd)` output pair are the shorthand for `Alpha` and `FP8Quantization`
 epilogue = types.ModuleType('deep_gemm.epilogue', 'GEMM epilogue classes')
-epilogue.Identity = lambda: _torch_ops.epilogue_identity()
-epilogue.Alpha = lambda alpha: _torch_ops.epilogue_alpha(alpha)
-epilogue.FP8Quantization = lambda sfd: _torch_ops.epilogue_fp8_quantization(sfd)
-epilogue.BF16StochasticRounding = lambda: _torch_ops.epilogue_bf16_stochastic_rounding()
+epilogue.Identity = lambda: _EpilogueSpec(1)
+epilogue.Alpha = lambda alpha: _EpilogueSpec(2, alpha=float(alpha))
+epilogue.FP8Quantization = lambda sfd: _EpilogueSpec(3, sfd=sfd)
+epilogue.BF16StochasticRounding = lambda: _EpilogueSpec(4)
 
 
 # Memory homed in the GPU's locality domains, re-exported by `deep_gemm.locality_domain`
-locality_domain = types.ModuleType('deep_gemm._C.locality_domain', "Memory homed in the GPU's locality domains")
+locality_domain = types.ModuleType(f'{__name__}.locality_domain', "Memory homed in the GPU's locality domains")
 locality_domain.get_num_locality_domains = _torch_ops.locality_domain_get_num_locality_domains
 locality_domain.get_granularity = _torch_ops.locality_domain_get_granularity
 locality_domain.is_localization_available = _torch_ops.locality_domain_is_localization_available
 locality_domain.empty = lambda sizes, dtype, domain_idx: _torch_ops.locality_domain_empty(list(sizes), dtype, domain_idx)
 locality_domain.empty_per_domain = lambda sizes, dtype: _torch_ops.locality_domain_empty_per_domain(list(sizes), dtype)
 locality_domain.is_localized = _torch_ops.locality_domain_is_localized
-locality_domain.get_sm_locality_domains = _torch_ops.locality_domain_get_sm_locality_domains
-locality_domain.get_balanced_sm_locality_domains = _torch_ops.locality_domain_get_balanced_sm_locality_domains
-locality_domain.release_mlopart = _torch_ops.locality_domain_release_mlopart
+
+_NUM_SMS_PER_TPC = 2
+_NUM_PROBE_CHUNKS_PER_SM = 8
+_PROBE_CHUNK_BYTES = 4096
+_PROBE_LINE_BYTES = 128
+_CHAIN_LINE_STRIDE = 7
+_MIN_FAR_NEAR_RATIO = 1.25
+_NUM_MAX_PROBE_ATTEMPTS = 5
+_sm_locality_domains = None
+_balanced_sm_locality_domains = None
+
+
+def _get_even_sm_locality_domains():
+    tpc_idx = torch.arange(
+        get_num_sms() // _NUM_SMS_PER_TPC, dtype=torch.int32, device='cuda')
+    return (tpc_idx % locality_domain.get_num_locality_domains()).to(torch.uint8).repeat_interleave(_NUM_SMS_PER_TPC)
+
+
+def _get_probe_chain():
+    num_lines = _PROBE_CHUNK_BYTES // _PROBE_LINE_BYTES
+    words_per_line = _PROBE_LINE_BYTES // 4
+    chain = torch.zeros((num_lines, words_per_line), dtype=torch.int32, device='cuda')
+    chain[:, 0] = (torch.arange(num_lines, dtype=torch.int32, device='cuda') + _CHAIN_LINE_STRIDE) % num_lines * words_per_line
+    return chain.flatten()
+
+
+def _probe_sm_locality_domains_once(buffer):
+    num_domains, num_sms = buffer.size(0), buffer.size(1)
+    buffer.view(torch.int32).view(num_domains, -1, _PROBE_CHUNK_BYTES // 4).copy_(_get_probe_chain())
+    latency = torch.zeros(
+        (num_domains, num_sms, _NUM_PROBE_CHUNKS_PER_SM), dtype=torch.int16, device=buffer.device)
+    torch.zeros(256 << 20, dtype=torch.uint8, device=buffer.device)
+    _torch_ops.locality_domain_probe_chase(buffer, latency)
+    assert latency.gt(0).all().item()
+    latency = latency.to(torch.float32).median(-1).values
+    sorted_latency, order = latency.sort(0)
+    sm_domain = order[0].to(torch.uint8)
+    tpcs = sm_domain.view(-1, _NUM_SMS_PER_TPC)
+    clear = sorted_latency[1].ge(sorted_latency[0] * _MIN_FAR_NEAR_RATIO).all().item()
+    consistent = torch.equal(tpcs, tpcs.select(1, 0).unsqueeze(1).expand_as(tpcs))
+    return sm_domain if clear and consistent else None
+
+
+def _probe_sm_locality_domains():
+    num_sms = get_num_sms()
+    buffer = locality_domain.empty_per_domain(
+        (num_sms, _NUM_PROBE_CHUNKS_PER_SM, _PROBE_CHUNK_BYTES), torch.uint8)
+    for _ in range(_NUM_MAX_PROBE_ATTEMPTS):
+        result = _probe_sm_locality_domains_once(buffer)
+        if result is not None:
+            return result
+    return _get_even_sm_locality_domains()
+
+
+def _balance_sm_locality_domains(sm_domain):
+    tpcs = sm_domain.view(-1, _NUM_SMS_PER_TPC)
+    tpc_domain = tpcs.select(1, 0)
+    num_tpcs = tpcs.size(0)
+    assert num_tpcs % 2 == 0
+    larger = int(tpc_domain.sum().item() * 2 > num_tpcs)
+    surplus = (tpc_domain == larger).nonzero().flatten()[:num_tpcs // 2]
+    balanced = sm_domain.clone()
+    balanced.view(-1, _NUM_SMS_PER_TPC).index_fill_(0, surplus, larger ^ 1)
+    return balanced
+
+
+def _get_sm_locality_domains():
+    global _sm_locality_domains
+    if _sm_locality_domains is None:
+        _sm_locality_domains = (
+            _probe_sm_locality_domains()
+            if locality_domain.is_localization_available()
+            else _get_even_sm_locality_domains()
+        )
+    return _sm_locality_domains
+
+
+def _get_balanced_sm_locality_domains():
+    global _balanced_sm_locality_domains
+    if _balanced_sm_locality_domains is None:
+        _balanced_sm_locality_domains = _balance_sm_locality_domains(_get_sm_locality_domains())
+        _torch_ops.locality_domain_set_sm_locality_domains(
+            _sm_locality_domains, _balanced_sm_locality_domains)
+    return _balanced_sm_locality_domains
+
+
+def _release_mlopart():
+    _get_balanced_sm_locality_domains()
+    _torch_ops.locality_domain_release_mlopart()
+
+
+locality_domain.get_sm_locality_domains = _get_sm_locality_domains
+locality_domain.get_balanced_sm_locality_domains = _get_balanced_sm_locality_domains
+locality_domain.release_mlopart = _release_mlopart
+
+_cpp_init = init
+
+
+def init(library_root_path):
+    _cpp_init(library_root_path, __package__)
+    _get_balanced_sm_locality_domains()
 # NOTES: registered so that `from ._C.locality_domain import ...` resolves as with the former pybind submodule
 sys.modules[locality_domain.__name__] = locality_domain
 

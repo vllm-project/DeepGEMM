@@ -1,12 +1,15 @@
 #pragma once
 
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../utils/torch_compat.hpp"
 #include "../torch_library_utils.hpp"
 
 #include <format>
 #include <variant>
 
-#include <torch/all.h>
+#include <torch/csrc/stable/ops.h>
+#include "../utils/torch_compat.hpp"
 
 #include "../utils/exception.hpp"
 #include "../utils/layout.hpp"
@@ -23,38 +26,40 @@
 
 namespace deep_gemm::einsum {
 
-static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-                       const std::optional<torch::Tensor>& c) {
+static void bmk_bnk_mn(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
+                       const std::optional<torch::stable::Tensor>& c) {
     if (jit->device.get_arch_major() == 12) {
         DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
         const auto [s, m, k] = get_shape<3>(a);
         const auto [s_, n, k_] = get_shape<3>(b);
         const auto [m_, n_] = get_shape<2>(d);
         DG_HOST_ASSERT(s == s_ and k == k_ and m == m_ and n == n_);
-        if (d.scalar_type() == torch::kFloat) {
+        if (d.scalar_type() == torch::headeronly::ScalarType::Float) {
             DG_HOST_ASSERT(c.has_value());
-            DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
+            DG_HOST_ASSERT(c->mutable_data_ptr() == d.mutable_data_ptr() and c->sizes().equals(d.sizes()) and c->strides().equals(d.strides()));
         } else {
-            DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and not c.has_value());
+            DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16 and not c.has_value());
         }
         if (m == 0 or n == 0)
             return;
     }
 
     // Currently FP32 only support the accumulated expression
-    if (d.scalar_type() == torch::kFloat) {
-        DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
+    if (d.scalar_type() == torch::headeronly::ScalarType::Float) {
+        DG_HOST_ASSERT(c->mutable_data_ptr() == d.mutable_data_ptr() and c->sizes().equals(d.sizes()) and c->strides().equals(d.strides()));
     } else {
-        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16);
         DG_HOST_ASSERT(not c.has_value());
 
-        const auto workspace = torch::empty_like(d, d.options().dtype(torch::kFloat32));
-        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(workspace.data_ptr(), 0, workspace.nbytes(),
-                              c10::cuda::getCurrentCUDAStream()));
+        const auto workspace = torch::stable::new_empty(
+            d, d.sizes(), torch::headeronly::ScalarType::Float);
+        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(
+            workspace.mutable_data_ptr(), 0, torch_compat::nbytes(workspace),
+            torch_compat::current_stream(d)));
         bmk_bnk_mn(a, b, workspace, workspace);
 
         // This line has an implicit FP32-to-BF16 casting
-        d.copy_(workspace);
+        torch_compat::copy_(d, workspace);
         return;
     }
 
@@ -79,16 +84,16 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
     }
 }
 
-static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D,
-                        const std::optional<torch::Tensor>& C,
+static void bhr_hdr_bhd(const torch::stable::Tensor& A, const torch::stable::Tensor& B, const torch::stable::Tensor& D,
+                        const std::optional<torch::stable::Tensor>& C,
                         const std::shared_ptr<EpilogueClass>& epilogue_class) {
     const auto [b , h  , r ] = get_shape<3>(A);
     const auto [h_, d  , r_] = get_shape<3>(B);
     const auto [b_, h__, d_] = get_shape<3>(D);
     DG_HOST_ASSERT(b == b_ and h == h_ and r == r_ and d == d_ and h == h__);
 
-    DG_HOST_ASSERT(A.scalar_type() == torch::kBFloat16 and A.stride(2) == 1);
-    DG_HOST_ASSERT(B.scalar_type() == torch::kBFloat16 and B.stride(2) == 1);
+    DG_HOST_ASSERT(A.scalar_type() == torch::headeronly::ScalarType::BFloat16 and A.stride(2) == 1);
+    DG_HOST_ASSERT(B.scalar_type() == torch::headeronly::ScalarType::BFloat16 and B.stride(2) == 1);
     DG_HOST_ASSERT(D.stride(2) == 1);
 
     // Early return for trivial cases
@@ -108,7 +113,7 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
         sm90_bf16_bhr_hdr_bhd(A, B, C, D, b, h, r, d);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        DG_HOST_ASSERT(not C.has_value() and D.scalar_type() == torch::kBFloat16 and
+        DG_HOST_ASSERT(not C.has_value() and D.scalar_type() == torch::headeronly::ScalarType::BFloat16 and
                        "SM120 supports BF16 output without accumulation only");
         sm120_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
@@ -118,16 +123,16 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
     }
 }
 
-static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D,
-                        const std::optional<torch::Tensor>& C,
+static void bhd_hdr_bhr(const torch::stable::Tensor& A, const torch::stable::Tensor& B, const torch::stable::Tensor& D,
+                        const std::optional<torch::stable::Tensor>& C,
                         const std::shared_ptr<EpilogueClass>& epilogue_class) {
     const auto [b , h  , d ] = get_shape<3>(A);
     const auto [h_, d_ , r ] = get_shape<3>(B);
     const auto [b_, h__, r_] = get_shape<3>(D);
     DG_HOST_ASSERT(b == b_ and h == h_ and r == r_ and d == d_ and h == h__);
 
-    DG_HOST_ASSERT(A.scalar_type() == torch::kBFloat16 and A.stride(2) == 1);
-    DG_HOST_ASSERT(B.scalar_type() == torch::kBFloat16 and B.stride(2) == 1);
+    DG_HOST_ASSERT(A.scalar_type() == torch::headeronly::ScalarType::BFloat16 and A.stride(2) == 1);
+    DG_HOST_ASSERT(B.scalar_type() == torch::headeronly::ScalarType::BFloat16 and B.stride(2) == 1);
     DG_HOST_ASSERT(D.stride(2) == 1);
 
     // Early return for trivial cases
@@ -147,7 +152,7 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
         sm90_bf16_bhd_hdr_bhr(A, B, C, D, b, h, r, d);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        DG_HOST_ASSERT(not C.has_value() and D.scalar_type() == torch::kBFloat16 and
+        DG_HOST_ASSERT(not C.has_value() and D.scalar_type() == torch::headeronly::ScalarType::BFloat16 and
                        "SM120 supports BF16 output without accumulation only");
         sm120_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
@@ -157,18 +162,18 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
     }
 }
 
-static void bhd_bhr_hdr(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D,
-                        const std::optional<torch::Tensor>& C) {
+static void bhd_bhr_hdr(const torch::stable::Tensor& A, const torch::stable::Tensor& B, const torch::stable::Tensor& D,
+                        const std::optional<torch::stable::Tensor>& C) {
     const auto [b , h  , d ] = get_shape<3>(A);
     const auto [b_, h_ , r ] = get_shape<3>(B);
     const auto [h__, d_, r_] = get_shape<3>(D);
     DG_HOST_ASSERT(b == b_ and h == h_ and h == h__ and d == d_ and r == r_);
 
-    DG_HOST_ASSERT(A.scalar_type() == torch::kBFloat16 and A.stride(2) == 1);
-    DG_HOST_ASSERT(B.scalar_type() == torch::kBFloat16 and B.stride(2) == 1);
-    DG_HOST_ASSERT(D.scalar_type() == torch::kFloat and D.stride(2) == 1);
+    DG_HOST_ASSERT(A.scalar_type() == torch::headeronly::ScalarType::BFloat16 and A.stride(2) == 1);
+    DG_HOST_ASSERT(B.scalar_type() == torch::headeronly::ScalarType::BFloat16 and B.stride(2) == 1);
+    DG_HOST_ASSERT(D.scalar_type() == torch::headeronly::ScalarType::Float and D.stride(2) == 1);
     if (C.has_value()) {
-        DG_HOST_ASSERT(C->scalar_type() == D.scalar_type() and C->sizes() == D.sizes() and C->stride(2) == 1);
+        DG_HOST_ASSERT(C->scalar_type() == D.scalar_type() and C->sizes().equals(D.sizes()) and C->stride(2) == 1);
     }
 
     // Early return for trivial cases
@@ -180,14 +185,14 @@ static void bhd_bhr_hdr(const torch::Tensor& A, const torch::Tensor& B, const to
 }
 
 static void einsum(const std::string& expr,
-                   const torch::Tensor& a,
-                   const torch::Tensor& b,
-                   const torch::Tensor& d,
-                   const std::optional<torch::Tensor>& c,
+                   const torch::stable::Tensor& a,
+                   const torch::stable::Tensor& b,
+                   const torch::stable::Tensor& d,
+                   const std::optional<torch::stable::Tensor>& c,
                    const std::shared_ptr<EpilogueClass>& epilogue_class) {
-    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(a.scalar_type() == torch::headeronly::ScalarType::BFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::headeronly::ScalarType::BFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16 or d.scalar_type() == torch::headeronly::ScalarType::Float);
     if (c.has_value()) {
         DG_HOST_ASSERT(d.scalar_type() == c->scalar_type());
     }
@@ -212,18 +217,18 @@ static void einsum(const std::string& expr,
 
 // The D output is either a plain BF16/FP32 tensor, or an FP8 `(d, sfd)` pair
 // quantized with dynamic per-32 packed UE8M0 SFs
-static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
-                    const torch::Tensor& b, const torch::Tensor& sfb,
-                    const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
-                    const std::optional<torch::Tensor>& c,
+static void fp8_bmm(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                    const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                    const std::variant<torch::stable::Tensor, std::pair<torch::stable::Tensor, torch::stable::Tensor>>& d,
+                    const std::optional<torch::stable::Tensor>& c,
                     std::optional<std::tuple<int, int, int>> recipe,
                     const std::string& compiled_dims,
                     const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // The FP8 output pair and a user `FP8Quantization` are two spellings of the same epilogue
-    const auto d_fp8 = std::get_if<std::pair<torch::Tensor, torch::Tensor>>(&d);
-    const auto d_tensor = d_fp8 != nullptr ? d_fp8->first : std::get<torch::Tensor>(d);
+    const auto d_fp8 = std::get_if<std::pair<torch::stable::Tensor, torch::stable::Tensor>>(&d);
+    const auto d_tensor = d_fp8 != nullptr ? d_fp8->first : std::get<torch::stable::Tensor>(d);
     auto merged_epilogue_class = epilogue_class;
-    std::optional<torch::Tensor> sfd;
+    std::optional<torch::stable::Tensor> sfd;
     if (d_fp8 != nullptr) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "The FP8 output pair supports no other epilogue");
         sfd = d_fp8->second;
@@ -245,8 +250,8 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto [batch_size__, m_, n_] = get_shape<3>(d_tensor);
     DG_HOST_ASSERT(batch_size == batch_size_ and batch_size == batch_size__);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
-    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(a.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn);
+    DG_HOST_ASSERT(b.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn);
     if (sfd.has_value()) {
         // The SF layout matches a per-token cast of D viewed as a 2D `(m, batch_size * n)`
         // matrix, where each row concatenates the `n` columns of all batches. This requires:
@@ -255,7 +260,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         //    nor a packed 4-SF word may cross a batch boundary
         DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
         DG_HOST_ASSERT(d_tensor.stride(0) == n and n % 128 == 0);
-        check_sf_layout(sfd.value(), m, batch_size * n, 1, 32, std::nullopt, true, false, torch::kInt);
+        check_sf_layout(sfd.value(), m, batch_size * n, 1, 32, std::nullopt, true, false, torch::headeronly::ScalarType::Int);
     }
 
     // Early return for trivial cases
@@ -292,10 +297,10 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
 }
 
 static void fp8_einsum(const std::string& expr,
-                       const std::pair<torch::Tensor, torch::Tensor>& a,
-                       const std::pair<torch::Tensor, torch::Tensor>& b,
-                       const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
-                       const std::optional<torch::Tensor>& c,
+                       const std::pair<torch::stable::Tensor, torch::stable::Tensor>& a,
+                       const std::pair<torch::stable::Tensor, torch::stable::Tensor>& b,
+                       const std::variant<torch::stable::Tensor, std::pair<torch::stable::Tensor, torch::stable::Tensor>>& d,
+                       const std::optional<torch::stable::Tensor>& c,
                        const std::tuple<int, int, int>& recipe,
                        const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Some hardcoded Einstein sum kernels
@@ -308,34 +313,42 @@ static void fp8_einsum(const std::string& expr,
         // NOTES: the FP8 output SF columns are flattened over D's last two dims (matching a
         //        per-token cast of `d.flatten(1, 2)`), so the SF layout is invariant under
         //        the `(b, h)` permute of the data dims
-        const auto perm_a = a.first.permute({1, 0, 2});
-        const auto perm_sfa = a.second.permute({1, 0, 2});
+        const auto perm_a = torch_compat::permute(a.first, {1, 0, 2});
+        const auto perm_sfa = torch_compat::permute(a.second, {1, 0, 2});
         auto perm_d = d;
-        if (const auto d_fp8 = std::get_if<std::pair<torch::Tensor, torch::Tensor>>(&perm_d))
-            d_fp8->first = d_fp8->first.permute({1, 0, 2});
+        if (const auto d_fp8 = std::get_if<std::pair<torch::stable::Tensor, torch::stable::Tensor>>(&perm_d))
+            d_fp8->first = torch_compat::permute(d_fp8->first, {1, 0, 2});
         else
-            std::get<torch::Tensor>(perm_d) = std::get<torch::Tensor>(perm_d).permute({1, 0, 2});
-        const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
+            std::get<torch::stable::Tensor>(perm_d) = torch_compat::permute(
+                std::get<torch::stable::Tensor>(perm_d), {1, 0, 2});
+        const auto perm_c = c.has_value()
+            ? std::make_optional(torch_compat::permute(c.value(), {1, 0, 2}))
+            : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", epilogue_class);
     } else if (expr == "bhd,hdr->bhr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, b, r, d)
-        DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
-        const auto perm_a = a.first.permute({1, 0, 2});
-        const auto perm_sfa = a.second.permute({1, 0, 2});
+        DG_HOST_ASSERT(std::holds_alternative<torch::stable::Tensor>(d));
+        const auto perm_a = torch_compat::permute(a.first, {1, 0, 2});
+        const auto perm_sfa = torch_compat::permute(a.second, {1, 0, 2});
         // SM120: B is MN-major after permute; .contiguous() to K-major (scalar MN-major path ~3x slower)
-        const auto perm_b = arch_major == 12 ? b.first.permute({0, 2, 1}).contiguous() : b.first.permute({0, 2, 1});
-        const auto perm_sfb = b.second.permute({0, 2, 1});
-        const auto perm_d = std::get<torch::Tensor>(d).permute({1, 0, 2});
-        const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
+        const auto perm_b_view = torch_compat::permute(b.first, {0, 2, 1});
+        const auto perm_b = arch_major == 12 ? torch::stable::contiguous(perm_b_view) : perm_b_view;
+        const auto perm_sfb = torch_compat::permute(b.second, {0, 2, 1});
+        const auto perm_d = torch_compat::permute(std::get<torch::stable::Tensor>(d), {1, 0, 2});
+        const auto perm_c = c.has_value()
+            ? std::make_optional(torch_compat::permute(c.value(), {1, 0, 2}))
+            : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk", epilogue_class);
     } else if (expr == "bhd,bhr->hdr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, d, r, b)
-        DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
+        DG_HOST_ASSERT(std::holds_alternative<torch::stable::Tensor>(d));
         // SM120: A/B are MN-major after permute; force K-major (MN-major A unsupported, scalar path ~3x slower)
-        const auto perm_a = arch_major == 12 ? a.first.permute({1, 2, 0}).contiguous() : a.first.permute({1, 2, 0});
-        const auto perm_sfa = a.second.permute({1, 2, 0});
-        const auto perm_b = arch_major == 12 ? b.first.permute({1, 2, 0}).contiguous() : b.first.permute({1, 2, 0});
-        const auto perm_sfb = b.second.permute({1, 2, 0});
+        const auto perm_a_view = torch_compat::permute(a.first, {1, 2, 0});
+        const auto perm_a = arch_major == 12 ? torch::stable::contiguous(perm_a_view) : perm_a_view;
+        const auto perm_sfa = torch_compat::permute(a.second, {1, 2, 0});
+        const auto perm_b_view = torch_compat::permute(b.first, {1, 2, 0});
+        const auto perm_b = arch_major == 12 ? torch::stable::contiguous(perm_b_view) : perm_b_view;
+        const auto perm_sfb = torch_compat::permute(b.second, {1, 2, 0});
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn", epilogue_class);
     } else {
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
@@ -347,35 +360,39 @@ namespace deep_gemm::torch_registration {
 using namespace deep_gemm::torch_utils;
 
 static void einsum(const std::string& expr,
-                   const torch::Tensor& a, const torch::Tensor& b,
-                   const torch::Tensor& d, const c10::optional<torch::Tensor>& c,
-                   const epilogue_class::EpilogueArg& epilogue) {
-    einsum::einsum(expr, a, b, d, c, epilogue_class::unwrap(epilogue));
+                   const torch::stable::Tensor& a, const torch::stable::Tensor& b,
+                   const torch::stable::Tensor& d, const std::optional<torch::stable::Tensor>& c,
+                   const int64_t& epilogue_kind,
+    const std::optional<double>& epilogue_alpha,
+    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    einsum::einsum(expr, a, b, d, c, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
 }
 
 static void fp8_einsum(const std::string& expr,
-                       const torch::Tensor& a, const torch::Tensor& sfa,
-                       const torch::Tensor& b, const torch::Tensor& sfb,
-                       const torch::Tensor& d, const c10::optional<torch::Tensor>& c,
+                       const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                       const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                       const torch::stable::Tensor& d, const std::optional<torch::stable::Tensor>& c,
                        const std::vector<int64_t>& recipe,
-                       const std::optional<torch::Tensor>& sfd,
-                       const epilogue_class::EpilogueArg& epilogue) {
-    std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>> output = d;
+                       const std::optional<torch::stable::Tensor>& sfd,
+                       const int64_t& epilogue_kind,
+    const std::optional<double>& epilogue_alpha,
+    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    std::variant<torch::stable::Tensor, std::pair<torch::stable::Tensor, torch::stable::Tensor>> output = d;
     if (sfd.has_value()) output = std::make_pair(d, *sfd);
-    einsum::fp8_einsum(expr, {a, sfa}, {b, sfb}, output, c, list_to_tuple3(recipe), epilogue_class::unwrap(epilogue));
+    einsum::fp8_einsum(expr, {a, sfa}, {b, sfb}, output, c, list_to_tuple3(recipe), epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
 }
 } // namespace deep_gemm::torch_registration
 
-TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def(
-        "einsum(str expr, Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, __torch__.torch.classes.deep_gemm.Epilogue? epilogue=None) -> ()");
+        "einsum(str expr, Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
     m.def(
-        "fp8_einsum(str expr, Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3] recipe, Tensor(sfd!)? sfd=None, __torch__.torch.classes.deep_gemm.Epilogue? epilogue=None) -> ()");
+        "fp8_einsum(str expr, Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3] recipe, Tensor(sfd!)? sfd=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     using namespace deep_gemm::torch_registration;
 
-    m.impl("einsum", TORCH_FN(einsum));
-    m.impl("fp8_einsum", TORCH_FN(fp8_einsum));
+    m.impl("einsum", TORCH_BOX(&einsum));
+    m.impl("fp8_einsum", TORCH_BOX(&fp8_einsum));
 }

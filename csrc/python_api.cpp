@@ -1,8 +1,8 @@
 #include <memory>
 
-#include <torch/all.h>
-#include <torch/custom_class.h>
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "utils/torch_compat.hpp"
 #include "utils/registration.h"
 
 #include <deep_jit/backend/cuda/backend.hpp>
@@ -22,17 +22,13 @@
 #include "apis/mega_gate.hpp"
 
 namespace deep_gemm {
-// Preserve the opaque runtime handle exposed by DeepJIT's former Python binding.
-struct JitRuntimeHandle : torch::CustomClassHolder {
-    std::shared_ptr<deep_jit::Runtime<deep_jit::CUDA>> value;
-    JitRuntimeHandle() : value(jit.get()) {}
-};
+static void ensure_jit() { (void)jit.get(); }
 }
-
-TORCH_LIBRARY(deep_gemm, m) {
-    // Register JIT objects
-    m.class_<deep_gemm::JitRuntimeHandle>("Runtime");
-    m.def("get_jit() -> __torch__.torch.classes.deep_gemm.Runtime", []() { return c10::make_intrusive<deep_gemm::JitRuntimeHandle>(); });
+STABLE_TORCH_LIBRARY(deep_gemm, m) {
+    m.def("_ensure_jit() -> ()");
+}
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {
+    m.impl("_ensure_jit", TORCH_BOX(&deep_gemm::ensure_jit));
 }
 
 REGISTER_EXTENSION(_C_extension)

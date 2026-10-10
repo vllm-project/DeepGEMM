@@ -8,7 +8,7 @@
 #define _STRINGIFY(A) #A
 #define STRINGIFY(A) _STRINGIFY(A)
 
-// Empty PyInit so the .so is importable; ops still register via TORCH_LIBRARY.
+// Empty PyInit keeps the .so importable; ops register through Torch library macros.
 #define REGISTER_EXTENSION(NAME)                                               \
   PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                     \
     static struct PyModuleDef module = {PyModuleDef_HEAD_INIT,                 \

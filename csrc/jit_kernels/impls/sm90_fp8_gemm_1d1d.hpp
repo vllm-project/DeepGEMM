@@ -1,7 +1,9 @@
 #pragma once
 
 #include <format>
-#include <torch/all.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
@@ -74,14 +76,14 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
-                               const torch::Tensor& b, const torch::Tensor& sfb,
-                               const std::optional<torch::Tensor>& c,
-                               const torch::Tensor& d,
+static void sm90_fp8_gemm_1d1d(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                               const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                               const std::optional<torch::stable::Tensor>& c,
+                               const torch::stable::Tensor& d,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::headeronly::ScalarType::Float);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto desc = GemmDesc {
@@ -142,16 +144,16 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
     });
 }
 
-static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                         const torch::Tensor& b, const torch::Tensor& sfb,
-                                         const std::optional<torch::Tensor>& c,
-                                         const torch::Tensor& d,
+static void sm90_k_grouped_fp8_gemm_1d1d(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
+                                         const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
+                                         const std::optional<torch::stable::Tensor>& c,
+                                         const torch::stable::Tensor& d,
                                          const int& m, const int& n,
-                                         const std::vector<int>& ks_cpu, const torch::Tensor& grouped_layout,
-                                         const torch::Tensor& tensor_map_buffer,
+                                         const std::vector<int>& ks_cpu, const torch::stable::Tensor& grouped_layout,
+                                         const torch::stable::Tensor& tensor_map_buffer,
                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::headeronly::ScalarType::Float);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     // TODO: refactor with the mk alignment function
@@ -213,10 +215,10 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .gmem_a_ptr = a.data_ptr(),
-        .gmem_b_ptr = b.data_ptr(),
-        .grouped_layout = grouped_layout.data_ptr(),
-        .tensor_map_buffer = tensor_map_buffer.data_ptr(),
+        .gmem_a_ptr = a.mutable_data_ptr(),
+        .gmem_b_ptr = b.mutable_data_ptr(),
+        .grouped_layout = grouped_layout.mutable_data_ptr(),
+        .tensor_map_buffer = tensor_map_buffer.mutable_data_ptr(),
         .tensor_map_a_base = tensor_map_a_base,
         .tensor_map_b_base = tensor_map_b_base,
         .tensor_map_sfa = tensor_map_sfa,

@@ -29,10 +29,10 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 ### Requirements
 
 - NVIDIA SM90 or SM100 architecture GPU
-- Python 3.8 or higher
+- Python 3.10 or higher
 - Compilers and standard libraries with C++20 `<format>` support
 - CUDA Toolkit 12.9 or higher
-- PyTorch 2.3 or higher
+- PyTorch 2.10 or higher
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 
 ### Development

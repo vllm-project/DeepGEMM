@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <format>
-#include <torch/all.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
@@ -12,9 +14,9 @@
 
 namespace deep_gemm {
 
-static void sm100_bmn_bnk_mn_gemm(const torch::Tensor &a,
-                                  const torch::Tensor &b,
-                                  const torch::Tensor &d,
+static void sm100_bmn_bnk_mn_gemm(const torch::stable::Tensor &a,
+                                  const torch::stable::Tensor &b,
+                                  const torch::stable::Tensor &d,
                                   const int &s, const int &m, const int &n, const int &k) {
     constexpr int block_m = 128;
     constexpr int block_n = 128;

@@ -11,6 +11,7 @@
 
 #include "../utils/exception.hpp"
 #include "jit.hpp"
+#include "python_package.hpp"
 
 namespace deep_gemm::mlopart {
 
@@ -69,7 +70,7 @@ static PyObjectRef checked(PyObject* ptr) {
     return PyObjectRef(ptr);
 }
 
-// `deep_gemm.utils.mlopart.<name>(*args)`, stealing the references of `args`
+// `<python package>.utils.mlopart.<name>(*args)`, stealing the references of `args`
 // NOTES: the caller must hold the GIL
 static PyObjectRef call(const char* name, const std::initializer_list<PyObject*>& args) {
     PyObjectRef tuple(PyTuple_New(static_cast<Py_ssize_t>(args.size())));
@@ -85,7 +86,8 @@ static PyObjectRef call(const char* name, const std::initializer_list<PyObject*>
     check_python_error();
     DG_HOST_ASSERT(tuple.get() != nullptr);
 
-    const auto module = checked(PyImport_ImportModule("deep_gemm.utils.mlopart"));
+    const auto module_name = python_package::module_name("utils.mlopart");
+    const auto module = checked(PyImport_ImportModule(module_name.c_str()));
     const auto func = checked(PyObject_GetAttrString(module.get(), name));
     return checked(PyObject_Call(func.get(), tuple.get(), nullptr));
 }

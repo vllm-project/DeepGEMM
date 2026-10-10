@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <format>
-#include <torch/all.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
@@ -12,9 +14,9 @@
 
 namespace deep_gemm {
 
-static void sm120_bmn_bnk_mn_gemm(const torch::Tensor &a,
-                                  const torch::Tensor &b,
-                                  const torch::Tensor &d,
+static void sm120_bmn_bnk_mn_gemm(const torch::stable::Tensor &a,
+                                  const torch::stable::Tensor &b,
+                                  const torch::stable::Tensor &d,
                                   const int &s, const int &m, const int &n, const int &k) {
     constexpr int block_m = 128;
     constexpr int block_n = 128;
@@ -90,7 +92,7 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(num_mn_blocks * ceil_div(num_sk_blocks, split_factor), 1, 1),
             .block_dim = dim3(num_tma_threads + num_math_threads, 1, 1),
         },
-        s, tensor_map_a, tensor_map_b, d.data_ptr<float>()
+        s, tensor_map_a, tensor_map_b, d.mutable_data_ptr<float>()
     );
 }
 

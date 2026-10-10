@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include <torch/all.h>
+#include <torch/csrc/stable/ops.h>
 
 #include <deep_gemm/common/types.cuh>
 
@@ -26,8 +26,9 @@ public:
 
     virtual deep_jit::cuda::CompilerOptions compiler_options() const { return {}; }
 
-    virtual void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const {
-        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    virtual void check(const std::optional<torch::stable::Tensor>& c, const torch::stable::Tensor& d) const {
+        DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16 or
+                       d.scalar_type() == torch::headeronly::ScalarType::Float);
     }
 
     // The BLAS linear-combination coefficient, when this epilogue is a plain store cuBLASLt
@@ -35,7 +36,7 @@ public:
     virtual std::optional<float> get_alpha() const { return std::nullopt; }
 
     // The SFD this epilogue quantizes into, if any (an empty problem zeroes it)
-    virtual std::optional<torch::Tensor> output_sfd() const { return std::nullopt; }
+    virtual std::optional<torch::stable::Tensor> output_sfd() const { return std::nullopt; }
 };
 
 class IdentityEpilogue final: public EpilogueClass {
@@ -65,27 +66,27 @@ public:
 };
 
 class FP8QuantizationEpilogue final: public EpilogueClass {
-    torch::Tensor sfd;
+    torch::stable::Tensor sfd;
 
 public:
-    explicit FP8QuantizationEpilogue(const torch::Tensor& sfd): sfd(sfd) {}
+    explicit FP8QuantizationEpilogue(const torch::stable::Tensor& sfd): sfd(sfd) {}
 
     std::string get_epilogue_operator_type() const override {
         return "epilogue::operators::QuantizeToFP8";
     }
 
     EpilogueOperatorArgs make_epilogue_operator_args(const int& m, const int& n) const override {
-        return {.sfd = static_cast<uint32_t*>(sfd.data_ptr()),
+        return {.sfd = static_cast<uint32_t*>(sfd.mutable_data_ptr()),
                 .sfd_stride = static_cast<uint32_t>(sfd.stride(-1)),
                 .shape_m = static_cast<uint32_t>(m), .shape_n = static_cast<uint32_t>(n)};
     }
 
-    void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
-        DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kFloat8_e4m3fn and
+    void check(const std::optional<torch::stable::Tensor>& c, const torch::stable::Tensor& d) const override {
+        DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn and
                        "FP8 quantization requires a direct E4M3 output");
     }
 
-    std::optional<torch::Tensor> output_sfd() const override { return sfd; }
+    std::optional<torch::stable::Tensor> output_sfd() const override { return sfd; }
 };
 
 class BF16StochasticRoundingEpilogue final: public EpilogueClass {
@@ -99,8 +100,8 @@ public:
         return {.arch = jit->device.get_arch(false)};
     }
 
-    void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
-        DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16 and
+    void check(const std::optional<torch::stable::Tensor>& c, const torch::stable::Tensor& d) const override {
+        DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::headeronly::ScalarType::BFloat16 and
                        "Stochastic rounding requires a direct BF16 output");
     }
 };
@@ -109,10 +110,10 @@ public:
 // validated against the GEMM output: the user class, the standalone `alpha` (an API argument
 // for cuBLASLt signature parity), or the FP8 `(d, sfd)` output pair; all exclusive
 static std::shared_ptr<EpilogueClass> resolve_epilogue_class(const std::shared_ptr<EpilogueClass>& epilogue_class,
-                                                             const std::optional<torch::Tensor>& c,
-                                                             const torch::Tensor& d,
+                                                             const std::optional<torch::stable::Tensor>& c,
+                                                             const torch::stable::Tensor& d,
                                                              const std::optional<float>& alpha = std::nullopt,
-                                                             const std::optional<torch::Tensor>& sfd = std::nullopt) {
+                                                             const std::optional<torch::stable::Tensor>& sfd = std::nullopt) {
     DG_HOST_ASSERT((epilogue_class != nullptr) + alpha.has_value() + sfd.has_value() <= 1 and
                    "The epilogue class, `alpha` and the FP8 output pair are exclusive");
     std::shared_ptr<EpilogueClass> resolved = epilogue_class;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <format>
-#include <torch/all.h>
+#include <torch/csrc/stable/ops.h>
 
 #include "../../runtime/runtime.hpp"
 #include "../heuristics/sm100.hpp"
@@ -15,7 +15,7 @@ static constexpr int kNumLocalityDomainProbeLineBytes = 128;
 static constexpr int kNumLocalityDomainProbeHops = kNumLocalityDomainProbeChunkBytes / kNumLocalityDomainProbeLineBytes;
 
 // `latency[sm_idx][chunk_idx]`: cycles per hop through chunk `chunk_idx` of SM `sm_idx`'s chunks of `buf`, chased by that SM
-static void sm100_locality_domain_probe_chase(const torch::Tensor& buf, const torch::Tensor& latency) {
+static void sm100_locality_domain_probe_chase(const torch::stable::Tensor& buf, const torch::stable::Tensor& latency) {
     // Compile
     const auto kernel = jit->compile("sm100_locality_domain_probe_chase", std::format(R"(
 #include <deep_gemm/impls/sm100_locality_domain.cuh>
@@ -34,7 +34,7 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(jit->device.get_num_sms(), 1, 1),
             .block_dim = dim3(32, 1, 1),
         },
-        buf.data_ptr(), latency.data_ptr()
+        buf.mutable_data_ptr(), latency.mutable_data_ptr()
     );
 }
 

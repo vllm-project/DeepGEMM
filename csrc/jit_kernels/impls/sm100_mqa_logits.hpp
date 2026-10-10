@@ -24,8 +24,8 @@ static int get_mqa_logits_block_q(const int& num_heads) {
 }
 
 // Paged metadata: per-SM starts as (q_token_idx, kv_split_idx)
-static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
-                                            const torch::Tensor& schedule_meta,
+static void sm100_paged_mqa_logits_metadata(const torch::stable::Tensor& context_lens,
+                                            const torch::stable::Tensor& schedule_meta,
                                             const int& num_q_tokens_total, const int& num_sms,
                                             const int* indices_ptr) {
     // Tuned for H32, other head counts may have slightly less balanced schedules
@@ -56,7 +56,7 @@ static void __instantiate_kernel() {{
             .block_dim = dim3(num_threads, 1, 1),
         },
         num_q_tokens_total,
-        context_lens.data_ptr<int>(), const_cast<int*>(indices_ptr), schedule_meta.data_ptr<int>()
+        context_lens.mutable_data_ptr<int>(), const_cast<int*>(indices_ptr), schedule_meta.mutable_data_ptr<int>()
     );
 }
 
@@ -68,9 +68,9 @@ static int get_mqa_logits_metadata_num_words(const int& num_q_tokens, const int&
     return align(3 * num_sms, 2) + 2 * num_q_blocks;
 }
 
-static void sm100_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_start,
-                                      const torch::Tensor& cu_seq_len_k_end,
-                                      const torch::Tensor& schedule_meta,
+static void sm100_mqa_logits_metadata(const torch::stable::Tensor& cu_seq_len_k_start,
+                                      const torch::stable::Tensor& cu_seq_len_k_end,
+                                      const torch::stable::Tensor& schedule_meta,
                                       const int& num_q_tokens,
                                       const int& num_kv_tokens,
                                       const int& block_q,
@@ -109,8 +109,8 @@ static void __instantiate_kernel() {{
             .block_dim = dim3(num_threads, 1, 1),
         },
         num_q_tokens, num_kv_tokens,
-        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
-        schedule_meta.data_ptr<int>()
+        cu_seq_len_k_start.mutable_data_ptr<int>(), cu_seq_len_k_end.mutable_data_ptr<int>(),
+        schedule_meta.mutable_data_ptr<int>()
     );
 }
 
@@ -125,10 +125,10 @@ struct MQALogitsConfig {
     static constexpr int num_specialized_threads = kMQALogitsNumSpecializedThreads;
     static constexpr int num_math_threads = (kMQALogitsSplitKV / 128) * 128;
 
-    MQALogitsConfig(const int& num_heads, const int& head_dim, const at::ScalarType& qk_dtype, const bool& is_paged):
+    MQALogitsConfig(const int& num_heads, const int& head_dim, const torch::headeronly::ScalarType& qk_dtype, const bool& is_paged):
             is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), num_heads(num_heads), head_dim(head_dim),
             block_q(get_mqa_logits_block_q(num_heads)) {
-        DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::headeronly::ScalarType::Float8_e4m3fn);
         if (is_fp4)
             DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
         else
@@ -194,7 +194,7 @@ struct MQALogitsConfig {
     }
 
     // `weights` is `[num_q_tokens, num_heads]` BF16 with an arbitrary row stride
-    CUtensorMap make_tensor_map_weights(const torch::Tensor& weights, const int& num_q_tokens) const {
+    CUtensorMap make_tensor_map_weights(const torch::stable::Tensor& weights, const int& num_q_tokens) const {
         return make_tma_2d_desc(weights, num_heads, num_q_tokens,
                                 num_weight_elements_per_row(), block_q,
                                 static_cast<int>(weights.stride(0)), 0);
@@ -203,15 +203,15 @@ struct MQALogitsConfig {
 
 // Unified contiguous-KV runtime for MXFP4 / MXFP8
 static void sm100_mqa_logits(const MQALogitsConfig& config,
-                             const torch::Tensor& q, const torch::Tensor& sf_q,
-                             const torch::Tensor& kv, const torch::Tensor& sf_kv,
-                             const torch::Tensor& weights,
-                             const torch::Tensor& cu_seq_len_k_start,
-                             const torch::Tensor& cu_seq_len_k_end,
-                             const torch::Tensor& logits,
+                             const torch::stable::Tensor& q, const torch::stable::Tensor& sf_q,
+                             const torch::stable::Tensor& kv, const torch::stable::Tensor& sf_kv,
+                             const torch::stable::Tensor& weights,
+                             const torch::stable::Tensor& cu_seq_len_k_start,
+                             const torch::stable::Tensor& cu_seq_len_k_end,
+                             const torch::stable::Tensor& logits,
                              const int& num_q_tokens, const int& num_kv_tokens,
                              const int& stride_logits,
-                             const std::optional<torch::Tensor>& schedule_meta) {
+                             const std::optional<torch::stable::Tensor>& schedule_meta) {
     DG_HOST_ASSERT(not config.is_paged);
     const int num_sms = runtime->get_num_sms();
 
@@ -219,10 +219,10 @@ static void sm100_mqa_logits(const MQALogitsConfig& config,
         const auto& workspace = schedule_meta.value();
         DG_HOST_ASSERT(workspace.is_cuda());
         DG_HOST_ASSERT(workspace.device() == q.device());
-        DG_HOST_ASSERT(workspace.scalar_type() == torch::kInt32);
+        DG_HOST_ASSERT(workspace.scalar_type() == torch::headeronly::ScalarType::Int);
         DG_HOST_ASSERT(workspace.is_contiguous());
         // Metadata is accessed as 8-byte words
-        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 8 == 0);
+        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(workspace.mutable_data_ptr()) % 8 == 0);
         const int required_words = get_mqa_logits_metadata_num_words(num_q_tokens, config.block_q, num_sms);
         DG_HOST_ASSERT(workspace.numel() >= required_words);
     }
@@ -285,9 +285,9 @@ static void __instantiate_kernel() {{
         },
         num_q_tokens, num_kv_tokens,
         stride_logits,
-        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
-        schedule_meta.has_value() ? schedule_meta.value().data_ptr<int>() : nullptr,
-        logits.data_ptr(),
+        cu_seq_len_k_start.mutable_data_ptr<int>(), cu_seq_len_k_end.mutable_data_ptr<int>(),
+        schedule_meta.has_value() ? schedule_meta.value().mutable_data_ptr<int>() : nullptr,
+        logits.mutable_data_ptr(),
         tensor_map_q, tensor_map_sf_q,
         tensor_map_kv, tensor_map_sf_kv,
         tensor_map_weights
@@ -296,16 +296,16 @@ static void __instantiate_kernel() {{
 
 // Unified paged runtime for MXFP4 / MXFP8
 static void sm100_paged_mqa_logits(const MQALogitsConfig& config,
-                                   const torch::Tensor& q,
-                                   const torch::Tensor& sf_q,
-                                   const torch::Tensor& kv_cache,
-                                   const torch::Tensor& kv_cache_sf,
-                                   const torch::Tensor& weights,
-                                   const torch::Tensor& context_lens,
-                                   const torch::Tensor& logits,
-                                   const torch::Tensor& block_table,
-                                   const torch::Tensor& indices,
-                                   const torch::Tensor& schedule_meta,
+                                   const torch::stable::Tensor& q,
+                                   const torch::stable::Tensor& sf_q,
+                                   const torch::stable::Tensor& kv_cache,
+                                   const torch::stable::Tensor& kv_cache_sf,
+                                   const torch::stable::Tensor& weights,
+                                   const torch::stable::Tensor& context_lens,
+                                   const torch::stable::Tensor& logits,
+                                   const torch::stable::Tensor& block_table,
+                                   const torch::stable::Tensor& indices,
+                                   const torch::stable::Tensor& schedule_meta,
                                    const int& num_q_tokens_total,
                                    const int& num_kv_blocks, const int& page_kv,
                                    const int& logits_stride,
@@ -372,8 +372,8 @@ static void __instantiate_kernel() {{
         },
         num_q_tokens_total,
         logits_stride, block_table_stride,
-        context_lens.data_ptr<int>(), logits.data_ptr(),
-        block_table.data_ptr<int>(), indices.data_ptr<int>(), schedule_meta.data_ptr<int>(),
+        context_lens.mutable_data_ptr<int>(), logits.mutable_data_ptr(),
+        block_table.mutable_data_ptr<int>(), indices.mutable_data_ptr<int>(), schedule_meta.mutable_data_ptr<int>(),
         tensor_map_q, tensor_map_sf_q,
         tensor_map_kv, tensor_map_sf_kv,
         tensor_map_weights

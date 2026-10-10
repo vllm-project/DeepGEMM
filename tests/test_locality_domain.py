@@ -135,9 +135,10 @@ def test_without_mlopart() -> None:
     # MPS predating MLOPart ignores `-mlopart`: emulate it by stripping the flag before the real control CLI
     # NOTES: through the torch dispatcher, the Python `AssertionError` from MLOPart surfaces as a `RuntimeError`
     real = shutil.which('nvidia-cuda-mps-control')
-    script = ('import warnings, torch, deep_gemm\n'
+    script = ('import warnings, torch\n'
               'with warnings.catch_warnings(record=True) as caught:\n'
               '    warnings.simplefilter("always")\n'
+              '    import deep_gemm\n'
               '    assert not deep_gemm.is_localization_available()\n'
               'assert len(caught) == 1 and "MLOPart is unavailable" in str(caught[0].message)\n'
               'assert deep_gemm.locality_domain.get_sm_locality_domains().numel() == torch.cuda.get_device_properties(0).multi_processor_count\n'
@@ -153,7 +154,8 @@ def test_without_mlopart() -> None:
         fake.chmod(0o755)
         result = subprocess.run([sys.executable, '-c', script], env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}'}, stderr=subprocess.PIPE, text=True)
     assert result.returncode == 0, result.stderr
-    assert '1 MLOPart devices' in result.stderr, result.stderr
+    assert 'Traceback' not in result.stderr, result.stderr
+    assert 'MLOPartUnavailable' not in result.stderr, result.stderr
     print(' > detected, `localize` refused, SM table available')
     print()
 

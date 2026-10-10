@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <format>
-#include <torch/all.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../runtime/jit.hpp"
 #include "../../utils/exception.hpp"
@@ -12,10 +14,10 @@
 
 namespace deep_gemm {
 
-static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
-                                      const torch::Tensor& b,
-                                      const torch::Tensor& d,
-                                      const torch::Tensor& sqr_sum,
+static void sm90_tf32_hc_prenorm_gemm(const torch::stable::Tensor& a,
+                                      const torch::stable::Tensor& b,
+                                      const torch::stable::Tensor& d,
+                                      const torch::stable::Tensor& sqr_sum,
                                       const int& m, const int& n, const int& k,
                                       const int& num_splits) {
     constexpr int block_m = 64;
@@ -109,7 +111,7 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(num_splits * ceil_div(m, block_m), 1, 1),
             .block_dim = dim3(num_threads, 1, 1),
         },
-        m, tensor_map_a, tensor_map_b, tensor_map_d, sqr_sum.data_ptr<float>()
+        m, tensor_map_a, tensor_map_b, tensor_map_d, sqr_sum.mutable_data_ptr<float>()
     );
 }
 
