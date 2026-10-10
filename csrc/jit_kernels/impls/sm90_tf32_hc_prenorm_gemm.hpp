@@ -12,6 +12,7 @@
 
 namespace deep_gemm {
 
+template <bool CompileOnly = false>
 static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                       const torch::Tensor& b,
                                       const torch::Tensor& d,
@@ -31,25 +32,6 @@ static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     DG_HOST_ASSERT(k % block_k == 0);
 
     const auto swizzle_cd_mode = get_swizzle_mode(block_n, sizeof(float));
-    const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
-                                              block_m, block_k,
-                                              static_cast<int>(a.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
-                                              get_swizzle_mode(block_k, a.element_size()), 0,
-                                              true);
-    const auto tensor_map_b = make_tma_b_desc(cute::UMMA::Major::K, b, n, k,
-                                              block_n, block_k,
-                                              static_cast<int>(b.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
-                                              get_swizzle_mode(block_k, b.element_size()), 0,
-                                              true);
-    const auto tensor_map_d = num_splits == 1 ? make_tma_cd_desc(d, m, n,
-                                                                 block_m, block_n,
-                                                                 static_cast<int>(d.stride(-2)), 1,
-                                                                 swizzle_cd_mode)
-                                               : make_tma_3d_desc(d, n, m, num_splits,
-                                                                  block_n, block_m, 1,
-                                                                  static_cast<int>(d.stride(-2)),
-                                                                  static_cast<int>(d.stride(-3)),
-                                                                  swizzle_cd_mode);
 
     // Calculate stages
     int num_stages = 12, smem_size = 0;
@@ -101,6 +83,29 @@ static void __instantiate_kernel() {{
         swizzle_cd_mode,
         num_stages,
         num_math_threads, num_tma_threads));
+
+    if constexpr (CompileOnly)
+        return;
+
+    const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
+                                              block_m, block_k,
+                                              static_cast<int>(a.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
+                                              get_swizzle_mode(block_k, a.element_size()), 0,
+                                              true);
+    const auto tensor_map_b = make_tma_b_desc(cute::UMMA::Major::K, b, n, k,
+                                              block_n, block_k,
+                                              static_cast<int>(b.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
+                                              get_swizzle_mode(block_k, b.element_size()), 0,
+                                              true);
+    const auto tensor_map_d = num_splits == 1 ? make_tma_cd_desc(d, m, n,
+                                                                 block_m, block_n,
+                                                                 static_cast<int>(d.stride(-2)), 1,
+                                                                 swizzle_cd_mode)
+                                               : make_tma_3d_desc(d, n, m, num_splits,
+                                                                  block_n, block_m, 1,
+                                                                  static_cast<int>(d.stride(-2)),
+                                                                  static_cast<int>(d.stride(-3)),
+                                                                  swizzle_cd_mode);
 
     // Launch
     jit->launch(
