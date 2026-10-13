@@ -11,6 +11,23 @@ from deep_gemm.utils import align
 from generators import get_arch_major
 
 
+@test_filter(lambda: get_arch_major() in (9, 10, 12))
+def test_compile_hc_prenorm_gemm() -> None:
+    torch.cuda.init()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    with torch.profiler.profile(activities=[
+        torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA
+    ]) as profile:
+        for splits in (1, 3, 26, 64):
+            deep_gemm.compile_tf32_hc_prenorm_gemm(24, 16384, splits)
+    assert torch.cuda.memory_allocated() == before
+    assert torch.cuda.max_memory_allocated() == before
+    assert not any(event.device_type == torch.autograd.DeviceType.CUDA
+                   for event in profile.events())
+
+
 @test_filter(lambda: get_arch_major() >= 9)
 def test_hc_prenorm_gemm() -> None:
     # Needs TF32 precision for PyTorch GEMMs
@@ -55,3 +72,4 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_hc_prenorm_gemm()
+    test_compile_hc_prenorm_gemm()

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <torch/library.h>
 
 #include "../utils/compatibility.hpp"
@@ -9,6 +10,23 @@
 #include "sm120_dispatch.hpp"
 
 namespace deep_gemm::hyperconnection {
+
+static void compile_tf32_hc_prenorm_gemm(int64_t n, int64_t k, int64_t num_splits) {
+    for (const auto value : {n, k, num_splits})
+        DG_HOST_ASSERT(value > 0 and value <= std::numeric_limits<int>::max());
+
+    // Compile-only implementations return before accessing tensors or launching.
+    const auto arch_major = jit->device.get_arch_major();
+    if (arch_major == 9) {
+        sm90_tf32_hc_prenorm_gemm<true>({}, {}, {}, {}, 0, n, k, num_splits);
+    } else if (arch_major == 10) {
+        sm100_tf32_hc_prenorm_gemm<true>({}, {}, {}, {}, 0, n, k, num_splits);
+    } else if (arch_major == 12) {
+        sm120_tf32_hc_prenorm_gemm<true>({}, {}, {}, {}, 0, n, k, num_splits);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+}
 
 static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                  const torch::Tensor& b,
@@ -75,6 +93,8 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a, const torch::Tensor& b,
 } // namespace deep_gemm::torch_registration
 
 TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def("compile_tf32_hc_prenorm_gemm(int n, int k, int num_splits=1) -> ()",
+          TORCH_FN(deep_gemm::hyperconnection::compile_tf32_hc_prenorm_gemm));
     m.def(
         "tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor(d!) d, Tensor(sqr_sum!) sqr_sum, int? num_splits=None) -> ()");
 }

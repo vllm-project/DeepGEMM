@@ -79,6 +79,7 @@ from ._C import (
     # Hyperconnection kernels
     mega_mhc,
     tf32_hc_prenorm_gemm,
+    compile_tf32_hc_prenorm_gemm,
     # Layout kernels
     transform_sf_into_required_layout,
     # MegaMoE
