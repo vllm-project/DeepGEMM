@@ -47,7 +47,9 @@ inline torch::stable::Tensor bitwise_and(const torch::stable::Tensor& self, cons
 
 // `aten::bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor`, via the `.Tensor` overload
 inline torch::stable::Tensor bitwise_and(const torch::stable::Tensor& self, int64_t other) {
-    return bitwise_and(self, detail::scalar_tensor_like(self, static_cast<double>(other)));
+    return torch_compat::bitwise_and(
+        self, detail::scalar_tensor_like(self, static_cast<double>(other))
+    );
 }
 
 // `aten::bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor`
@@ -61,7 +63,9 @@ inline torch::stable::Tensor bitwise_or(const torch::stable::Tensor& self, const
 
 // `aten::bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor`, via the `.Tensor` overload
 inline torch::stable::Tensor bitwise_or(const torch::stable::Tensor& self, int64_t other) {
-    return bitwise_or(self, detail::scalar_tensor_like(self, static_cast<double>(other)));
+    return torch_compat::bitwise_or(
+        self, detail::scalar_tensor_like(self, static_cast<double>(other))
+    );
 }
 
 // `aten::bitwise_left_shift.Tensor(Tensor self, Tensor other) -> Tensor`
@@ -75,7 +79,9 @@ inline torch::stable::Tensor bitwise_left_shift(const torch::stable::Tensor& sel
 
 // `aten::bitwise_left_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor`, via the `.Tensor` overload
 inline torch::stable::Tensor bitwise_left_shift(const torch::stable::Tensor& self, int64_t other) {
-    return bitwise_left_shift(self, detail::scalar_tensor_like(self, static_cast<double>(other)));
+    return torch_compat::bitwise_left_shift(
+        self, detail::scalar_tensor_like(self, static_cast<double>(other))
+    );
 }
 
 // `aten::bitwise_right_shift.Tensor(Tensor self, Tensor other) -> Tensor`
@@ -89,7 +95,9 @@ inline torch::stable::Tensor bitwise_right_shift(const torch::stable::Tensor& se
 
 // `aten::bitwise_right_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor`, via the `.Tensor` overload
 inline torch::stable::Tensor bitwise_right_shift(const torch::stable::Tensor& self, int64_t other) {
-    return bitwise_right_shift(self, detail::scalar_tensor_like(self, static_cast<double>(other)));
+    return torch_compat::bitwise_right_shift(
+        self, detail::scalar_tensor_like(self, static_cast<double>(other))
+    );
 }
 
 // `aten::index_select(Tensor self, int dim, Tensor index) -> Tensor`
@@ -114,7 +122,9 @@ inline torch::stable::Tensor floor_divide(const torch::stable::Tensor& self, con
 
 // `aten::floor_divide.Scalar(Tensor self, Scalar other) -> Tensor`, via the `.Tensor` overload
 inline torch::stable::Tensor floor_divide(const torch::stable::Tensor& self, int64_t other) {
-    return floor_divide(self, detail::scalar_tensor_like(self, static_cast<double>(other)));
+    return torch_compat::floor_divide(
+        self, detail::scalar_tensor_like(self, static_cast<double>(other))
+    );
 }
 
 // `Tensor::nbytes()` has no stable ABI equivalent; reconstruct from `numel()` and `element_size()`.
