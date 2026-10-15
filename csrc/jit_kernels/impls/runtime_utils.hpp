@@ -95,6 +95,8 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const torch::headeronl
         case torch::headeronly::ScalarType::Float:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::headeronly::ScalarType::BFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::headeronly::ScalarType::Float8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        // Raw bytes (e.g. packed-FP4 tensors moved without smem unpacking)
+        case torch::headeronly::ScalarType::Byte:          return CU_TENSOR_MAP_DATA_TYPE_UINT8;
         case kPackedFP4:            return fp4_unpacked_smem ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
                                                              : CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
         default: DG_HOST_UNREACHABLE("Unsupported dtype");

@@ -91,4 +91,35 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 }
 
+
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads,
+          uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
+CUTLASS_DEVICE void nvlink_barrier_all_ctas(const layout::Workspace& workspace,
+                                           const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                           const uint32_t& sm_idx, const uint32_t& thread_idx,
+                                           const sync_scope_t& sync_scope) {
+    auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+    // Every CTA must snapshot the phase before CTA 0 can advance it.
+    const auto status = (*counter_ptr) & 3;
+    const auto signal_phase = status & 1, signal_sign = status >> 1;
+    auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+    grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+
+    if (sm_idx == 0) {
+        if (thread_idx < kNumRanks)
+            ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
+        sync_scope();
+        if (thread_idx == 0)
+            ptx::red_add(counter_ptr, 1);
+    }
+    if (thread_idx == 0) {
+        const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
+        wait_until([&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
+            printf("DeepGEMM distributed wait timeout: rank=%d sm=%u tag=%u\n",
+                   sym_buffer.rank_idx, sm_idx, kTag);
+        });
+    }
+    sync_scope();
+}
+
 } // namespace deep_gemm::comm

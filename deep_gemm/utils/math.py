@@ -125,6 +125,54 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return packed[:, :n // 2].contiguous(), sf
 
 
+def _quantize_to_fp4_e2m1_rne(x: torch.Tensor) -> torch.Tensor:
+    # Round-to-nearest-even on the E2M1 grid, matching `cvt.rn.satfinite.e2m1x2.f32`
+    # {0, 0.5, 1, 1.5, 2, 3, 4, 6}; ties at 0.75, 1.75 and 3.5 round up (to even codes)
+    ax = x.abs()
+    code = torch.zeros_like(x, dtype=torch.uint8)
+    for boundary in (0.25, 1.25, 2.5, 5.0):
+        code += (ax > boundary).to(torch.uint8)
+    for boundary in (0.75, 1.75, 3.5):
+        code += (ax >= boundary).to(torch.uint8)
+    sign = (x < 0) & (code != 0)
+    code = code | (sign.to(torch.uint8) << 3)
+    return code.view(torch.int8)
+
+
+def per_token_cast_to_nvfp4(x: torch.Tensor, gran_k: int = 16,
+                            use_packed_e4m3: bool = False,
+                            global_scale: float = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    # NVFP4: packed E2M1 values with one E4M3 SF per `gran_k` elements. By default the
+    # block SF is `e4m3(amax / 6)` (unit global scale). When `global_scale` (a per-tensor
+    # `input_scale`, modelopt convention) is given, the block SF is normalized into E4M3's
+    # well-represented range as `e4m3(amax / 6 / global_scale)`, matching the kernel's
+    # `a2_scale` recipe; the returned SF is the normalized one, so dequantizing needs an
+    # extra `* global_scale` (or fold it into the GEMM alpha).
+    # With `use_packed_e4m3`, the SF is returned with 4 E4M3 bytes packed per `int32`
+    m, n = x.shape
+    assert n % (gran_k * 4) == 0
+    x_view = x.float().view(m, n // gran_k, gran_k)
+    x_amax = x_view.abs().amax(dim=2)
+    inv_global = 1.0 if global_scale is None else 1.0 / global_scale
+    # 2^-9 is the smallest E4M3 subnormal, keeping the SF away from zero
+    sf_e4m3 = (x_amax * (1.0 / 6.0) * inv_global).clamp_min(2.0 ** -9).to(torch.float8_e4m3fn)
+    sf = sf_e4m3.float()
+    # Element quant divisor = sf * global_scale (== sf when unit-scaled)
+    elem_scale = sf if global_scale is None else sf * global_scale
+    x_scaled = x_view / elem_scale.unsqueeze(2)
+    codes = _quantize_to_fp4_e2m1_rne(x_scaled).view(m, n)
+    codes2 = codes.view(m, n // 2, 2)
+    packed = ((codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)).contiguous()
+    if use_packed_e4m3:
+        return packed, sf_e4m3.view(torch.uint8).contiguous().view(torch.int32)
+    return packed, sf
+
+
+def unpack_e4m3_sf_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
+    assert packed_sf.dtype == torch.int32
+    return packed_sf.contiguous().view(torch.uint8).view(torch.float8_e4m3fn).float()
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2
