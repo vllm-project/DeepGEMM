@@ -36,6 +36,7 @@ template <
     float kActivationAlpha,
     float kActivationBeta,
     bool kFastMath,
+    bool kWithPostExpertNorm,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -56,6 +57,8 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_bf16_mega_moe_impl(void* y,
                          int* cumulative_local_expert_recv_stats,
                          const uint32_t num_tokens,
+                         const float* post_expert_norm_gamma,
+                         const float post_expert_norm_eps,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -82,6 +85,8 @@ sm100_bf16_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+
+    DG_STATIC_ASSERT(not kWithPostExpertNorm or kNumSharedExperts == 0, "Post-expert norm requires routed experts only");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -916,7 +921,7 @@ sm100_bf16_mega_moe_impl(void* y,
 
                         // Load weights from global into register cache per 32 tokens
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                        if (not kWithPostExpertNorm and not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
@@ -1143,6 +1148,35 @@ sm100_bf16_mega_moe_impl(void* y,
                             (bank_group_idx ^ row_in_atom) * (kNumBankGroupBytes / sizeof(d_dtype_t));
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
 
+                        // Fuse the local RMS statistic into GEMM2's epilogue,
+                        // after the model's BF16 output rounding and gamma.
+                        // Each half warp owns 128 columns of one token. The
+                        // existing NVLink barrier makes all N-tile partials
+                        // visible before combine computes the reciprocal RMS.
+                        if constexpr (kWithPostExpertNorm) {
+                            DG_STATIC_ASSERT(BLOCK_N == 128, "Norm partials require 128-column tiles");
+                            const auto* bf = reinterpret_cast<const nv_bfloat162*>(&packed);
+                            float partial = 0.0f;
+                            #pragma unroll
+                            for (uint32_t q = 0; q < 4; ++q) {
+                                const auto v = __bfloat1622float2(bf[q]);
+                                const auto g = *reinterpret_cast<const float2*>(
+                                    post_expert_norm_gamma + n_idx + (lane_idx % 16) * 8 + q * 2);
+                                const float x = v.x * g.x;
+                                const float y = v.y * g.y;
+                                partial += x * x + y * y;
+                            }
+                            const auto active = __activemask();
+                            #pragma unroll
+                            for (uint32_t offset = 8; offset > 0; offset >>= 1)
+                                partial += __shfl_xor_sync(active, partial, offset, 16);
+                            if (lane_idx % 16 == 0) {
+                                auto* dst = buffer.combine_norm_buffer.get_rank_buffer(dst_topk_idx)
+                                    .get_data_buffer(dst_token_idx).template get_base_ptr<float>() + n_idx / 128;
+                                *sym_buffer.map(dst, dst_rank_idx) = partial;
+                            }
+                        }
+
                         // Write into remote
                         const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);
@@ -1203,6 +1237,7 @@ sm100_bf16_mega_moe_impl(void* y,
 
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
+        int stage_slot[2] = {};
 
         // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
@@ -1251,6 +1286,7 @@ sm100_bf16_mega_moe_impl(void* y,
                     // Shared slot goes first, then routed slots in top-k order
                     const uint32_t slot_idx = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
                     mask ^= 1 << slot_idx;
+                    stage_slot[i] = slot_idx;
 
                     // Load
                     if (cute::elect_one_sync()) {
@@ -1278,13 +1314,48 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // Accumulate
                 combine_load_barriers[load_stage_idx]->wait(combine_phase);
-                #pragma unroll
-                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
-                    const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
-                    const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                if constexpr (kWithPostExpertNorm) {
+                    constexpr uint32_t kNumElemsPerUint4Lane = kNumElemsPerUint4 * 2;
+                    const int cur_slot = stage_slot[load_stage_idx];
+                    const auto* partials = buffer.combine_norm_buffer.get_rank_buffer(cur_slot)
+                        .get_data_buffer(token_idx).template get_base_ptr<float>();
+                    float sum_sq = 0.0f;
                     #pragma unroll
-                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                        ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                    for (uint32_t tile = lane_idx; tile < kHidden / 128; tile += 32)
+                        sum_sq += __ldg(partials + tile);
+                    #pragma unroll
+                    for (uint32_t offset = 16; offset > 0; offset >>= 1)
+                        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+
+                    const float weight = __ldg(
+                        buffer.input_topk_weights_buffer.template get_base_ptr<float>() +
+                        token_idx * kNumTopk + cur_slot);
+                    const float scale = rsqrtf(sum_sq / static_cast<float>(kHidden) + post_expert_norm_eps) * weight;
+
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                        const uint32_t base_elem = chunk_byte_offset / sizeof(nv_bfloat16) +
+                                (j * 32 + lane_idx) * kNumElemsPerUint4Lane;
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                            const auto g = *reinterpret_cast<const float2*>(post_expert_norm_gamma + base_elem + l * 2);
+                            const auto v = __bfloat1622float2(bf16_values[l]);
+                            auto& acc = reduced[j * kNumElemsPerUint4 + l];
+                            acc.x += v.x * g.x * scale;
+                            acc.y += v.y * g.y * scale;
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                    }
                 }
                 cutlass::arch::fence_view_async_shared();
                 combine_phase ^= load_stage_idx;
