@@ -31,6 +31,18 @@ CUTLASS_DEVICE void tensor_map_replace_global_inner_dim_stride_in_smem(cute::Tma
 #endif
 }
 
+template <uint32_t kNewElemType>
+CUTLASS_DEVICE void tensor_map_replace_elemtype_in_gmem(cute::TmaDescriptor* gmem_desc) {
+    const auto gmem_int_desc = reinterpret_cast<uint64_t>(gmem_desc);
+    asm volatile("tensormap.replace.tile.elemtype.global.b1024.b32 [%0], %1;" :: "l"(gmem_int_desc), "n"(kNewElemType) : "memory");
+}
+
+template <uint32_t kNewSwizzleMode>
+CUTLASS_DEVICE void tensor_map_replace_swizzle_mode_in_gmem(cute::TmaDescriptor* gmem_desc) {
+    const auto gmem_int_desc = reinterpret_cast<uint64_t>(gmem_desc);
+    asm volatile("tensormap.replace.tile.swizzle_mode.global.b1024.b32 [%0], %1;" :: "l"(gmem_int_desc), "n"(kNewSwizzleMode) : "memory");
+}
+
 /// TMA instructions
 CUTLASS_DEVICE void mbarrier_arrive(
     cutlass::arch::ClusterTransactionBarrier* ptr) {

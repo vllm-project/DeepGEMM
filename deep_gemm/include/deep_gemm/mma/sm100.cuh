@@ -8,7 +8,36 @@
 #include <deep_gemm/common/packing.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 
+// SM107 (Rubin, CC 10.7) adds a K=64 shape for dense `kind::mxf8f6f4.block_scale` MMAs
+// (instruction descriptor bit 31, `k_size_`). Each K=64 UMMA consumes two consecutive 32-element
+// UE8M0 scale factors per row, starting at the (even) SF id, like `kind::mxf4` with `scale_vec::2X`.
+// NOTES: with K=64, E2M1 operands are read from shared memory *packed* (2 elements per byte), so the
+// unpacked FP4 layout (`float_e2m1_unpacksmem_t`, TMA `16U4_ALIGN16B`) cannot use it as is
+// (MegaMoE re-targets its routed weight tensor maps to the packed layout instead).
+// SM100/SM103 do not have this encoding. The JIT compiles every CC 10.x part as `sm_100f`, so the host
+// defines `DG_SM107_MXF8F6F4_K64=1` on SM107 (runtime/jit.hpp).
+#ifndef DG_SM107_MXF8F6F4_K64
+#define DG_SM107_MXF8F6F4_K64 0
+#endif
+
 namespace deep_gemm::mma::sm100 {
+
+constexpr bool kEnableMXF8F6F4K64 = DG_SM107_MXF8F6F4_K64 != 0;
+
+/// UMMA K (in elements) for `kind::mxf8f6f4.block_scale`
+template <uint32_t kGranKA, uint32_t kGranKB, typename a_dtype_t, typename b_dtype_t>
+constexpr uint32_t get_mxf8f6f4_umma_k() {
+    // NOTES: K=64 consumes 2 SFs per UMMA, so it only applies to per-32 SFs on both operands
+    constexpr bool kHasUnpackedFP4 = cute::is_same_v<a_dtype_t, cutlass::detail::float_e2m1_unpacksmem_t> or
+                                     cute::is_same_v<b_dtype_t, cutlass::detail::float_e2m1_unpacksmem_t>;
+    return (kEnableMXF8F6F4K64 and kGranKA == 32 and kGranKB == 32 and not kHasUnpackedFP4) ? 64 : 32;
+}
+
+/// Select the MXF8F6F4 instruction K (bit 31 of the block-scaled instruction descriptor)
+CUTLASS_HOST_DEVICE constexpr void set_mxf8f6f4_instr_desc_k(
+    cute::UMMA::InstrDescriptorBlockScaled& desc, const uint32_t& umma_k) {
+    desc.k_size_ = umma_k == 64 ? 1 : 0;
+}
 
 /// Shared memory descriptor
 CUTLASS_DEVICE

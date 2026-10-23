@@ -31,6 +31,8 @@ inline void init_jit(const std::string& library_root_path) {
         const auto [major, minor] = runtime->device.get_arch_pair();
         if (major == 10 and minor == 7) {
             runtime->default_compiler_options.arch = "100f";
+            // SM107 has the K=64 MXF8F6F4 MMA; the flag is part of the JIT cache key.
+            runtime->default_compiler_options.nvcc_flags->emplace_back("-DDG_SM107_MXF8F6F4_K64=1");
         }
 
         runtime->default_compiler_options.nvcc_flags->

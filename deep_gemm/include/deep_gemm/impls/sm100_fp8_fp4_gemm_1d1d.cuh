@@ -49,9 +49,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
     // NOTES: an FP4xFP4 pair uses the dedicated MXF4 MMA (packed 4-bit operands, K-major only, UMMA_K=64);
-    //        all other combinations use the MXF8F6F4 MMA (unpacked operands, UMMA_K=32)
+    //        all other combinations use the MXF8F6F4 MMA (unpacked operands, UMMA_K=32,
+    //        or 64 on SM107 for FP8xFP8 with per-32 SFs)
     constexpr bool kIsMXF4 = cute::is_same_v<a_dtype_t, cutlass::float_e2m1_t> and
                              cute::is_same_v<b_dtype_t, cutlass::float_e2m1_t>;
+    constexpr uint32_t kMXF8F6F4UMMAK = mma::sm100::get_mxf8f6f4_umma_k<kGranKA, kGranKB, a_dtype_t, b_dtype_t>();
 
     // The host launches the epilogue operator directly as a kernel argument
     DG_STATIC_ASSERT(sizeof(epilogue_operator_t) == sizeof(EpilogueOperatorArgs),
@@ -69,7 +71,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
     constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N;
-    constexpr uint32_t UMMA_K = kIsMXF4 ? 64 : 32;
+    constexpr uint32_t UMMA_K = kIsMXF4 ? 64 : kMXF8F6F4UMMAK;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t kPackFactor = get_smem_pack_factor<a_dtype_t>();
@@ -306,6 +308,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                                                                              UMMA_M, UMMA_N, kMajorB, kMajorA>()
                                   : cute::UMMA::make_instr_desc_block_scaled<a_dtype_t, b_dtype_t, float, cutlass::float_ue8m0_t,
                                                                              UMMA_M, UMMA_N, kMajorA, kMajorB>();
+        if constexpr (not kIsMXF4)
+            mma::sm100::set_mxf8f6f4_instr_desc_k(instr_desc, UMMA_K);
         auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
@@ -419,7 +423,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                         const uint32_t subblock_idx = offset / kNumUTCCPAlignedElems;
                         // SF id (in units of 32 K-elements within the 128-K sub-block):
                         //   gran-32  selects the 32-element SF at this UMMA K offset (MXF4's `scale_vec::2X`
-                        //            consumes two 32-element SFs per UMMA K=64 step, hence a step of 2);
+                        //            and SM107's K=64 MXF8F6F4 consume two 32-element SFs per UMMA K=64 step,
+                        //            hence a step of 2);
                         //   gran-128 uses the per-load stage id (whole 512-K SF span).
                         const uint32_t sf_id_in_subblock = (offset % kNumUTCCPAlignedElems) / 32;
                         const uint32_t tmem_col_sfa = kTmemStartColOfSFA + subblock_idx * SF_BLOCK_M / 32;

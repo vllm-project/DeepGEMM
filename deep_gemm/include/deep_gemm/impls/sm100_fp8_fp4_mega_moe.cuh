@@ -18,6 +18,25 @@
 
 namespace deep_gemm {
 
+// SM107 K=64 MXF8F6F4 MMA reads E2M1 operands packed in SMEM, but the host builds the routed FP4 weight
+// tensor maps for the unpacked layout (`16U4_ALIGN16B`, 128B swizzle). Each CTA keeps a patched copy of the
+// L1/L2 weight tensor maps (`16U4_ALIGN8B`, i.e. packed, with 64B swizzle) in global memory.
+constexpr uint32_t kMaxMegaMoEPackedWeightMapCTAs = 1024;
+__device__ __align__(128) cute::TmaDescriptor
+    g_mega_moe_packed_weight_tensor_maps[kMaxMegaMoEPackedWeightMapCTAs][2];
+
+CUTLASS_DEVICE void make_packed_fp4_tensor_map(cute::TmaDescriptor* dst, const cute::TmaDescriptor* src) {
+    // NOTES: same thread copies, patches and later uses the tensor map
+    #pragma unroll
+    for (uint32_t i = 0; i < sizeof(cute::TmaDescriptor) / sizeof(uint4); ++ i)
+        reinterpret_cast<uint4*>(dst)[i] = reinterpret_cast<const uint4*>(src)[i];
+    // Element type 13: `.b4x16` (`CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B`); swizzle mode 2: 64B
+    ptx::tensor_map_replace_elemtype_in_gmem<13>(dst);
+    ptx::tensor_map_replace_swizzle_mode_in_gmem<2>(dst);
+    ptx::tensor_map_release_gpu();
+    ptx::tensor_map_acquire_gpu(dst);
+}
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -164,7 +183,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
     constexpr uint32_t UMMA_BLOCK_K = 128;
-    constexpr uint32_t UMMA_K = 32;
+    // NOTES: SM107 has a K=64 MXF8F6F4 MMA (two per-32 SFs per UMMA), see `mma::sm100::get_mxf8f6f4_umma_k`;
+    //        as it reads E2M1 packed, FP4 routed weights are then loaded packed (see `make_packed_fp4_tensor_map`)
+    constexpr bool kPackedFP4Weights = mma::sm100::kEnableMXF8F6F4K64 and not kIsWeightFP8;
+    using routed_smem_dtype_t = cute::conditional_t<kPackedFP4Weights, cutlass::float_e2m1_t, weight_dtype_t>;
+    constexpr uint32_t kRoutedSwizzleBMode = kPackedFP4Weights ? 64 : 128;
+    // NOTES: routed and shared tasks share the UMMA K (packed FP4 routed weights require the K=64 MMA)
+    constexpr uint32_t UMMA_K = mma::sm100::get_mxf8f6f4_umma_k<kGranK, kGranK, a_dtype_t, shared_b_dtype_t>();
+    DG_STATIC_ASSERT(not kPackedFP4Weights or UMMA_K == 64, "Packed FP4 weights need the K=64 MMA");
+    constexpr uint32_t kNumSFPerUMMA = UMMA_K / kGranK;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
@@ -761,10 +788,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights with SF
+        const cute::TmaDescriptor* routed_l1_weights_map = &tensor_map_l1_weights;
+        const cute::TmaDescriptor* routed_l2_weights_map = &tensor_map_l2_weights;
+        if constexpr (kPackedFP4Weights) {
+            DG_STATIC_ASSERT(kNumSMs <= kMaxMegaMoEPackedWeightMapCTAs, "Too many CTAs for packed weight tensor maps");
+            // NOTES: after `cudaGridDependencySynchronize`, so a preceding launch is no longer using these maps
+            routed_l1_weights_map = &g_mega_moe_packed_weight_tensor_maps[sm_idx][0];
+            routed_l2_weights_map = &g_mega_moe_packed_weight_tensor_maps[sm_idx][1];
+            if (cute::elect_one_sync()) {
+                make_packed_fp4_tensor_map(const_cast<cute::TmaDescriptor*>(routed_l1_weights_map), &tensor_map_l1_weights);
+                make_packed_fp4_tensor_map(const_cast<cute::TmaDescriptor*>(routed_l2_weights_map), &tensor_map_l2_weights);
+            }
+            __syncwarp();
+        }
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
-            const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
-                                          task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights :
+            const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? routed_l1_weights_map :
+                                          task_info.block_phase == sched::BlockPhase::Linear2 ? routed_l2_weights_map :
                                           task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_weights :
                                         /*task_info.block_phase == sched::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_weights;
             const auto tensor_map_sfb_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights_sf :
@@ -803,8 +843,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
                     } else {
-                        tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t, 4>(
-                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                        tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kRoutedSwizzleBMode, routed_smem_dtype_t, 4>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<routed_smem_dtype_t*>(shared_storage.smem_b[stage_idx]), 2, k_idx, half_n_idx, half_idx, expert_idx);
                         tma::copy<BLOCK_N, 1, 0>(
                             tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                         if (is_leader_cta) {
@@ -837,6 +877,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 UMMA_M, UMMA_N,
                 cute::UMMA::Major::K, cute::UMMA::Major::K
             >();
+            mma::sm100::set_mxf8f6f4_instr_desc_k(routed_instr_desc, UMMA_K);
+            mma::sm100::set_mxf8f6f4_instr_desc_k(shared_instr_desc, UMMA_K);
             auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
             DG_STATIC_ASSERT(sizeof(weight_dtype_t) == sizeof(shared_b_dtype_t), "Weight SMEM descriptors must use identical addressing");
@@ -845,6 +887,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, UMMA_BLOCK_K, kSwizzleBMode>(shared_storage.smem_b[0], 0, 0);
             const uint32_t a_desc_lo = a_desc.lo;
             const uint32_t b_desc_lo = b_desc.lo;
+            auto routed_b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, UMMA_BLOCK_K, kRoutedSwizzleBMode>(
+                reinterpret_cast<routed_smem_dtype_t*>(shared_storage.smem_b[0]), 0, 0);
+            const uint32_t routed_b_desc_lo = routed_b_desc.lo;
 
             // Checks for MMA instructions
             DG_STATIC_ASSERT((UMMA_M == 64  and UMMA_N %  8 == 0 and  8 <= UMMA_N and UMMA_N <= 256) or
@@ -860,6 +905,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Dynamic update of UMMA N based on effective M
                 auto& instr_desc = task_info.is_shared() ? shared_instr_desc : routed_instr_desc;
+
+                // Packed-FP4 routed weights (SW64) and FP8 weights (SW128) only differ in the B descriptor
+                // NOTES: select it per task rather than branching in the K loop
+                const bool is_packed_b = kPackedFP4Weights and not task_info.is_shared();
+                auto task_b_desc = is_packed_b ? routed_b_desc : b_desc;
+                const uint32_t task_b_desc_lo = is_packed_b ? routed_b_desc_lo : b_desc_lo;
+                const uint32_t task_b_k_shift = is_packed_b ? 1 : 0;
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, task_info.get_umma_aligned_valid_m());
 
                 // Wait tensor memory empty barrier arrival
@@ -890,7 +942,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::tcgen05_after_thread_sync();
 
                     const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
-                    const uint32_t b_desc_base_lo = b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
+                    const uint32_t b_desc_base_lo = task_b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
                     if (cute::elect_one_sync()) {
                         #pragma unroll
                         for (uint32_t umma_k_block_idx = 0; umma_k_block_idx < BLOCK_K / UMMA_BLOCK_K; ++ umma_k_block_idx) {
@@ -913,13 +965,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t k = 0; k < UMMA_BLOCK_K / UMMA_K; ++ k) {
                                 const auto runtime_instr_desc =
-                                    mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k, k);
+                                    mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k * kNumSFPerUMMA, k * kNumSFPerUMMA);
                                 a_desc.lo = mma::sm100::advance_umma_desc_lo<
                                     cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_M * sizeof(a_dtype_t), k * UMMA_K);
-                                b_desc.lo = mma::sm100::advance_umma_desc_lo<
-                                    cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t>(b_desc_base_lo, umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_N * sizeof(weight_dtype_t), k * UMMA_K);
+                                // NOTES: K-major, so the K offset is in bytes (halved for packed FP4)
+                                task_b_desc.lo = b_desc_base_lo + ((((umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_N + k * UMMA_K) *
+                                                                     static_cast<uint32_t>(sizeof(weight_dtype_t))) >> task_b_k_shift) >> 4);
                                 ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
-                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    task_b_desc, a_desc, accum_stage_idx * UMMA_N,
                                     k_block_idx > 0 or umma_k_block_idx > 0 or k > 0, runtime_instr_desc,
                                     kTmemStartColOfSFB, kTmemStartColOfSFA);
                             }
