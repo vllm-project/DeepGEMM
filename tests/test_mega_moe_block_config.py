@@ -37,3 +37,28 @@ def test_reduced_sms_keep_m16():
         assert deep_gemm.get_block_m_for_mega_moe(4, 256, 2048, 64, 8, 'fp4xfp4') == 16
     finally:
         deep_gemm.set_num_sms(original_sms)
+
+
+@pytest.mark.parametrize("mma", ["fp8xfp4", "fp8xfp8"])
+@pytest.mark.parametrize("hidden,intermediate", [(512, 256), (256, 512), (512, 384)])
+def test_mx_buffer_preserves_128_alignment(mma, hidden, intermediate):
+    num_bytes, _ = deep_gemm._C.get_symm_buffer_size_for_mega_moe(
+        1, 8, 48, 2, hidden, intermediate, mma, "swiglu", 0
+    )
+    assert num_bytes > 0
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(512, 256), (256, 512)])
+def test_nvfp4_buffer_accepts_256_alignment(hidden, intermediate):
+    num_bytes, _ = deep_gemm._C.get_symm_buffer_size_for_mega_moe(
+        1, 8, 48, 2, hidden, intermediate, "fp4xfp4", "swiglu", 0
+    )
+    assert num_bytes > 0
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(512, 128), (512, 384)])
+def test_nvfp4_buffer_rejects_non_256_alignment(hidden, intermediate):
+    with pytest.raises(RuntimeError, match="Assertion error"):
+        deep_gemm._C.get_symm_buffer_size_for_mega_moe(
+            1, 8, 48, 2, hidden, intermediate, "fp4xfp4", "swiglu", 0
+        )

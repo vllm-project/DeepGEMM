@@ -171,8 +171,12 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
 
     // Check SF buffer requirements
     if (with_sf) {
-        // NVFP4 needs `hidden % 256 == 0` to keep per-token SF rows TMA-aligned (16 bytes)
-        DG_HOST_ASSERT(hidden % (sf_gran_k * 16) == 0 and intermediate_hidden % (sf_gran_k * 16) == 0);
+        // Preserve the existing MX SF packing requirements.
+        DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+        if (mma_kind == MmaKind::NVFP4) {
+            // NVFP4 requires 16-byte-aligned per-token SF rows.
+            DG_HOST_ASSERT(hidden % 256 == 0 and intermediate_hidden % 256 == 0);
+        }
         DG_HOST_ASSERT(shared_intermediate_hidden % 128 == 0);
         DG_HOST_ASSERT(num_sf_ring_tokens % 4 == 0);
     }
