@@ -92,7 +92,10 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     const MmaKind& mma_kind) {
     // Expected tokens per expert, plus a one-sigma routing margin for the tile choice
     const float num_expected_tokens = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
+    // NOTES: at decode sizes (one block per expert) a half-sigma margin is enough: a few experts spilling into a
+    //        second small block cost less than doubling the rows of every block (measured on SM107, wide-EP decode)
+    const float num_sigma_margin = num_expected_tokens <= 128 ? 0.5f : 1.0f;
+    const float num_covered_tokens = num_expected_tokens + num_sigma_margin * std::sqrt(num_expected_tokens);
 
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
     // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
@@ -110,7 +113,7 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     }
 
     // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
-    const int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 :
+    const int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m == 96 ? 16 : block_m <= 192 ? 32 :
                                  mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
     const int store_block_m_l2 = (block_m == 240 and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
 

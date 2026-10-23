@@ -225,7 +225,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     struct SharedStorage {
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
-        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
+        // NOTES: unused since the dispatch pull is SIMT, kept so that the SMEM layout stays unchanged
+        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][16];
         union {
             alignas(kSharedMemoryAlignment) cutlass::float_e4m3_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N];
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumEpilogueWarpgroups][STORE_BLOCK_M_L2 * BLOCK_N];
@@ -248,12 +249,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
-
-    // Send buffers
-    constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
-    const auto smem_send_buffers = layout::Buffer(
-        pull_layout, kNumDispatchWarps, 1,
-        static_cast<void*>(shared_storage.dispatch_send_buffer));
 
     // Tensor memory size
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
@@ -461,10 +456,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Pull token data and SF from remote ranks into local L1 buffer
-        uint32_t pull_mbarrier_phase = 0;
-        const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
-        const auto pull_mbarrier = &shared_storage.dispatch_barriers[warp_idx];
-
         // Per-rank counts for current expert (re-loaded when expert changes)
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int current_expert_idx = -1;
@@ -563,11 +554,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
-            // Hidden bytes are divided into chunks
-            constexpr uint32_t kNumChunks = kHidden / kNumBytesPerPull;
-            DG_STATIC_ASSERT(kNumChunks * kNumBytesPerPull == kHidden, "kNumBytesPerPull must divide hidden");
-
-            // TMA load token from remote rank and store into local
+            // Load the token from the remote rank and store it locally
             const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
 
@@ -582,27 +569,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
-            const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
-                ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
-                ptx::tma_store_1d(
-                    math::advance_ptr(dst_base_ptr, i * kNumBytesPerPull),
-                    pull_buffer.get_base_ptr(), kNumBytesPerPull
-                );
-                cute::tma_store_arrive();
-                ptx::tma_store_wait<0>();
-            };
-            if (cute::elect_one_sync()) {
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumChunks; ++ i) {
-                    ptx::tma_load_1d(
-                        pull_buffer.get_base_ptr(),
-                        math::advance_ptr(src_base_ptr, i * kNumBytesPerPull),
-                        pull_mbarrier, kNumBytesPerPull
-                    );
-                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kNumBytesPerPull);
-                    i != (kNumChunks - 1) ? issue_and_wait_pull_store(i) : void();
-                }
-            }
+            // SIMT pull: each lane loads its 16-byte slices of the token into registers (issued together with the
+            // weight and SF loads below), then stores them; no SMEM bounce buffer and no TMA store round trip
+            DG_STATIC_ASSERT(kHidden % (16 * 32) == 0, "Invalid hidden for SIMT pull");
+            constexpr uint32_t kNumPullUint4PerLane = kHidden / (16 * 32);
+            uint4 pulled[kNumPullUint4PerLane];
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumPullUint4PerLane; ++ j)
+                pulled[j] = __ldcs(reinterpret_cast<const uint4*>(src_base_ptr) + j * 32 + lane_idx);
             __syncwarp();
 
             // Load the weight first, so that its remote latency overlaps with the SF copy below
@@ -610,7 +584,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
 
-            // Load and store SF (overlaps with last chunk's TMA load from remote)
+            // Load and store SF (overlaps with the token loads above)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
             const auto remote_sf_ptr = sym_buffer.map(
@@ -627,6 +601,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (j < kNumSFUint32)
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
             }
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumPullUint4PerLane; ++ j)
+                reinterpret_cast<uint4*>(dst_base_ptr)[j * 32 + lane_idx] = pulled[j];
+            // The tokens are read by TMA (async proxy) in other CTAs after the release below
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            __threadfence();
             __syncwarp();
 
             // Store weights and metadata
@@ -637,8 +617,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
-                // Complete last chunk's store
-                issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
