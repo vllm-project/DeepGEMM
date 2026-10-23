@@ -20,10 +20,17 @@ static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidde
     if (heuristics_runtime->get_deterministic_algorithms())
         return mhc_layout::kDefaultNumSplits;
 
-    // Fewest splits that still reach the shortest possible longest task
+    // Fewest splits that still reach the shortest possible longest task. When the default split count
+    // would spill into a second partial wave but a single wave still gives each task >= 8 splits'
+    // worth of parallelism (e.g. 16 m-blocks on 212 SMs), fit all tasks into one wave instead.
     const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
+    const uint32_t num_single_wave_splits = num_sms / num_m_blocks;
+    const bool fits_one_wave_below_default = num_single_wave_splits >= 8 and
+                                             num_single_wave_splits < mhc_layout::kDefaultNumSplits;
     const uint32_t max_num_splits = cute::min(
-        mhc_layout::kNumMaxSplits, cute::max(mhc_layout::kDefaultNumSplits, num_sms / num_m_blocks));
+        mhc_layout::kNumMaxSplits,
+        fits_one_wave_below_default ? num_single_wave_splits
+                                    : cute::max(mhc_layout::kDefaultNumSplits, num_single_wave_splits));
     return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
 }
 

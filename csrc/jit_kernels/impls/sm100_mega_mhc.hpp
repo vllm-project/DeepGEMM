@@ -50,7 +50,14 @@ static void sm100_mega_mhc(
             static_cast<int>(tensor.stride(0)), swizzle_mode);
     };
 
-    const auto smem_size = static_cast<int>(sizeof(mhc_layout::SharedStorage));
+    // Many-wave BF16-only grids use the task ring: dynamic task tickets (balancing per-SM speed
+    // differences) and dedicated TMA RMSNorm CTAs instead of norm workers co-running with the Post
+    // workers. Outputs are bit-identical either way.
+    const auto num_m_blocks = mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens));
+    const bool use_task_ring = store_bf16 and not y_fp8.has_value() and
+                               static_cast<uint64_t>(num_m_blocks) * num_splits >= 8ull * num_sms;
+    const auto smem_size = static_cast<int>(use_task_ring ? sizeof(mhc_layout::SharedStorage<true>)
+                                                          : sizeof(mhc_layout::SharedStorage<false>));
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
@@ -115,7 +122,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_mega_mhc_impl<
         {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -123,7 +130,7 @@ static void __instantiate_kernel() {{
         mix_args.new_prev_mix != nullptr,
         store_bf16,
         norm_args.y_fp8 != nullptr,
-        shared_sf_block_m));
+        shared_sf_block_m, use_task_ring));
 
     // Launch
     jit->launch(
