@@ -349,11 +349,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 2;
 
     // Adjust registers
-    // NOTES: more experts per rank will cost more schedulers' registers
+    // NOTES: more experts per rank will cost more schedulers' registers, so fewer experts free some for the
+    //        epilogue. The dispatch warps keep 96 either way: each lane holds a whole pulled token slice
+    //        (`pulled[kNumPullUint4PerLane]`), and fewer registers spill it, serializing the remote NVLink loads
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
-    constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
+    constexpr uint32_t kNumDispatchRegisters = 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 72;
-    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 168;
+    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 184 : 168;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
