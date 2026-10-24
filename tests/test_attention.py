@@ -540,6 +540,40 @@ def test_paged_mqa_logits_zero_context():
     print(' > Passed\n')
 
 
+@test_filter(lambda: get_arch_major() == 9)
+def test_paged_mqa_logits_empty_query_prefetch():
+    # Force multiple queries into one scheduler partition. The prefetched Q must
+    # follow the scheduler across empty requests, including consecutive gaps.
+    original_sms = deep_gemm.get_num_sms()
+    try:
+        for next_n in (1, 2, 4):
+            num_sms = 2 if next_n == 4 else 1
+            deep_gemm.set_num_sms(num_sms)
+            for lengths in ([64, 64], [64, 0, 64], [64, 0, 0, 64], [64, 0], [0, 0]):
+                batch_size, heads, dim, block_kv = len(lengths), 32, 128, 64
+                q = torch.arange(1, batch_size * next_n + 1, device='cuda', dtype=torch.float)
+                q = q.view(batch_size, next_n, 1, 1).expand(-1, -1, heads, dim).contiguous()
+                q = q.to(torch.float8_e4m3fn)
+                kv = torch.ones((2, block_kv, 1, dim), device='cuda', dtype=torch.bfloat16)
+                packed_kv, ref_kv = kv_cache_cast_to_fp8(kv)
+                weights = torch.ones((batch_size * next_n, heads), device='cuda', dtype=torch.float)
+                lens = torch.tensor(lengths, device='cuda', dtype=torch.int)[:, None]
+                lens = lens.expand(-1, next_n).contiguous()
+                tables = torch.zeros((batch_size, 2), device='cuda', dtype=torch.int)
+                metadata = deep_gemm.get_paged_mqa_logits_metadata(lens, block_kv, 1)
+                logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                    (q, None), packed_kv, weights, lens, tables, metadata, 128, clean_logits=False)
+                torch.cuda.synchronize()
+                for row, length in enumerate(lengths):
+                    if length:
+                        expected = q[row].float().sum((-1, -2)) * ref_kv[0, 0, 0, 0].float()
+                        actual = logits[row * next_n:(row + 1) * next_n, :length]
+                        torch.testing.assert_close(actual, expected[:, None].expand_as(actual))
+    finally:
+        deep_gemm.set_num_sms(original_sms)
+    print(' > Empty-query prefetch passed')
+
+
 @test_filter(lambda: get_arch_major() == 10)
 def test_sparse_mqa_logits() -> None:
     head_dim, page_kv = 128, 64
@@ -780,4 +814,5 @@ if __name__ == '__main__':
     test_mqa_logits()
     test_paged_mqa_logits()
     test_paged_mqa_logits_zero_context()
+    test_paged_mqa_logits_empty_query_prefetch()
     test_sparse_mqa_logits()
