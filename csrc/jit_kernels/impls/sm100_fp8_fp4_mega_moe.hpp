@@ -45,11 +45,14 @@ static void sm100_fp8_fp4_mega_moe(
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Heuristics
+    // NOTES: SM107 MMAs read FP4 weights packed in shared memory (the JIT defines `DG_SM107_MXF8F6F4_K64` there)
+    const auto [arch_major, arch_minor] = jit->device.get_arch_pair();
+    const bool packed_fp4_weights = arch_major == 10 and arch_minor == 7 and l1_weights.scalar_type() == kPackedFP4;
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4);
+        MmaKind::MXFP8FP4, /*has_pull_buffers=*/ false, packed_fp4_weights);
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -95,12 +98,15 @@ static void sm100_fp8_fp4_mega_moe(
                                                            num_experts_per_rank, 0, 0, false,
                                                            sf_smem_outer_dim, static_cast<int>(l2_weights_sf.stride(-1)));
 
+    // NOTES: with packed FP4 routed weight stages, the FP8 shared expert loads half-width K blocks (64-byte rows)
+    const int shared_block_k = packed_fp4_weights ? config.block_k / 2 : config.block_k;
+    const int shared_swizzle_mode = packed_fp4_weights ? 64 : 128;
     const auto tensor_map_shared_l1_acts = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l1_acts,
         hidden, num_max_tokens_per_rank,
-        config.block_k, config.load_block_m,
+        shared_block_k, config.load_block_m,
         static_cast<int>(shared_l1_acts.stride(-2)),
-        config.swizzle_acts_mode) : tensor_map_l1_acts;
+        shared_swizzle_mode) : tensor_map_l1_acts;
     const auto tensor_map_shared_l1_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l1_acts_sf,
         static_cast<int>(shared_l1_acts_sf.size(0)), hidden,
@@ -108,7 +114,7 @@ static void sm100_fp8_fp4_mega_moe(
         1, 0, 0, false,
         sf_smem_outer_dim, static_cast<int>(shared_l1_acts_sf.stride(-1))) : tensor_map_l1_acts_sf;
     const auto tensor_map_shared_l1_weights = num_shared_experts > 0 ?
-        make_tma_weights_2d_desc(shared_l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : tensor_map_l1_weights;
+        make_tma_weights_2d_desc(shared_l1_weights, shared_block_k, config.load_block_n, shared_swizzle_mode) : tensor_map_l1_weights;
     const auto tensor_map_shared_l1_weights_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l1_weights_sf,
         shared_intermediate_hidden * 2, hidden,
@@ -124,9 +130,9 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_shared_l2_acts = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
         shared_intermediate_hidden, num_max_tokens_per_rank,
-        config.block_k, config.load_block_m,
+        shared_block_k, config.load_block_m,
         static_cast<int>(shared_l2_acts.stride(-2)),
-        config.swizzle_acts_mode) : tensor_map_l2_acts;
+        shared_swizzle_mode) : tensor_map_l2_acts;
     const auto tensor_map_shared_l2_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l2_acts_sf,
         static_cast<int>(shared_l2_acts_sf.size(0)), shared_intermediate_hidden,
@@ -134,7 +140,7 @@ static void sm100_fp8_fp4_mega_moe(
         1, 0, 0, false,
         sf_smem_outer_dim, static_cast<int>(shared_l2_acts_sf.stride(-1))) : tensor_map_l2_acts_sf;
     const auto tensor_map_shared_l2_weights = num_shared_experts > 0 ?
-        make_tma_weights_2d_desc(shared_l2_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : tensor_map_l2_weights;
+        make_tma_weights_2d_desc(shared_l2_weights, shared_block_k, config.load_block_n, shared_swizzle_mode) : tensor_map_l2_weights;
     const auto tensor_map_shared_l2_weights_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l2_weights_sf,
         hidden, shared_intermediate_hidden,

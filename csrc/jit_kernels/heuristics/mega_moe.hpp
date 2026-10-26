@@ -136,7 +136,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind, const bool& has_pull_buffers, const bool& packed_fp4_weights) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -148,9 +148,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Dispatch region
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
-    const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
-        kSmemAlignment);
+    // NOTES: kernels that pull tokens through registers keep only a 16-byte placeholder per dispatch warp; the extra
+    //        alignment unit covers the padding between `SharedStorage` members, which this estimate does not model
+    const int smem_send_buffers_size = has_pull_buffers ?
+        align(static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
+              kSmemAlignment) :
+        align(num_dispatch_warps * 16, kSmemAlignment) + kSmemAlignment;
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
@@ -180,7 +183,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
     const int smem_a_size_per_stage = load_block_m * block_k * num_mma_elem_bytes;
-    const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bytes;
+    // NOTES: packed FP4 weight stages are half the size; FP8 shared expert tiles then load half-width K blocks
+    const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bytes / (packed_fp4_weights ? 2 : 1);
     DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
     DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
     const int smem_stage_barriers = 2 * 8;
@@ -203,10 +207,12 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const bool& has_pull_buffers = true,
+    const bool& packed_fp4_weights = false) {
 
     // Block config
-    const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
+    const auto [cluster_size, block_m, store_block_m_l1, default_store_block_m_l2, block_k, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
     DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
     const int block_n = 128;
@@ -232,13 +238,26 @@ static MegaMoEConfig get_mega_moe_config(
     }
 
     // Pipeline
-    const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
-        SM100ArchSpec::smem_capacity,
-        num_experts, hidden,
-        block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
-        sf_block_m, sf_block_n, gran_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind);
+    const auto get_pipeline_config = [&](const int& store_block_m_l2) {
+        return get_pipeline_config_for_mega_moe(
+            SM100ArchSpec::smem_capacity,
+            num_experts, hidden,
+            block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
+            sf_block_m, sf_block_n, gran_k,
+            num_dispatch_threads / 32, num_epilogue_threads / 32,
+            mma_kind, has_pull_buffers, packed_fp4_weights);
+    };
+
+    // A deeper TMA pipeline is worth more than a larger L2 BF16 store block: halve the store block while that frees
+    // enough shared memory for another stage (it must still split the warpgroup block into 8-row atoms)
+    int store_block_m_l2 = default_store_block_m_l2;
+    auto [num_stages, smem_size] = get_pipeline_config(store_block_m_l2);
+    while (store_block_m_l2 % 16 == 0) {
+        const auto [halved_num_stages, halved_smem_size] = get_pipeline_config(store_block_m_l2 / 2);
+        if (halved_num_stages <= num_stages)
+            break;
+        store_block_m_l2 /= 2, num_stages = halved_num_stages, smem_size = halved_smem_size;
+    }
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,

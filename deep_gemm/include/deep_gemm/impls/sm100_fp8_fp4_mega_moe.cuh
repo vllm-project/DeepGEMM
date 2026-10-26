@@ -188,6 +188,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kPackedFP4Weights = mma::sm100::kEnableMXF8F6F4K64 and not kIsWeightFP8;
     using routed_smem_dtype_t = cute::conditional_t<kPackedFP4Weights, cutlass::float_e2m1_t, weight_dtype_t>;
     constexpr uint32_t kRoutedSwizzleBMode = kPackedFP4Weights ? 64 : 128;
+    // NOTES: a packed FP4 weight stage holds a 128-wide K block in 64-byte rows, so the FP8 shared expert splits its K
+    //        blocks into halves of the same 64-byte rows, and every weight stage needs only half the bytes. The SF tiles
+    //        still cover 128-wide K, and the shared halves pick their per-32 SFs by ID
+    constexpr bool kSplitSharedK = kPackedFP4Weights;
+    constexpr uint32_t SHARED_BLOCK_K = kSplitSharedK ? BLOCK_K / 2 : BLOCK_K;
+    constexpr uint32_t kSharedSwizzleMode = kSplitSharedK ? 64 : 128;
+    constexpr uint32_t kNumWeightStageElems = BLOCK_N * BLOCK_K / (kPackedFP4Weights ? 2 : 1);
+    DG_STATIC_ASSERT(not kSplitSharedK or BLOCK_K == 128, "Split shared K blocks assume one SF word per stage");
     // NOTES: routed and shared tasks share the UMMA K (packed FP4 routed weights require the K=64 MMA)
     constexpr uint32_t UMMA_K = mma::sm100::get_mxf8f6f4_umma_k<kGranK, kGranK, a_dtype_t, shared_b_dtype_t>();
     DG_STATIC_ASSERT(not kPackedFP4Weights or UMMA_K == 64, "Packed FP4 weights need the K=64 MMA");
@@ -232,7 +240,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumEpilogueWarpgroups][STORE_BLOCK_M_L2 * BLOCK_N];
         } smem_d;
         alignas(kSharedMemoryAlignment) a_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K];
-        alignas(kSharedMemoryAlignment) weight_dtype_t smem_b[kNumStages][LOAD_BLOCK_N * BLOCK_K];
+        alignas(kSharedMemoryAlignment) weight_dtype_t smem_b[kNumStages][kNumWeightStageElems];
         uint32_t smem_sfa[kNumStages][SF_BLOCK_M * (BLOCK_K / 128)];
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
@@ -438,7 +446,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
+                // NOTES: no return value, so the pushes of all experts are in flight together; the release of the
+                //        NVLink barrier below orders them before the peers pull
+                ptx::red_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
             }
@@ -568,47 +578,53 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
-            const auto src_base_ptr = sym_buffer.map(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
-            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
-            // SIMT pull: each lane loads its 16-byte slices of the token into registers (issued together with the
-            // weight and SF loads below), then stores them; no SMEM bounce buffer and no TMA store round trip
+            // SIMT pull: each lane loads its 16-byte slices of the token into registers, then stores them; no SMEM
+            // bounce buffer and no TMA store round trip. All remote loads of the token (data, SF and top-k weight) are
+            // issued before any local store, so they share one remote round trip
             DG_STATIC_ASSERT(kHidden % (16 * 32) == 0, "Invalid hidden for SIMT pull");
             constexpr uint32_t kNumPullUint4PerLane = kHidden / (16 * 32);
+            constexpr uint32_t kNumSFUint32 = kHidden / 128;
+            constexpr uint32_t kNumSFUint32PerLane = math::constexpr_ceil_div(kNumSFUint32, 32u);
+            DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
+            const auto src_base_ptr = sym_buffer.map(
+                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+            const auto remote_sf_ptr = sym_buffer.map(
+                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
+                current_rank_in_expert_idx);
             uint4 pulled[kNumPullUint4PerLane];
             #pragma unroll
             for (uint32_t j = 0; j < kNumPullUint4PerLane; ++ j)
                 pulled[j] = __ldcs(reinterpret_cast<const uint4*>(src_base_ptr) + j * 32 + lane_idx);
-            __syncwarp();
-
-            // Load the weight first, so that its remote latency overlaps with the SF copy below
+            uint32_t pulled_sf[kNumSFUint32PerLane];
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumSFUint32PerLane; ++ i) {
+                const uint32_t j = i * 32 + lane_idx;
+                pulled_sf[i] = j < kNumSFUint32 ? remote_sf_ptr[j] : 0;
+            }
             const auto weight = *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
 
-            // Load and store SF (overlaps with the token loads above)
-            constexpr uint32_t kNumSFUint32 = kHidden / 128;
-            DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
-                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
-                current_rank_in_expert_idx);
+            // Store SF and the token locally
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
             #pragma unroll
-            for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
+            for (uint32_t i = 0; i < kNumSFUint32PerLane; ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
                 if (j < kNumSFUint32)
-                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = pulled_sf[i];
             }
+            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             #pragma unroll
             for (uint32_t j = 0; j < kNumPullUint4PerLane; ++ j)
                 reinterpret_cast<uint4*>(dst_base_ptr)[j * 32 + lane_idx] = pulled[j];
-            // The tokens are read by TMA (async proxy) in other CTAs after the release below
+
+            // The tokens are read by TMA (async proxy) in other CTAs: the warp barrier orders every lane's stores before
+            // the elected lane's release below, which publishes them GPU-wide
             asm volatile("fence.proxy.async.global;" ::: "memory");
-            __threadfence();
             __syncwarp();
 
             // Store weights and metadata
@@ -712,7 +728,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                             task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts_sf :
                                             task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_acts_sf :
                                           /*task_info.block_phase == sched::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_acts_sf;
-            const auto num_k_blocks = math::ceil_div(task_info.shape_k, BLOCK_K);
+            const bool is_split_k = kSplitSharedK and task_info.is_shared();
+            const auto num_k_blocks = math::ceil_div(task_info.shape_k, is_split_k ? SHARED_BLOCK_K : BLOCK_K);
 
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = task_info.pool_block_idx;
@@ -740,9 +757,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Compute token offsets from block index
                 uint32_t m_idx = block_idx * BLOCK_M;
-                uint32_t k_idx = k_block_idx * BLOCK_K;
+                uint32_t k_idx = k_block_idx * (is_split_k ? SHARED_BLOCK_K : BLOCK_K);
                 const uint32_t sfa_m_idx = block_idx * SF_BLOCK_M;
-                uint32_t sfa_k_idx = k_block_idx * (BLOCK_K / 128);
+                uint32_t sfa_k_idx = k_idx / 128;
 
                 // Add 2 CTA offsets for non-leader CTA
                 if (not is_leader_cta)
@@ -750,12 +767,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                        tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                    if (is_split_k) {
+                        tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_M, kSharedSwizzleMode, a_dtype_t>(
+                            tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                    } else {
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                            tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                    }
                     tma::copy<SF_BLOCK_M, 1, 0>(
                         tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     if (is_leader_cta) {
-                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_a[0]) * 2 + sizeof(SharedStorage::smem_sfa[0]) * 2);
+                        const uint32_t num_a_bytes = LOAD_BLOCK_M * (is_split_k ? SHARED_BLOCK_K : BLOCK_K) * sizeof(a_dtype_t);
+                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(num_a_bytes * 2 + sizeof(SharedStorage::smem_sfa[0]) * 2);
                     } else {
                         shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
@@ -796,7 +819,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto shape_n = task_info.shape_n;
             const auto shape_sfb_k = math::ceil_div(shape_k, kGranK * 4u);
             const auto n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
-            const auto num_k_blocks = math::ceil_div(shape_k, BLOCK_K);
+            const bool is_split_k = kSplitSharedK and task_info.is_shared();
+            const auto num_k_blocks = math::ceil_div(shape_k, is_split_k ? SHARED_BLOCK_K : BLOCK_K);
 
             const uint32_t half_n = shape_n / 2, n_idx = n_block_idx * BLOCK_N, half_idx = n_idx >= half_n;
             const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
@@ -806,19 +830,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
 
                 // Compute weight offset
-                uint32_t k_idx = k_block_idx * BLOCK_K;
+                uint32_t k_idx = k_block_idx * (is_split_k ? SHARED_BLOCK_K : BLOCK_K);
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
-                uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / 128) : task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
+                uint32_t sfb_k_idx = task_info.is_shared() ? k_idx / 128 : task_info.local_expert_idx * shape_sfb_k + k_idx / 128;
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
                     if (task_info.is_shared()) {
-                        tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, shared_b_dtype_t, 4>(
+                        tma::copy_nd<SHARED_BLOCK_K, LOAD_BLOCK_N, kSharedSwizzleMode, shared_b_dtype_t, 4>(
                             tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]), 2, k_idx, half_n_idx, half_idx, expert_idx);
                         tma::copy<BLOCK_N, 1, 0>(
                             tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                         if (is_leader_cta) {
-                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) * 2 + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                            constexpr uint32_t kNumSharedWeightBytes = LOAD_BLOCK_N * SHARED_BLOCK_K * sizeof(shared_b_dtype_t) * 2;
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(kNumSharedWeightBytes + sizeof(SharedStorage::smem_sfb[0]) * 2);
                         } else {
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
@@ -828,7 +853,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         tma::copy<BLOCK_N, 1, 0>(
                             tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                         if (is_leader_cta) {
-                            constexpr uint32_t kNumWeightBytes = sizeof(SharedStorage::smem_b[0]) * 2 /
+                            constexpr uint32_t kNumWeightBytes = LOAD_BLOCK_N * BLOCK_K * sizeof(weight_dtype_t) * 2 /
                                 (kIsWeightFP8 ? 1 : 2);
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(kNumWeightBytes + sizeof(SharedStorage::smem_sfb[0]) * 2);
                         } else {
@@ -870,6 +895,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             auto routed_b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, UMMA_BLOCK_K, kRoutedSwizzleBMode>(
                 reinterpret_cast<routed_smem_dtype_t*>(shared_storage.smem_b[0]), 0, 0);
             const uint32_t routed_b_desc_lo = routed_b_desc.lo;
+            auto split_a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, SHARED_BLOCK_K, kSharedSwizzleMode>(shared_storage.smem_a[0], 0, 0);
+            auto split_b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, SHARED_BLOCK_K, kSharedSwizzleMode>(
+                reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[0]), 0, 0);
+            const uint32_t split_a_desc_lo = split_a_desc.lo;
+            const uint32_t split_b_desc_lo = split_b_desc.lo;
 
             // Checks for MMA instructions
             DG_STATIC_ASSERT((UMMA_M == 64  and UMMA_N %  8 == 0 and  8 <= UMMA_N and UMMA_N <= 256) or
@@ -881,7 +911,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t current_iter_idx = 0;
             task_info_t task_info;
             while (scheduler.get_next_task(task_info)) {
-                const auto num_k_blocks = task_info.shape_k / BLOCK_K;
+                const bool is_split_k = kSplitSharedK and task_info.is_shared();
+                const auto num_k_blocks = task_info.shape_k / (is_split_k ? SHARED_BLOCK_K : BLOCK_K);
+                const uint32_t num_ummas_per_stage = (is_split_k ? SHARED_BLOCK_K : UMMA_BLOCK_K) / UMMA_K;
 
                 // Dynamic update of UMMA N based on effective M
                 auto& instr_desc = task_info.is_shared() ? shared_instr_desc : routed_instr_desc;
@@ -889,8 +921,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Packed-FP4 routed weights (SW64) and FP8 weights (SW128) only differ in the B descriptor
                 // NOTES: select it per task rather than branching in the K loop
                 const bool is_packed_b = kPackedFP4Weights and not task_info.is_shared();
-                auto task_b_desc = is_packed_b ? routed_b_desc : b_desc;
-                const uint32_t task_b_desc_lo = is_packed_b ? routed_b_desc_lo : b_desc_lo;
+                auto task_a_desc = is_split_k ? split_a_desc : a_desc;
+                const uint32_t task_a_desc_lo = is_split_k ? split_a_desc_lo : a_desc_lo;
+                auto task_b_desc = is_packed_b ? routed_b_desc : is_split_k ? split_b_desc : b_desc;
+                const uint32_t task_b_desc_lo = is_packed_b ? routed_b_desc_lo : is_split_k ? split_b_desc_lo : b_desc_lo;
                 const uint32_t task_b_k_shift = is_packed_b ? 1 : 0;
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, task_info.get_umma_aligned_valid_m());
 
@@ -921,7 +955,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     shared_storage.full_barriers[stage_idx].wait(phase);
                     ptx::tcgen05_after_thread_sync();
 
-                    const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
+                    const uint32_t a_desc_base_lo = task_a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
+                    // A split shared K block uses the per-32 SFs of its half of the 128-wide SF word
+                    const uint32_t sf_id_offset = is_split_k ? (k_block_idx % (BLOCK_K / SHARED_BLOCK_K)) * (SHARED_BLOCK_K / kGranK) : 0;
                     const uint32_t b_desc_base_lo = task_b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
                     if (cute::elect_one_sync()) {
                         #pragma unroll
@@ -944,15 +980,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             // Issue UMMA
                             #pragma unroll
                             for (uint32_t k = 0; k < UMMA_BLOCK_K / UMMA_K; ++ k) {
-                                const auto runtime_instr_desc =
-                                    mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k * kNumSFPerUMMA, k * kNumSFPerUMMA);
-                                a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                if (k >= num_ummas_per_stage)
+                                    break;
+                                const auto sf_id = sf_id_offset + k * kNumSFPerUMMA;
+                                const auto runtime_instr_desc = mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, sf_id, sf_id);
+                                task_a_desc.lo = mma::sm100::advance_umma_desc_lo<
                                     cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_M * sizeof(a_dtype_t), k * UMMA_K);
                                 // NOTES: K-major, so the K offset is in bytes (halved for packed FP4)
                                 task_b_desc.lo = b_desc_base_lo + ((((umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_N + k * UMMA_K) *
                                                                      static_cast<uint32_t>(sizeof(weight_dtype_t))) >> task_b_k_shift) >> 4);
                                 ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
-                                    task_b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    task_b_desc, task_a_desc, accum_stage_idx * UMMA_N,
                                     k_block_idx > 0 or umma_k_block_idx > 0 or k > 0, runtime_instr_desc,
                                     kTmemStartColOfSFB, kTmemStartColOfSFA);
                             }
