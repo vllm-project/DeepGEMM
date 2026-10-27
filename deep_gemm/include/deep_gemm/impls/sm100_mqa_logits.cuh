@@ -497,8 +497,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     }
                 };
 
-                // Contiguous KV: unroll 4 splits so one split's FMA chains overlap the next split's TMEM wait and loads
-                constexpr uint32_t kSplitUnroll = kIsPaged ? 1 : 4;
+                // Contiguous KV and wide (two-warpgroup) paged tiles release TMEM before the FMA chains and unroll splits
+                // so one split's FMA chains overlap the next split's TMEM wait and loads
+                constexpr bool kEarlyRelease = not kIsPaged or UMMA_N > 128;
+                constexpr uint32_t kSplitUnroll = kIsPaged ? (kEarlyRelease ? 2 : 1) : 4;
                 #pragma unroll (kSplitUnroll)
                 for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
                     const auto kv_offset = task.kv_token_base + kv_split_idx * SPLIT_KV + math_thread_idx;
@@ -506,7 +508,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
                     ptx::tcgen05_after_thread_sync();
 
-                    if constexpr (not kIsPaged) {
+                    if constexpr (kEarlyRelease) {
                         // ReLU-pack every token's heads first, so TMEM is released right after the last load
                         nv_bfloat162 relu_packed[kNumValidTokens][kNumHeads / 2];
                         #pragma unroll

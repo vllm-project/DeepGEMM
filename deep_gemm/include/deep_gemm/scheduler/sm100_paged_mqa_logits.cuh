@@ -154,7 +154,7 @@ void sm100_paged_mqa_logits_metadata(const uint32_t num_q_tokens_total,
             get_request_info(request_idx, q_token_idx, num_q_tokens, context_len);
             kv_split_idx = (target - cost_before) / (use_token_cost ? num_q_tokens : get_split_cost(num_q_tokens));
         }
-        reinterpret_cast<uint2*>(schedule_meta)[sm_idx] = make_uint2(q_token_idx, kv_split_idx);
+        reinterpret_cast<uint2*>(schedule_meta)[sm_idx] = make_uint2(q_token_idx, kv_split_idx * SPLIT_KV);
     }
 }
 
@@ -166,7 +166,7 @@ struct SM100PagedMQALogitsScheduler {
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
     // Cache one page coordinate per lane
     static constexpr uint32_t kNumCachedPages = 32;
-    DG_STATIC_ASSERT(BLOCK_Q * kNumHeads <= 128, "Invalid Q block shape");
+    DG_STATIC_ASSERT(BLOCK_Q * kNumHeads <= 256, "Invalid Q block shape");
     DG_STATIC_ASSERT(SPLIT_KV % PAGE_KV == 0 and kNumPagesPerSplit <= kNumCachedPages, "Invalid split shape");
 
     using Info = RequestInfo<BLOCK_Q, SPLIT_KV, PAGE_KV>;
@@ -201,11 +201,13 @@ struct SM100PagedMQALogitsScheduler {
             block_table(block_table), block_table_stride(block_table_stride) {
         const auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
         const auto end = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx + 1];
+        // The metadata stores KV token offsets: both ends of every SM range round down to this kernel's splits the
+        // same way, so neighboring ranges still tile each request exactly
         end_q_token_idx = end.x;
-        end_kv_split_idx = end.y;
+        end_kv_split_idx = end.y / SPLIT_KV;
 
         current.q_token_start = start.x;
-        current_kv_split_base = start.y;
+        current_kv_split_base = start.y / SPLIT_KV;
         current_q_block_in_request = 0;
         if (has_work())
             current = Info::from_q_token(start.x, num_q_tokens_total, context_lens, indices);

@@ -13,7 +13,6 @@ namespace deep_gemm {
 static constexpr int kMQALogitsSplitCost = 2;
 static constexpr int kMQALogitsSegmentCost = 3;
 static constexpr int kMQALogitsSplitKV = 384;
-static constexpr int kMQALogitsNumTmemStages = 3;
 static constexpr int kMQALogitsSplitsPerChunk = 8;
 static constexpr int kMQALogitsNumSpecializedThreads = 128;
 
@@ -23,12 +22,20 @@ static int get_mqa_logits_block_q(const int& num_heads) {
     return 128 / num_heads;
 }
 
-// Paged metadata: per-SM starts as (q_token_idx, kv_split_idx)
+// Paged MXFP4 H32 uses 6-token Q tiles (UMMA_N = 192) on two math warpgroups with 256-token KV splits, so a DSpark
+// verify request of up to 6 tokens is one Q block and each KV split feeds one MMA per warpgroup
+static int get_paged_mqa_logits_block_q(const int& num_heads, const bool& is_fp4) {
+    return (is_fp4 and num_heads == 32) ? 6 : get_mqa_logits_block_q(num_heads);
+}
+
+// Paged metadata: per-SM starts as (q_token_idx, kv_token_offset), so kernels with any KV split size can read it
 static void sm100_paged_mqa_logits_metadata(const torch::stable::Tensor& context_lens,
                                             const torch::stable::Tensor& schedule_meta,
                                             const int& num_q_tokens_total, const int& num_sms,
                                             const int* indices_ptr) {
     // Tuned for H32, other head counts may have slightly less balanced schedules
+    // NOTES: costs assume 4-token Q blocks, so batches mixing 1-4 and 5-6 token requests balance slightly worse on the
+    // 6-token MXFP4 H32 tiles
     constexpr int block_q = 4;
     const uint32_t num_threads = num_q_tokens_total <= 512 ? 256 : (num_q_tokens_total <= 2048 ? 512 : 1024);
     // Request starts, work prefix, warp sums, and block total
@@ -115,25 +122,28 @@ static void __instantiate_kernel() {{
 }
 
 // Kernel geometry shared by the contiguous and paged runtimes: every math warpgroup consumes one UMMA_M = 128 KV
-// tile, the Q tile always covers 128 (token, head) rows, and the FP4 pipelines are deeper (half-size stages)
+// tile and owns one TMEM accumulator, the Q tile covers 128 (token, head) rows (paged MXFP4 H32: 192 on two
+// warpgroups), and the FP4 pipelines are deeper (half-size stages)
 struct MQALogitsConfig {
     bool is_fp4, is_paged;
     int num_heads, head_dim, block_q, umma_n;
     int num_q_stages, num_kv_stages;
-    static constexpr int split_kv = kMQALogitsSplitKV;
-    static constexpr int num_tmem_stages = kMQALogitsNumTmemStages;
+    int split_kv, num_tmem_stages, num_math_threads;
     static constexpr int num_specialized_threads = kMQALogitsNumSpecializedThreads;
-    static constexpr int num_math_threads = (kMQALogitsSplitKV / 128) * 128;
 
     MQALogitsConfig(const int& num_heads, const int& head_dim, const torch::headeronly::ScalarType& qk_dtype, const bool& is_paged):
             is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), num_heads(num_heads), head_dim(head_dim),
-            block_q(get_mqa_logits_block_q(num_heads)) {
+            block_q(is_paged ? get_paged_mqa_logits_block_q(num_heads, is_fp4) : get_mqa_logits_block_q(num_heads)) {
         DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::headeronly::ScalarType::Float8_e4m3fn);
         if (is_fp4)
             DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
         else
             DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
         umma_n = align(block_q * num_heads, 8);
+        // Q tiles past 128 rows run on two math warpgroups (TMEM holds 2 x 256 accumulator columns at most)
+        split_kv = umma_n > 128 ? 256 : kMQALogitsSplitKV;
+        num_tmem_stages = split_kv / 128;
+        num_math_threads = split_kv;
         num_q_stages = is_fp4 ? 2 : 3;
         num_kv_stages = is_fp4 ? 8 : 3;
     }
