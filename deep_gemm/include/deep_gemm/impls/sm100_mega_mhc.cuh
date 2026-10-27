@@ -34,9 +34,8 @@ constexpr uint32_t kNumTokenRowsPerLane = 2;
 
 // Persistent mHC with static grid-stride roles and TMA-native layouts.
 // Norm receives one arrival only after Shifted X1 stores and statistics are committed.
-// kUseTaskRing (host-selected for many-wave BF16-only grids): tasks are claimed from a global
-// ticket counter instead of a static grid stride, and the first kNumNormCTAs CTAs run the
-// Shifted RMSNorm alone (TMA bulk copies) instead of co-running norm workers with Post.
+// kUseTaskRing (host-selected for large BF16-only grids): tasks are claimed from a global ticket
+// counter instead of a static grid stride, which balances per-SM speed differences.
 template <uint32_t kHidden, uint32_t kNumSplits, uint32_t kNumSMs,
           bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kUseTaskRing>
 CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
@@ -89,8 +88,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
     // Register reconfigurations
     constexpr uint32_t kNumControlRegisters = 32;
-    constexpr uint32_t kNumPostRegisters = kIsShifted ? 136 : 112;
-    constexpr uint32_t kNumLightweightRegisters = 40;
+    constexpr uint32_t kNumPostRegisters = kIsShifted ? 128 : 112;
+    constexpr uint32_t kNumLightweightRegisters = 48;
     constexpr uint32_t kNumShiftedNormRegisters = 96;
     constexpr uint32_t kNumNormalRegisters = 80;
 
@@ -133,6 +132,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     // Descriptor cache hints and barriers are initialized once per persistent CTA.
     if (warp_idx == 0 and cute::elect_one_sync()) {
         smem.next_norm_task_ticket = 0;
+        smem.next_mix_ticket = 0;
 
         // Normal aliases the shifted-only descriptors to valid maps, so prefetch unconditionally.
         for (const auto& tensor_map: {&tensor_map_residual, &tensor_map_x, &tensor_map_fn,
@@ -154,9 +154,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         if constexpr (kUseTaskRing) {
             init_barriers(smem.full_task_barriers, 1);
             init_barriers(smem.empty_task_barriers, kNumTaskConsumerWarps);
-            init_barriers(smem.full_norm_barriers, 1);
-            init_barriers(smem.done_norm_barriers, kNumNormConsumerWarps);
-            init_barriers(smem.free_norm_barriers, 1);
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2 and cute::elect_one_sync()) {
@@ -199,8 +196,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     constexpr auto kTaskLaneConsumer = cute::Int<1>{};
     constexpr auto kTaskWarpConsumer = cute::Int<2>{};
     // Ring tickets come from an unused split-barrier line (requires num_m_blocks < kNumMaxMBlocks);
-    // the last of the grid's num_tasks + num_post_ctas claims resets it for the next launch.
-    constexpr uint32_t kNumRingNormCTAs = kStoreBF16 ? kNumNormCTAs : 0;
+    // the last of the grid's num_tasks + num_ctas claims resets it for the next launch.
     const auto task_counter = reinterpret_cast<uint32_t*>(
         math::advance_ptr<uint64_t>(gmem_split_barriers, (2ull * kNumMaxMBlocks - 1) * kSplitBarrierLineBytes));
     RingPipeline<kNumTaskSlots> task_pipeline;
@@ -210,13 +206,10 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         CUTE_TIE_DECL(task_pipeline.advance(), slot, phase);
         if constexpr (kRole == 0) {
             ring_smem.empty_task_barriers[slot].wait(phase ^ 1u);
-            uint32_t task = kInvalidTask;
-            if (blockIdx.x >= kNumRingNormCTAs) {
-                const uint32_t ticket = atomicAdd(task_counter, 1u);
-                if (ticket == num_tasks + (gridDim.x - kNumRingNormCTAs) - 1)
-                    atomicExch(task_counter, 0u);
-                task = ticket < num_tasks ? ticket : kInvalidTask;
-            }
+            const uint32_t ticket = atomicAdd(task_counter, 1u);
+            if (ticket == num_tasks + gridDim.x - 1)
+                atomicExch(task_counter, 0u);
+            const uint32_t task = ticket < num_tasks ? ticket : kInvalidTask;
             ring_smem.task_ring[slot] = task;
             ring_smem.full_task_barriers[slot].arrive();
             return task;
@@ -247,6 +240,23 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
             return task_idx + kNumSMs;
     };
 
+    // Shifted Mix runs one token per warp in CTA-local order (CTA base + residue + grid-wide wave).
+    // WG4 starts at once and WG3 joins after its last task, so decode-sized grids need no second Mix round.
+    const auto run_mix_worker = [&]() {
+        while (true) {
+            uint32_t mix_ticket;
+            if (cute::elect_one_sync())
+                mix_ticket = atomicAdd(&smem.next_mix_ticket, 1u);
+            mix_ticket = ptx::exchange(mix_ticket, 0);
+            const uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + mix_ticket % kNumWarpsPerWG +
+                                       mix_ticket / kNumWarpsPerWG * (kNumSMs * kNumWarpsPerWG);
+            if (token_idx >= norm_args.num_tokens)
+                break;
+            epilogue::mega_mhc::run_mix_task<kHidden, true>(
+                workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
+        }
+    };
+
     // Static roles follow the execution graph: WG0 TMA/MMA, WG1-2 Post, WG3 workspace epilogue, WG4 Mix, and WG5 Norm.
     if (warp_idx < kFirstPostWGIdx * kNumWarpsPerWG) {
         // WG0: producer pipelines
@@ -258,17 +268,27 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
             RingPipeline<kNumStages> pipeline;
 
             if (cute::elect_one_sync()) {
+                bool is_first_task = true;
                 for (uint32_t task_idx = get_first_task(role); task_idx < num_tasks; task_idx = get_next_task(role, task_idx)) {
                     const uint32_t split_idx = task_idx % kNumSplits;
                     const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
                     const uint32_t m_idx = task_idx / kNumSplits * BLOCK_M;
 
+                    // Static grids run one wave of tasks: the first IO stage lands sooner when the remaining
+                    // stages of the first task are issued only after it (or the first two) arrived.
+                    const uint32_t first_task_wait_k_block_idx = num_task_k_blocks > kNumIOStages ? 2 : 1;
+
                     #pragma unroll 1
                     for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
                         CUTE_TIE_DECL(pipeline.advance(), stage_idx, stage_phase);
                         empty_barriers[stage_idx].wait(stage_phase ^ 1u);
+                        if constexpr (not kUseTaskRing) {
+                            if (role == kTaskProducer and is_first_task and k_block_idx == first_task_wait_k_block_idx)
+                                smem.full_io_barriers[0].wait(0);
+                        }
                         load_hidden_block(stage_idx, get_task_k_begin(split_idx) + k_block_idx * BLOCK_K, m_idx);
                     }
+                    is_first_task = false;
                 }
             }
             __syncwarp();
@@ -400,10 +420,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
                         const uint32_t k_idx = get_task_k_begin(split_idx) + k_block_idx * BLOCK_K;
                         const uint32_t m_idx = m_block_idx * BLOCK_M;
-                        const bool should_prefetch_next_coeff =
-                            k_block_idx == num_task_k_blocks - 1 and task_idx + kNumSMs < num_tasks;
+                        // The next task's coefficients go out with the first store: issued at the last hidden
+                        // block, their HBM latency stalled every Post worker at the next task start.
+                        const bool should_prefetch_next_coeff = k_block_idx == 0 and task_idx + kNumSMs < num_tasks;
 
-                        // Wait for a reusable slot before entering the final store-drain overlap window.
+                        // The slot was released when the previous task read its coefficients.
                         if (should_prefetch_next_coeff)
                             next_coeff_stage_idx = advance_coeff_pipeline();
 
@@ -419,7 +440,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                                                   m_idx, cute::TMA::CacheHintSm100::EVICT_LAST);
 
                             cute::tma_store_arrive();
-                            // Issue next-task coefficients here to avoid competing with the task's main TMA wave.
                             if (should_prefetch_next_coeff)
                                 issue_coeff_tma((task_idx + kNumSMs) / kNumSplits * BLOCK_M, next_coeff_stage_idx);
 
@@ -461,7 +481,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     __syncwarp();
                 }
 
-                // The next task is fetched at the last hidden block so its coefficients can be prefetched.
+                // The next task is fetched as soon as the producer can have claimed it, so its coefficients
+                // are prefetched early.
                 uint32_t next_task_idx = kInvalidTask;
                 for (uint32_t task_idx = first_task_idx, task_phase = 0; task_idx < num_tasks;
                      task_idx = next_task_idx, task_phase ^= 1u) {
@@ -470,7 +491,10 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     const uint32_t m_block_idx = task_idx / kNumSplits;
                     if constexpr (kIsShifted)
                         sched::mega_mhc::Norm::wait_init<kNumSplits>(gmem_split_barriers, m_block_idx);
-                    uint32_t next_coeff_stage_idx = 0;
+                    // The producer claims the next ticket after its last load of this task, which needs the IO
+                    // stage released at this hidden block (or one of an earlier task).
+                    const uint32_t next_task_k_block_idx =
+                        num_task_k_blocks > kNumIOStages ? num_task_k_blocks - 1 - kNumIOStages : 0;
 
                     #pragma unroll 1
                     for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
@@ -480,14 +504,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
                         const uint32_t k_idx = get_task_k_begin(split_idx) + k_block_idx * BLOCK_K;
                         const uint32_t m_idx = m_block_idx * BLOCK_M;
-                        if (k_block_idx == num_task_k_blocks - 1)
-                            next_task_idx = get_next_task(kTaskWarpConsumer, task_idx);
-                        const bool should_prefetch_next_coeff =
-                            k_block_idx == num_task_k_blocks - 1 and next_task_idx < num_tasks;
-
-                        // Wait for a reusable slot before entering the final store-drain overlap window.
-                        if (should_prefetch_next_coeff)
-                            next_coeff_stage_idx = advance_coeff_pipeline();
 
                         if (cute::elect_one_sync()) {
                             // New residual is re-read by the fused Normal workers, so it stays in L2
@@ -501,13 +517,21 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                                                   m_idx, cute::TMA::CacheHintSm100::EVICT_LAST);
 
                             cute::tma_store_arrive();
-                            // Issue next-task coefficients here to avoid competing with the task's main TMA wave.
-                            if (should_prefetch_next_coeff)
-                                issue_coeff_tma(next_task_idx / kNumSplits * BLOCK_M, next_coeff_stage_idx);
 
                             // Complete the destination writes before releasing this IO stage.
                             ptx::tma_store_wait<0>();
                             smem.empty_io_barriers[io_stage_idx].arrive();
+                        }
+
+                        if (k_block_idx == next_task_k_block_idx) {
+                            __syncwarp();
+                            next_task_idx = get_next_task(kTaskWarpConsumer, task_idx);
+                            if (next_task_idx < num_tasks) {
+                                const uint32_t coeff_stage_idx = advance_coeff_pipeline();
+                                if (cute::elect_one_sync())
+                                    issue_coeff_tma(next_task_idx / kNumSplits * BLOCK_M, coeff_stage_idx);
+                            }
+                            __syncwarp();
                         }
                     }
 
@@ -552,8 +576,10 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
         DG_STATIC_ASSERT(UMMA_K % kNumLanesPerRowGroup == 0, "Invalid Post geometry");
 
-        const auto run_post_worker = [&](auto post_worker) {
-            constexpr uint32_t kPostWorkerIdx = decltype(post_worker)::value;
+        // Both Post WGs run one code copy: two instances of the unrolled hidden-block body (~11 KB each)
+        // thrash the instruction cache of every SM sub-partition they share with the Norm workers.
+        {
+            const uint32_t post_worker_idx = warp_idx / kNumWarpsPerWG - kFirstPostWGIdx;
             cutlass::arch::warpgroup_reg_alloc<kNumPostRegisters>();
             const uint32_t col_pair_idx = lane_idx & (kNumLanesPerRowGroup - 1);
             const uint32_t first_row_idx = get_first_row_idx();
@@ -564,7 +590,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
             RingPipeline<kNumCoeffStages> coeff_pipeline;
 
             // Each Post worker maps to one WG; offset them so their A stages interleave.
-            a_pipeline.advance(kPostWorkerIdx);
+            a_pipeline.advance(post_worker_idx);
 
             for (uint32_t task_idx = get_first_task(kTaskWarpConsumer), task_phase = 0; task_idx < num_tasks;
                  task_idx = get_next_task(kTaskWarpConsumer, task_idx), task_phase ^= 1u) {
@@ -608,8 +634,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     smem.full_io_barriers[io_stage_idx].wait(io_phase);
 
                     #pragma unroll
-                    for (uint32_t umma_k_idx = kPostWorkerIdx; umma_k_idx < BLOCK_K / UMMA_K;
-                         umma_k_idx += kNumPostWGs) {
+                    for (uint32_t atom_idx = 0; atom_idx < BLOCK_K / UMMA_K / kNumPostWGs; ++ atom_idx) {
+                        const uint32_t umma_k_idx = atom_idx * kNumPostWGs + post_worker_idx;
                         const uint32_t hidden_pair_idx = umma_k_idx * (UMMA_K / 2) +
                                                          col_pair_idx * (UMMA_K / kNumLanesPerRowGroup / 2);
                         float2 x[kNumTokenRowsPerLane];
@@ -703,11 +729,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     reduced_x1_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(x1_sqr_sums[1].x + x1_sqr_sums[1].y);
                 }
 
-                smem.hc_norm_sqr_sums[kPostWorkerIdx][row_indices[0]] = reduced_hc_norm_0;
-                smem.hc_norm_sqr_sums[kPostWorkerIdx][row_indices[1]] = reduced_hc_norm_1;
+                smem.hc_norm_sqr_sums[post_worker_idx][row_indices[0]] = reduced_hc_norm_0;
+                smem.hc_norm_sqr_sums[post_worker_idx][row_indices[1]] = reduced_hc_norm_1;
                 if constexpr (kIsShifted) {
-                    smem.x1_sqr_sums[kPostWorkerIdx][row_indices[0]] = reduced_x1_0;
-                    smem.x1_sqr_sums[kPostWorkerIdx][row_indices[1]] = reduced_x1_1;
+                    smem.x1_sqr_sums[post_worker_idx][row_indices[0]] = reduced_x1_0;
+                    smem.x1_sqr_sums[post_worker_idx][row_indices[1]] = reduced_x1_1;
                 }
                 __syncwarp();
 
@@ -715,9 +741,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     smem.full_stats_barrier.arrive();
                 __syncwarp();
             }
-        };
-        warp_idx < (kFirstPostWGIdx + 1) * kNumWarpsPerWG ?
-            run_post_worker(cute::Int<0>{}) : run_post_worker(cute::Int<1>{});
+        }
         cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
     } else if (warp_idx < kMixWGIdx * kNumWarpsPerWG) {
         // WG3: workspace-epilogue worker, draining one split accumulator block per grid-stride task
@@ -807,15 +831,13 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     sched::mega_mhc::Mix::arrive<kNumSplits>(gmem_split_barriers, m_block_idx);
             }
         }
+        if constexpr (kIsShifted)
+            run_mix_worker();
     } else if (warp_idx < kNormWGIdx * kNumWarpsPerWG) {
         // WG4: four shifted Mix workers, one per warp
         if constexpr (kIsShifted) {
             cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
-            const uint32_t warp_idx_in_mix_wg = warp_idx - kMixWGIdx * kNumWarpsPerWG;
-            for (uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + warp_idx_in_mix_wg;
-                 token_idx < norm_args.num_tokens; token_idx += kNumSMs * kNumWarpsPerWG)
-                epilogue::mega_mhc::run_mix_task<kHidden, true>(
-                    workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
+            run_mix_worker();
         }
     }
 
@@ -839,7 +861,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         const uint32_t wg_idx = warp_idx / kNumWarpsPerWG;
         if ((wg_idx >= kFirstPostWGIdx and wg_idx < kWorkspaceEpilogueWGIdx) or wg_idx == kNormWGIdx) {
             epilogue::mega_mhc::run_shifted_norm_worker<kHidden, kNumSMs, kNumShiftedNormRegisters,
-                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M, kUseTaskRing>(
+                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M>(
                 smem, workspace, gmem_split_barriers, norm_args, lane_idx);
         }
     }

@@ -50,12 +50,11 @@ static void sm100_mega_mhc(
             static_cast<int>(tensor.stride(0)), swizzle_mode);
     };
 
-    // Many-wave BF16-only grids use the task ring: dynamic task tickets (balancing per-SM speed
-    // differences) and dedicated TMA RMSNorm CTAs instead of norm workers co-running with the Post
-    // workers. Outputs are bit-identical either way.
+    // BF16-only grids from the 8-split single wave upward use the task ring: dynamic task tickets balance
+    // per-SM speed differences, while smaller grids are faster with the static stride. Outputs are
+    // bit-identical either way.
     const auto num_m_blocks = mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens));
-    const bool use_task_ring = store_bf16 and not y_fp8.has_value() and
-                               static_cast<uint64_t>(num_m_blocks) * num_splits >= 8ull * num_sms;
+    const bool use_task_ring = store_bf16 and not y_fp8.has_value() and num_sms / num_m_blocks < 9;
     const auto smem_size = static_cast<int>(use_task_ring ? sizeof(mhc_layout::SharedStorage<true>)
                                                           : sizeof(mhc_layout::SharedStorage<false>));
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
