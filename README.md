@@ -157,6 +157,10 @@ branch unchanged, matching an unset `situ_linear_beta` in FlashInfer.
 `activation_alpha` must be positive, and `activation_clamp` applies only to
 SwiGLU.
 
+On SM90, `fp8_fp4_mega_moe` takes FP4 routed weights (`mma_type='fp8xfp4'`) with `swiglu` or `swiglustep` only.
+Its recipe is `(1, 1, 128)`, the default there: `buffer.x_sf` holds one UE8M0 exponent per 128 channels in byte 0 of each word.
+`transform_weights_for_mega_moe` also re-encodes the weights and SF for SM90, and asserts that the SF exponents of each FP4 weight row span at most 11 below a maximum of at least 7.
+
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
 For native NVFP4 routed experts with fused MXFP8 or BF16 shared experts, use
