@@ -89,7 +89,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     static constexpr uint32_t kNumUTCCPAlignedElems = SharedStorage::kNumUTCCPAlignedElems;
     static constexpr uint32_t UMMA_M = 128;
     static constexpr uint32_t BLOCK_QH = SharedStorage::BLOCK_QH;
-    static constexpr uint32_t UMMA_K = kIsFP4 ? 64 : 32;
+    // SM107 paged KV: one K = 128 MXF4 MMA per 128-dim head instead of two K = 64 ones (contiguous KV keeps K = 64:
+    // K = 128 is slower there on short KV rows)
+    static constexpr bool kUseMXF4K128 = kIsPaged and kIsFP4 and kHeadDim == 128 and mma::sm100::kEnableMXF4K128;
+    static constexpr uint32_t UMMA_K = kUseMXF4K128 ? 128 : (kIsFP4 ? 64 : 32);
     static constexpr uint32_t kNumSFQ = SharedStorage::kNumSFQ;
     static constexpr uint32_t kNumSFKV = SharedStorage::kNumSFKV;
     static constexpr uint32_t kNumQKBytesPerToken = SharedStorage::kNumQKBytesPerToken;
@@ -369,15 +372,18 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
         DG_TRAP_ONLY_DEVICE_ASSERT(tmem_base == 0);
         if (cute::elect_one_sync()) {
-            using mma_op_t = cute::conditional_t<kIsFP4, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF8F6F4_SS>;
+            using mma_op_t = cute::conditional_t<kUseMXF4K128, ptx::SM107_MMA_MXF4NVF4_SS,
+                             cute::conditional_t<kIsFP4, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF8F6F4_SS>>;
             DG_STATIC_ASSERT((not kIsFP4 and kHeadDim == 32) or kHeadDim == 64 or kHeadDim == 128, "Invalid head dim");
             constexpr uint32_t kPackFactor = get_smem_pack_factor<qk_dtype_t>();
             constexpr uint32_t kQKSwizzleMode = kHeadDim / kPackFactor;
             constexpr uint32_t kNumUMMAK = kHeadDim / UMMA_K;
             // Advance descriptor low words by each stage's fixed offset
-            const auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
+            auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
                 qk_dtype_t, qk_dtype_t, float, cutlass::float_ue8m0_t,
                 UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+            if constexpr (kUseMXF4K128)
+                mma::sm100::set_mxf4_instr_desc_k128(instr_desc);
             auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kQKSwizzleMode>(smem.smem_kv[0], 0, 0);
             auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kQKSwizzleMode>(smem.smem_q[0], 0, 0);
             const uint32_t a_desc_lo = a_desc.lo, b_desc_lo = b_desc.lo;

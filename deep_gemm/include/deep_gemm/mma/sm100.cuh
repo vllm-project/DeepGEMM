@@ -33,6 +33,13 @@ constexpr uint32_t get_mxf8f6f4_umma_k() {
     return (kEnableMXF8F6F4K64 and kGranKA == 32 and kGranKB == 32 and not kHasUnpackedFP4) ? 64 : 32;
 }
 
+/// SM107 dense MXF4 (`kind::mxf4nvf4`) K = 128: instruction descriptor bit 3 (reserved on SM100; bit 31 selects K = 96)
+constexpr bool kEnableMXF4K128 = kEnableMXF8F6F4K64;
+
+CUTLASS_HOST_DEVICE constexpr void set_mxf4_instr_desc_k128(cute::UMMA::InstrDescriptorBlockScaled& desc) {
+    desc.desc_ |= 1u << 3;
+}
+
 /// Select the MXF8F6F4 instruction K (bit 31 of the block-scaled instruction descriptor)
 CUTLASS_HOST_DEVICE constexpr void set_mxf8f6f4_instr_desc_k(
     cute::UMMA::InstrDescriptorBlockScaled& desc, const uint32_t& umma_k) {
