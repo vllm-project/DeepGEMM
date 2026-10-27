@@ -475,13 +475,22 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     }
                 }
 
-                // Reduce both bf16x2 halves and store the low half only for valid KV columns
+                // Contiguous KV and wide (two-warpgroup) paged tiles release TMEM before the FMA chains and unroll splits
+                // so one split's FMA chains overlap the next split's TMEM wait and loads
+                constexpr bool kEarlyRelease = not kIsPaged or UMMA_N > 128;
+                constexpr uint32_t kSplitUnroll = kIsPaged ? (kEarlyRelease ? 2 : 1) : 4;
+                // Wide paged tiles with six or more rows keep one output address per row for each unrolled group of splits
+                // and store the group's later splits at immediate offsets (fewer rows are faster with per-split addresses)
+                constexpr bool kGroupStores = kIsPaged and kEarlyRelease and kNumValidTokens >= 6;
+
+                // Reduce both bf16x2 halves and store the low half at `bases[i] + offset` for valid KV columns
                 const auto store_token = [&](const uint32_t& i, const uint32_t& kv_offset,
+                                             nv_bfloat16* const* bases, const uint32_t& offset,
                                              const nv_bfloat162& sum_0, const nv_bfloat162& sum_1) {
                     const auto sum = __hadd2_rn(sum_0, sum_1);
                     const auto result = __hadd2_rn(__low2bfloat162(sum), __high2bfloat162(sum));
                     if (seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i])
-                        ptx::st_global_low_bf16(output_bases[i] + kv_offset, result);
+                        ptx::st_global_low_bf16(bases[i] + offset, result);
                 };
                 const auto reduce_pairs = [&](const float* chunk, const nv_bfloat162* chunk_weights, const uint32_t& num_heads,
                                               nv_bfloat162& sum_0, nv_bfloat162& sum_1) {
@@ -503,13 +512,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     }
                 };
 
-                // Contiguous KV and wide (two-warpgroup) paged tiles release TMEM before the FMA chains and unroll splits
-                // so one split's FMA chains overlap the next split's TMEM wait and loads
-                constexpr bool kEarlyRelease = not kIsPaged or UMMA_N > 128;
-                constexpr uint32_t kSplitUnroll = kIsPaged ? (kEarlyRelease ? 2 : 1) : 4;
-                #pragma unroll (kSplitUnroll)
-                for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
-                    const auto kv_offset = task.kv_token_base + kv_split_idx * SPLIT_KV + math_thread_idx;
+                const auto process_split = [&](const uint32_t& kv_offset, nv_bfloat16* const* bases, const uint32_t& offset) {
                     CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
                     ptx::tcgen05_after_thread_sync();
@@ -536,9 +539,9 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
                             auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
                             reduce_packed_pairs(relu_packed[i], weights[i], kNumHeads, sum_0, sum_1);
-                            store_token(i, kv_offset, sum_0, sum_1);
+                            store_token(i, kv_offset, bases, offset, sum_0, sum_1);
                         }
-                        continue;
+                        return;
                     }
 
                     #pragma unroll
@@ -558,7 +561,32 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
                         };
                         visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
-                        store_token(i, kv_offset, sum_0, sum_1);
+                        store_token(i, kv_offset, bases, offset, sum_0, sum_1);
+                    }
+                };
+                if constexpr (kGroupStores) {
+                    nv_bfloat16* group_bases[kNumValidTokens];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                        group_bases[i] = output_bases[i] + task.kv_token_base + math_thread_idx;
+                    for (uint32_t kv_group_idx = 0; kv_group_idx < task.num_kv_splits; kv_group_idx += kSplitUnroll) {
+                        #pragma unroll
+                        for (uint32_t kv_unroll_idx = 0; kv_unroll_idx < kSplitUnroll; ++ kv_unroll_idx) {
+                            const uint32_t kv_split_idx = kv_group_idx + kv_unroll_idx;
+                            if (kv_split_idx >= task.num_kv_splits)
+                                break;
+                            process_split(task.kv_token_base + kv_split_idx * SPLIT_KV + math_thread_idx,
+                                          group_bases, kv_unroll_idx * SPLIT_KV);
+                        }
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                            group_bases[i] += kSplitUnroll * SPLIT_KV;
+                    }
+                } else {
+                    #pragma unroll (kSplitUnroll)
+                    for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
+                        const auto kv_offset = task.kv_token_base + kv_split_idx * SPLIT_KV + math_thread_idx;
+                        process_split(kv_offset, output_bases, kv_offset);
                     }
                 }
             };
