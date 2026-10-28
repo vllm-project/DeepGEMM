@@ -44,6 +44,11 @@ CUTLASS_DEVICE uint64_t atomic_add_sys(const uint64_t* ptr, const uint64_t& valu
     return ret;
 }
 
+// Generic-to-async proxy shared memory fence with a `memory` clobber
+CUTLASS_DEVICE void fence_view_async_shared() {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 } // namespace ordered_ptx
 
 // An 8-entry E4M3 lookup table of the FP4 (E2M1) magnitudes times `2 ^ (shift - 5)`, for `shift` in [0, 11]
@@ -177,7 +182,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
     // SF configs
-    // One MN-major SF word per 128 K: a UE8M0 activation exponent, or packed routed weight exponents
+    // One MN-major SF word per 128 K: an FP32 activation scale, or packed routed weight exponents
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only one activation SF per K block is supported");
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, 128u), "Invalid SF_BLOCK_M");
     const auto transform_sf_token_idx = [](const uint32_t& idx) {
@@ -911,7 +916,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t i = 0; i < NWGMMA::kNumAccum / 4; ++ i) {
                             if (t == 0) {
                                 const auto sfa_ptr = shared_storage.smem_sfa[stage_idx] + transform_sf_token_idx(i * 8 + quad_idx * 2);
-                                token_scales[i] = {__uint_as_float(ptx::ld_shared(sfa_ptr) << 23), __uint_as_float(ptx::ld_shared(sfa_ptr + 4) << 23)};
+                                token_scales[i] = {__uint_as_float(ptx::ld_shared(sfa_ptr)), __uint_as_float(ptx::ld_shared(sfa_ptr + 4))};
                             }
                             #pragma unroll
                             for (uint32_t j = 0; j < 4; ++ j) {
@@ -1145,13 +1150,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     return fmaxf(ptx::ld_shared(local_amax + i), ptx::ld_shared(peer_amax + i));
                 };
 
+                // FP32 scale `amax * (1 / 448)` as in `per_token_cast_to_fp8`, and its inverse correctly rounded by one Newton step
+                const auto get_sf = [](const float& amax) { return fmaxf(amax, 1e-4f) * (1.0f / 448.0f); };
+                const auto get_sf_inv = [](const float& sf) {
+                    const float r = math::fast_rcp(sf);
+                    return __fmaf_rn(__fmaf_rn(-sf, r, 1.0f), r, r);
+                };
+
                 // Cast into FP8 E4M3 and store into shared memory
                 const uint32_t channel_idx = first_row_tile_idx * (WGMMA::M / 2) + warp_idx_in_wg * 8 + lane_idx / 4;
                 #pragma unroll
                 for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                     const uint32_t token_idx = i * 8 + quad_idx * 2;
-                    const float2 sf_inv = {math::get_ue8m0_sf_inv<float>(math::get_ue8m0_sf_exp(get_amax(token_idx))),
-                                           math::get_ue8m0_sf_inv<float>(math::get_ue8m0_sf_exp(get_amax(token_idx + 1)))};
+                    const float2 sf_inv = {get_sf_inv(get_sf(get_amax(token_idx))), get_sf_inv(get_sf(get_amax(token_idx + 1)))};
                     #pragma unroll
                     for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
                         const auto fp8x2 = __nv_fp8x2_e4m3(make_float2(activations[t][i].x * sf_inv.x, activations[t][i].y * sf_inv.y));
@@ -1164,16 +1175,16 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
 
-                // Store UE8M0 SF into `l2_sf_buffer` or `shared_l2_sf_buffer` (MN-major), only by the leader CTA
+                // Store FP32 SF into `l2_sf_buffer` or `shared_l2_sf_buffer` (MN-major), only by the leader CTA
                 if (is_leader_cta and epilogue_thread_idx < BLOCK_M) {
                     const auto sf_ptr = is_shared ?
                         buffer.shared_l2_sf_buffer.get_base_ptr<uint32_t>() + task_info.n_cluster_idx * kNumSharedSFTokens :
                         buffer.l2_sf_buffer.get_base_ptr<uint32_t>() + task_info.n_cluster_idx * kNumSFRingTokens;
-                    sf_ptr[block_idx * SF_BLOCK_M + transform_sf_token_idx(epilogue_thread_idx)] = math::get_ue8m0_sf_exp(get_amax(epilogue_thread_idx));
+                    sf_ptr[block_idx * SF_BLOCK_M + transform_sf_token_idx(epilogue_thread_idx)] = __float_as_uint(get_sf(get_amax(epilogue_thread_idx)));
                 }
 
                 // Issue TMA store
-                cute::tma_store_fence();
+                ordered_ptx::fence_view_async_shared();
                 sync_epilogue();
                 if (epilogue_thread_idx == 0) {
                     const auto tensor_map_l1_output_ptr = is_shared ? &tensor_map_shared_l1_output : &tensor_map_l1_output;
@@ -1303,7 +1314,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(math_thread_idx);
 
         // All local L2 writes are done after this grid sync
-        comm::grid_sync<kNumSMs, kMathGridSyncIndex, false>(
+        comm::grid_sync<kNumSMs, kMathGridSyncIndex>(
             workspace, sm_idx, math_thread_idx,
             [&]() { ordered_ptx::sync_aligned(kNumMathThreads, kMathFullBarrierIdx); }
         );
@@ -1314,7 +1325,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ordered_ptx::sync_unaligned(kNumDispatchThreads + kNumMathThreads, kDispatchWithMathBarrierIdx);
-        cutlass::arch::fence_view_async_shared();
+        ordered_ptx::fence_view_async_shared();
 
         // Iterate over all token chunks
         const auto grid_idx = ptx::get_grid_idx() + 1;
@@ -1332,7 +1343,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            while (not __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx));
+            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
             ptx::fence_proxy_async_global();
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
@@ -1379,7 +1391,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
                         ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
                 }
-                cutlass::arch::fence_view_async_shared();
+                ordered_ptx::fence_view_async_shared();
                 __syncwarp();
                 combine_phase ^= load_stage_idx;
                 load_stage_idx ^= 1;
@@ -1406,7 +1418,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
             // TMA store the token chunk
             if (cute::elect_one_sync()) {
-                cute::tma_store_fence();
+                ordered_ptx::fence_view_async_shared();
                 ptx::tma_store_1d(
                     math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
                     combine_store_buffer, kNumChunkBytes);

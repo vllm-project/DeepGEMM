@@ -75,8 +75,12 @@ def _emu_weights(w: torch.Tensor, exps: torch.Tensor, gran_k: int) -> Tuple[torc
     n, num_sf = exps.shape
     exps = exps.int().view(n, -1, gran_k // 32)
     if w.dtype == torch.int8:
-        # FP4 fold: base `max(e) - 6` per row, one RN cast to E4M3
-        base = (exps.amax(dim=(1, 2), keepdim=True) - 6).repeat(1, exps.size(1), 1)
+        # FP4 fold: base `max(e) - 6` per row over nonzero groups (zero scale below 7), one RN cast to E4M3
+        is_nonzero = ((w.view(torch.uint8) & 0x77).view(n, -1, gran_k // 32, 16).amax(dim=-1) != 0)
+        exps = torch.where(is_nonzero, exps, 0)
+        max_exps = exps.amax(dim=(1, 2), keepdim=True)
+        exps = torch.where(is_nonzero, exps, max_exps).clamp(min=6)
+        base = torch.where(max_exps < 7, 0, max_exps - 6).repeat(1, exps.size(1), 1)
         w = cast_back_from_fp4(w, _exp2((exps - base).view(n, num_sf) + 127), gran_k=32).to(torch.float8_e4m3fn)
     else:
         # FP8: the stored values, with the per-32 exponents of a block all equal
@@ -94,18 +98,23 @@ def _emu_gemm(a: torch.Tensor, sa: torch.Tensor, b: torch.Tensor, sb: torch.Tens
 
 
 def _apply_activation(l1_y: torch.Tensor, weights: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    # SwiGLU clamps the gate before SiLU, SwiGLU-step the SiLU output (with alpha 1 and beta 0)
     gate, up = l1_y.chunk(2, dim=-1)
+    is_step = args.activation == 'swiglustep'
     if args.activation_clamp is not None:
-        gate, up = gate.clamp(max=args.activation_clamp), up.clamp(-args.activation_clamp, args.activation_clamp)
-    return gate / (1 + torch.exp(-args.activation_alpha * gate)) * (up + args.activation_beta) * weights[:, None]
+        gate, up = gate if is_step else gate.clamp(max=args.activation_clamp), up.clamp(-args.activation_clamp, args.activation_clamp)
+    gated = gate / (1 + torch.exp(-args.activation_alpha * gate))
+    if is_step and args.activation_clamp is not None:
+        gated = gated.clamp(max=args.activation_clamp)
+    return gated * (up + args.activation_beta) * weights[:, None]
 
 
 def _emu_expert(x: torch.Tensor, sx: torch.Tensor, l1_weights: Tuple, l2_weights: Tuple, weights: torch.Tensor,
                 gran_k: int, args: argparse.Namespace) -> torch.Tensor:
-    # The kernel's numerics, with BF16 gate/up and BF16 output rounding and per-`gran_k` L2 requantization
+    # The kernel's numerics, with BF16 gate/up and BF16 output rounding and per-`gran_k` L2 requantization (FP32 scales on SM90)
     l1_y = _emu_gemm(x.float(), sx, *_emu_weights(*l1_weights, gran_k), gran_k)
     l2_x, l2_sx = per_token_cast_to_fp8(
-        _apply_activation(l1_y.bfloat16().float(), weights, args), use_ue8m0=True, gran_k=gran_k)
+        _apply_activation(l1_y.bfloat16().float(), weights, args), use_ue8m0=gran_k != 128, gran_k=gran_k)
     return _emu_gemm(l2_x.float(), l2_sx, *_emu_weights(*l2_weights, gran_k), gran_k).bfloat16()
 
 
@@ -149,8 +158,9 @@ def _calc_token_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 # Sweep: tokens per rank, hidden, intermediate, experts per rank, top-k, shared experts, clamp, routing, extra args
 # The heaviest 20 also run with more ranks
-# Sweep-only extra args: exact inputs, subnormal probe, activation exponent range, weight exponent span and shift
-_CASE_DEFAULTS = dict(exact_inputs=False, subnormal_probe=False, act_exp_range=0, weight_exp_span=None, weight_exp_shift=0)
+# Sweep-only extra args: exact inputs, subnormal probe, activation exponent range, weight exponent span and shift, zeroed groups
+_CASE_DEFAULTS = dict(exact_inputs=False, subnormal_probe=False, act_exp_range=0, weight_exp_span=None, weight_exp_shift=0,
+                      zero_weight_groups=0)
 _EXACT = dict(exact_inputs=True, fast_math=0)
 _SWEEP_CASES = (
     (128, 2048, 256, 8, 6, 1, 10, 'random', dict(subnormal_probe=True, fast_math=0)),
@@ -207,6 +217,14 @@ _SWEEP_CASES = (
     (1000, 2048, 2304, 48, 6, 1, None, 'masked', dict(weight_exp_shift=120, weight_exp_span=8)),
     (128, 7168, 256, 8, 6, 1, None, 'random', dict(weight_exp_shift=-105)),
     (4096, 5120, 1536, 48, 8, 0, None, 'random', dict(weight_exp_shift=-105, weight_exp_span=11)),
+    (129, 2048, 1536, 8, 6, 1, 10, 'random', dict(zero_weight_groups=0.2)),
+    (1000, 5120, 2304, 48, 6, 1, 10, 'masked', dict(zero_weight_groups=0.05, weight_exp_span=11)),
+    (7, 7168, 256, 8, 6, 0, None, 'random', dict(zero_weight_groups=0.5)),
+    (129, 2048, 1536, 8, 6, 0, 0.5, 'random', dict(activation='swiglustep')),
+    (1000, 5120, 2304, 48, 6, 0, 2, 'masked', dict(activation='swiglustep')),
+    (7, 7168, 3072, 8, 8, 0, 1, 'hot', dict(activation='swiglustep')),
+    (63, 4096, 256, 2, 1, 0, 0.5, 'random', dict(activation='swiglustep', **_EXACT)),
+    (4096, 2048, 1536, 48, 6, 0, None, 'random', dict(activation='swiglustep')),
 )
 
 
@@ -268,9 +286,10 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     # SM90 quantizes activations per 128 channels and checks against the PyTorch reference
     arch_major = get_arch_major()
     gran_k = 128 if arch_major == 9 else 32
+    shared_gran_k = args.shared_gran_k or gran_k
     use_emu_reference = arch_major == 9 or args.emu_reference
     is_exact_inputs = args.exact_inputs or args.subnormal_probe
-    assert not use_emu_reference or (not is_bf16xbf16 and args.activation == 'swiglu')
+    assert not use_emu_reference or (not is_bf16xbf16 and args.activation in ('swiglu', 'swiglustep'))
     assert not is_exact_inputs or (use_emu_reference and not args.fast_math)
     assert not args.subnormal_probe or arch_major == 9
 
@@ -317,7 +336,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
 
             # Routed weights are per-32 casts, shared ones per `--shared-gran-k` with the exponent in all its bytes
             cast = per_token_cast_to_fp8 if is_fp8 else per_token_cast_to_fp4
-            gran_k_w = 32 if is_routed else args.shared_gran_k
+            gran_k_w = 32 if is_routed else shared_gran_k
             w[i], sf = cast(torch.randn((n, k), dtype=torch.bfloat16, **rand_kwargs) * k ** -0.5,
                             use_ue8m0=True, gran_k=gran_k_w)
             e = (sf.view(torch.int) >> 23).repeat_interleave(gran_k_w // 32, dim=1)
@@ -328,6 +347,13 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 offsets = torch.randint(args.weight_exp_span + 1, (n, k // 128, 4), **rand_kwargs)
                 offsets[:, :, 0], offsets[:, :, 1] = 0, args.weight_exp_span
                 e = e.amax(dim=1, keepdim=True) - offsets.view(n, -1)
+            if is_routed and not is_fp8 and args.zero_weight_groups > 0:
+                # Zero groups (half -0) with exponent 0, plus zero rows and 128 K blocks like padding
+                is_zero = torch.rand((n, k // 32), **rand_kwargs) < args.zero_weight_groups
+                is_zero[::16], is_zero[3::7, :4] = True, True
+                zero_byte = torch.where(torch.rand((n, k // 32, 1), **rand_kwargs) < 0.5, 0x00, 0x88).to(torch.uint8)
+                w[i] = torch.where(is_zero[:, :, None], zero_byte, w[i].view(torch.uint8).view(n, -1, 16)).view(n, -1).view(torch.int8)
+                e = torch.where(is_zero, 0, e)
             exps[i] = e
         return w, exps
 
@@ -388,19 +414,25 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                     x_fp8 = torch.where(is_probe.repeat_interleave(gran_k, dim=1),
                                         subnormals, x_fp8.view(torch.uint8)).view(torch.float8_e4m3fn)
                 ref_x_hi = x_fp8.double() * _exp2(x_exps, torch.double).repeat_interleave(gran_k, dim=1)
+                x_scales = _exp2(x_exps)
             else:
                 if args.act_exp_range > 0:
                     act_exps = torch.randint(
                         127 - args.act_exp_range, 128 + args.act_exp_range, (num_tokens, hidden // 128), device='cuda')
                     x = (x.float() * _exp2(act_exps).repeat_interleave(128, dim=1)).bfloat16()
-                x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=gran_k)
-                x_exps = x_sf.view(torch.int) >> 23
+                # SM90 uses FP32 scales, except with `--weight-exp-shift` (power-of-two scales)
+                use_ue8m0 = arch_major != 9 or args.weight_exp_shift != 0
+                x_fp8, x_scales = per_token_cast_to_fp8(x, use_ue8m0=use_ue8m0, gran_k=gran_k)
+                x_exps = x_scales.view(torch.int) >> 23
                 # `--weight-exp-shift` moves exponents from the activations to the L1 weights
                 shifted_x_exps = (x_exps - args.weight_exp_shift).clamp(1, 254)
                 ref_x_hi = x.double() * _exp2(shifted_x_exps - x_exps + 127, torch.double).repeat_interleave(gran_k, dim=1)
                 x_exps = shifted_x_exps
-            x_sf = x_exps if gran_k == 128 else x_exps.to(torch.uint8).view(torch.int)
-            ref_x = (x_fp8, _exp2(x_exps))
+                if use_ue8m0:
+                    x_scales = _exp2(x_exps)
+            # SM90 SF words hold the FP32 scales, SM100 ones the UE8M0 exponents of 4 groups
+            x_sf = x_scales.contiguous().view(torch.int) if arch_major == 9 else x_exps.to(torch.uint8).view(torch.int)
+            ref_x = (x_fp8, x_scales)
             x = (x_fp8, x_sf)
             shared_x = (x_fp8, _to_mn_major_sf(x_sf))
             if num_shared_experts > 0:
@@ -716,9 +748,11 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 all_l1_weights, all_l2_weights, hi_shared_weights, torch.double)
             diff, hi_diff = calc_diff(fused_y, ref_y), calc_diff(fused_y, hi_y)
             max_token_diff = max(_calc_token_diff(fused_y, ref_y).tolist(), default=0)
+            dist_print(f' > Accuracy (rank {rank_idx}): calc_diff={diff:.3e}, max_token_diff={max_token_diff:.3e}, hi_diff={hi_diff:.3e}')
             if is_exact_inputs:
                 assert torch.equal(fused_y, ref_y), f'calc_diff={diff}'
-            max_diff, max_token_diff_limit = (2 ** -13, 1e-2) if arch_major == 9 else (1e-5, 1e-4)
+            # SM90 WGMMA accumulation is not bit-equal to FP32, so random inputs get a looser tolerance
+            max_diff, max_token_diff_limit = (1e-4, 1e-2) if arch_major == 9 else (1e-5, 1e-4)
             assert diff < max_diff and max_token_diff < max_token_diff_limit and hi_diff < 2e-3, \
                 f'calc_diff={diff}, max_token_diff={max_token_diff}, hi_diff={hi_diff}'
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
@@ -859,7 +893,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--num-shared-experts', type=int, default=1, help='Number of shared experts (use 0 to disable)')
-    parser.add_argument('--activation', type=str, default='swiglu', choices=('swiglu', 'situ'))
+    parser.add_argument('--activation', type=str, default='swiglu', choices=('swiglu', 'swiglustep', 'situ'))
     parser.add_argument('--activation-clamp', type=float, default=10, help='SwiGLU clamp value')
     parser.add_argument('--activation-alpha', type=float, default=1.0,
                         help='SwiGLU sigmoid scale or SiTU gate tanh scale')
@@ -880,8 +914,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
     parser.add_argument('--sweep', action='store_true', help='Run the shape sweep (heaviest 20 cases with more than 1 rank)')
     parser.add_argument('--emu-reference', action='store_true', help='Check against the PyTorch reference (always on SM90)')
-    parser.add_argument('--shared-gran-k', type=int, default=128, choices=(32, 128),
-                        help='K granularity of the shared weight scales')
+    parser.add_argument('--shared-gran-k', type=int, default=None, choices=(32, 128),
+                        help='K granularity of the shared weight scales (default: 128 on SM90, 32 on SM100)')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()

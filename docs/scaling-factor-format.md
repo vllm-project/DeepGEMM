@@ -392,7 +392,7 @@ Untransformed `float32` SFs need no special care — the internal transform hand
 
 Sources: `csrc/apis/mega_moe.hpp` (host checks), `deep_gemm/mega/__init__.py` (Python wrapper + weight transform), `tests/test_mega_moe.py` (SF construction).
 
-- **Recipe is pinned to `(1, 1, 32)` on SM100 and `(1, 1, 128)` on SM90**, where it is the activation granularity only; the wrapper picks it when `recipe` is `None` (mega.hpp:179); `kGranK = 32` is also hardcoded in the JIT impl (sm100_fp8_fp4_mega_moe.hpp:165).
+- **Recipe is pinned to `(1, 1, 32)` on SM100 and `(1, 1, 128)` on SM90** (mega.hpp:179), where it is the activation granularity only and the Python wrapper picks it when `recipe` is `None`; `kGranK = 32` is also hardcoded in the JIT impl (sm100_fp8_fp4_mega_moe.hpp:165).
 - **Weight SFs must already be packed `int32`** — unlike the GEMM APIs, there is NO float32 fallback and no auto-transform: `check_sf_layout(..., type_check=torch::kInt)` rejects `float32` outright (mega.hpp:206-209, 229-232). The required layout is exactly the Section 3 contract with `gran_k = 32`:
   - Routed L1 SF: `[num_experts_per_rank, 2*intermediate_hidden, ceil_div(hidden, 128)]`, `int32`, MN-major, TMA-aligned (`stride(-2)==1`, `stride(-1)==align(mn,4)`); routed L2 SF: `[num_experts_per_rank, hidden, ceil_div(intermediate_hidden, 128)]`. (The `/128` is `gran_k * 4 = 32 * 4`.)
   - Shared expert SFs (optional; weights are FP8 instead of FP4): same contract, 2-D without the group dimension.

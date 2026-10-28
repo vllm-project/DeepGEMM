@@ -12,13 +12,8 @@ namespace deep_gemm::comm {
 constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
 
 // Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
-template <bool kWithTimeout = true, typename pred_t, typename print_timeout_t>
+template <typename pred_t, typename print_timeout_t>
 CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_timeout) {
-    if constexpr (not kWithTimeout) {
-        while (not pred());
-        return;
-    }
-
     const auto start_clock = clock64();
     while (not pred()) {
         if (clock64() - start_clock >= kNumTimeoutCycles) {
@@ -37,7 +32,7 @@ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     cute::cluster_wait();
 }
 
-template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, bool kWithTimeout = true, typename sync_scope_t>
+template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t>
 CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
                               const uint32_t& sm_idx, const uint32_t& thread_idx,
                               const sync_scope_t& sync_scope) {
@@ -49,7 +44,7 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
-        wait_until<kWithTimeout>([&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
+        wait_until([&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
             printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
                    sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
         });

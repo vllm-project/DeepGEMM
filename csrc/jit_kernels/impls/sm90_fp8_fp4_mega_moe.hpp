@@ -110,7 +110,8 @@ static void sm90_fp8_fp4_mega_moe(
     // Compile
     const auto kernel = jit->compile("sm90_fp8_fp4_mega_moe", std::format(R"(
 #define DG_NO_DEVICE_PRINTF
-#define DG_DEVICE_ASSERT(cond) DG_TRAP_ONLY_DEVICE_ASSERT(cond)
+// __builtin_unreachable tells ptxas the trap never returns, avoiding spills
+#define DG_DEVICE_ASSERT(cond) do {{ if (not (cond)) {{ asm("trap;"); __builtin_unreachable(); }} }} while (0)
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;

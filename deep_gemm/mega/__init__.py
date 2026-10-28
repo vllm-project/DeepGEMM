@@ -181,33 +181,54 @@ def relayout_fp4_weights_for_sm90_mega_moe(w: torch.Tensor) -> torch.Tensor:
     return words.transpose(-3, -2).flatten(-4).contiguous().view(torch.int8)
 
 
-def transform_fp4_sf_for_sm90_mega_moe(sf: torch.Tensor) -> torch.Tensor:
+def transform_fp4_sf_for_sm90_mega_moe(sf: torch.Tensor, w: Optional[torch.Tensor] = None) -> torch.Tensor:
     # Per row, the base `max(e) - 6` in bits 7..0 of every SF word, and the 4 per-32 table shifts `e - base + 5` in bits 31..16
+    # All-zero groups of `w` (packed) or, without `w`, all-zero SF words are exempt; rows with a maximum below 7 get a zero scale
     assert sf.dtype == torch.int
     exps = torch.stack([(sf >> (8 * i)) & 0xff for i in range(4)], dim=-1)
+    if w is not None:
+        assert w.dtype == torch.int8 and w.shape[:-1] == sf.shape[:-1] and w.shape[-1] == sf.shape[-1] * 64
+        is_nonzero = ((w.view(torch.uint8) & 0x77).unflatten(-1, (-1, 16)).amax(dim=-1) != 0).unflatten(-1, (-1, 4)).to(exps.device)
+    else:
+        is_nonzero = (exps != 0).any(dim=-1, keepdim=True).expand_as(exps)
+    exps = torch.where(is_nonzero, exps, 0)
     max_exps = exps.amax(dim=(-2, -1), keepdim=True)
-    min_max_exp, max_span = torch.stack((max_exps.amin(), (max_exps - exps).amax())).tolist()
-    assert min_max_exp >= 7 and max_span <= 11, \
-        (f'SM90 Mega MoE needs the UE8M0 exponents of each FP4 weight row to span at most 11 below a maximum of at least 7, '
-         f'got a span of up to {max_span} and a maximum as small as {min_max_exp}')
-    shifts = (exps - max_exps + 11).to(torch.uint8)
-    words = torch.stack(((max_exps[..., 0] - 6).to(torch.uint8).expand_as(shifts[..., 0]), torch.zeros_like(shifts[..., 0]),
-                         shifts[..., 0] | (shifts[..., 1] << 4), shifts[..., 2] | (shifts[..., 3] << 4)), dim=-1)
+    is_zero_row = max_exps < 7
+    exps = torch.where(is_nonzero, exps, max_exps)
+    max_span = torch.where(is_zero_row, 0, max_exps - exps).amax().item()
+    assert max_span <= 11, \
+        (f'SM90 Mega MoE needs the UE8M0 exponents of each FP4 weight row to span at most 11, got {max_span}'
+         f'{"" if w is not None else " (pass `w`, so that all-zero 32-element groups are exempt)"}')
+    shifts = torch.where(is_zero_row, 0, exps - max_exps + 11).to(torch.uint8)
+    words = torch.stack((torch.where(is_zero_row[..., 0], 0, max_exps[..., 0] - 6).to(torch.uint8).expand_as(shifts[..., 0]),
+                         torch.zeros_like(shifts[..., 0]), shifts[..., 0] | (shifts[..., 1] << 4), shifts[..., 2] | (shifts[..., 3] << 4)),
+                        dim=-1)
     return sf.clone().copy_(words.view(torch.int).squeeze(-1))
+
+
+def _get_weights_arch_major(w: torch.Tensor) -> Optional[int]:
+    # The architecture of the weights' GPU; for CPU weights, the current GPU's if there is one
+    if w.is_cuda:
+        return torch.cuda.get_device_capability(w.device)[0]
+    return torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else None
 
 
 def transform_weights_for_mega_moe(
     l1_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    activation: str = 'swiglu'
+    activation: str = 'swiglu',
+    arch_major: Optional[int] = None
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
+    # `arch_major` defaults to the weights' GPU, e.g. pass 9 to prepare SM90 weights on the CPU
     _validate_activation(activation)
-    if isinstance(l1_weights, tuple) and torch.cuda.get_device_capability()[0] == 9:
+    if isinstance(l1_weights, tuple) and arch_major is None:
+        arch_major = _get_weights_arch_major(l1_weights[0])
+    if isinstance(l1_weights, tuple) and arch_major == 9:
         if l1_weights[0].dtype == torch.float8_e4m3fn:
             l1_weights, l2_weights = (requantize_fp8_weights_for_sm90_mega_moe(w) for w in (l1_weights, l2_weights))
         else:
-            l1_weights, l2_weights = ((relayout_fp4_weights_for_sm90_mega_moe(w), transform_fp4_sf_for_sm90_mega_moe(sf))
+            l1_weights, l2_weights = ((relayout_fp4_weights_for_sm90_mega_moe(w), transform_fp4_sf_for_sm90_mega_moe(sf, w))
                                       for w, sf in (l1_weights, l2_weights))
     if isinstance(l1_weights, tuple):
         # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
