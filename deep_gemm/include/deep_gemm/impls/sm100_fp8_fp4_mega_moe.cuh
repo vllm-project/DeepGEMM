@@ -1352,6 +1352,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 constexpr uint32_t kNumPrefetchStages = math::constexpr_min(kNumEpiPrefetchStages, kNumStoreBlocks - 1);
                 uint32_t raw_values[kNumPrefetchStages + 1][kNumAtomsPerStore][ATOM_M];
 
+                // With many small store blocks and many local experts (DEP2 prefill), the L2 epilogue bounds the L2 phase:
+                // read all source metadata up front, so that the load latencies overlap instead of stalling every store
+                // block (measured neutral to slower with fewer local experts, e.g. DEP4 and wide-EP decode)
+                constexpr bool kPrefetchAllSrcMetadata = kNumStoreBlocks > 4 and kNumExpertsPerRank >= 128;
+                layout::TokenSrcMetadata prefetched_src_metadata[kPrefetchAllSrcMetadata ? kNumStoreBlocks : 1][kNumAtomsPerStore];
+                if constexpr (kPrefetchAllSrcMetadata) {
+                    #pragma unroll
+                    for (uint32_t s = 0; s < kNumStoreBlocks; ++ s) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumAtomsPerStore; ++ j) {
+                            const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M_L2 + j * ATOM_M + warp_idx_in_wg * 2 + lane_idx / 16;
+                            if (m_idx_in_block < valid_m)
+                                prefetched_src_metadata[s][j] = task_info.is_shared() ?
+                                    layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + m_idx_in_block, kNumTopk) :
+                                    *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
+                        }
+                    }
+                }
+
                 // Store blocks with at least one valid row (the last one may be partial); `<= kNumStoreBlocks` by construction
                 const uint32_t num_valid_store_blocks = math::ceil_div(num_valid_wg_rows, STORE_BLOCK_M_L2);
                 prefetch_prologue(num_valid_store_blocks, raw_values);
@@ -1369,10 +1388,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumAtomsPerStore; ++ j) {
                         const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M_L2 + j * ATOM_M + warp_idx_in_wg * 2 + lane_idx / 16;
-                        if (m_idx_in_block < valid_m)
+                        if constexpr (kPrefetchAllSrcMetadata) {
+                            cached_src_metadata[j] = prefetched_src_metadata[s][j];
+                        } else if (m_idx_in_block < valid_m) {
                             cached_src_metadata[j] = task_info.is_shared() ?
                                 layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + m_idx_in_block, kNumTopk) :
                                 *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
+                        }
                     }
                     __syncwarp();
 
