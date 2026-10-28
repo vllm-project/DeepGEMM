@@ -105,6 +105,10 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
         int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
         if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
             num_blocks = 2;
+        // With many local experts (64 or more, e.g. DEP2/DEP4), the margin alone does not split every expert into two
+        // blocks: while the expected count fits one 240-row block, most experts take one (two reload all weight tiles)
+        if (num_blocks == 2 and num_expected_tokens <= 240 and num_experts / num_ranks >= 64)
+            num_blocks = 1;
         for (const int& candidate: {64, 128, 192, 240}) {
             block_m = candidate;
             if (num_blocks * candidate >= num_covered_tokens)

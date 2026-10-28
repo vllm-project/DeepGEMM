@@ -156,6 +156,12 @@ branch unchanged, matching an unset `situ_linear_beta` in FlashInfer.
 `activation_alpha` must be positive, and `activation_clamp` applies only to
 SwiGLU.
 
+Every rank's experts receive tokens from all ranks. When ranks run batches of different sizes (e.g. data-parallel
+prefill, where an idle rank runs a tiny dummy batch), pass `num_expected_tokens_per_rank=max(num_tokens, average batch)`
+to `fp8_fp4_mega_moe`, so that a light rank sizes its tiles for the tokens its experts actually receive. The default `0`
+sizes them for this rank's batch. Lay out scaled shared-expert inputs with
+`get_block_m_for_mega_moe(..., num_tokens=<the same count>, ...)` then.
+
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
 For native NVFP4 routed experts with fused MXFP8 or BF16 shared experts, use

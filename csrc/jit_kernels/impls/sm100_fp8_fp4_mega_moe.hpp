@@ -30,7 +30,7 @@ static void sm100_fp8_fp4_mega_moe(
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_shared_experts,
-    const int& num_tokens, const int& num_topk,
+    const int& num_tokens, const int& num_expected_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& clamp_after_silu,
@@ -50,7 +50,7 @@ static void sm100_fp8_fp4_mega_moe(
     const bool packed_fp4_weights = arch_major == 10 and arch_minor == 7 and l1_weights.scalar_type() == kPackedFP4;
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
+        num_max_tokens_per_rank, num_expected_tokens_per_rank, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
         MmaKind::MXFP8FP4, /*has_pull_buffers=*/ false, packed_fp4_weights);
 

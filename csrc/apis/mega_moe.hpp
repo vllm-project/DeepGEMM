@@ -282,13 +282,18 @@ static void fp8_fp4_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const float& activation_alpha,
-    const float& activation_beta
+    const float& activation_beta,
+    const int& num_expected_tokens_per_rank
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
     // Config checks
+    // NOTES: tiles are sized for `num_expected_tokens_per_rank` tokens per rank (0: this rank's count), so that
+    //        ranks with unequal batches size them for the tokens their experts actually receive
     const auto num_tokens = static_cast<int>(y.size(0));
+    const auto num_tiling_tokens = num_expected_tokens_per_rank > 0 ? num_expected_tokens_per_rank : num_tokens;
+    DG_HOST_ASSERT(num_tiling_tokens <= num_max_tokens_per_rank);
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swiglustep" or activation == "situ");
@@ -398,7 +403,7 @@ static void fp8_fp4_mega_moe(
                    rank_idx, num_max_tokens_per_rank,
                    num_experts_per_rank,
                    num_shared_experts,
-                   num_tokens, num_topk,
+                   num_tokens, num_tiling_tokens, num_topk,
                    hidden, intermediate_hidden,
                    activation_args...);
         };
@@ -594,7 +599,8 @@ static void fp8_fp4_mega_moe(
     const std::optional<double>& activation_clamp_opt,
     const bool& fast_math,
     const double& activation_alpha,
-    const double& activation_beta) {
+    const double& activation_beta,
+    const int64_t& num_expected_tokens_per_rank) {
     mega::fp8_fp4_mega_moe(
         y, {l1_weights_tuple, l1_weights_tuple_sf}, {l2_weights_tuple, l2_weights_tuple_sf},
         make_optional_tensor_pair(shared_l1_weights_tuple_opt, shared_l1_weights_tuple_opt_sf),
@@ -603,7 +609,8 @@ static void fp8_fp4_mega_moe(
         mega::checked_int(rank_idx), mega::checked_int(num_max_tokens_per_rank),
         mega::checked_int(num_experts), mega::checked_int(num_topk), checked_recipe(recipe),
         activation, activation_clamp_opt, fast_math,
-        static_cast<float>(activation_alpha), static_cast<float>(activation_beta));
+        static_cast<float>(activation_alpha), static_cast<float>(activation_beta),
+        mega::checked_int(num_expected_tokens_per_rank));
 }
 
 static void bf16_mega_moe(
@@ -658,7 +665,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts) -> (int, int[])");
     m.def("_slice_symm_buffer_for_mega_moe(Tensor(a) buffer, int[] layout_info) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
 
-    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta) -> ()");
+    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, int num_expected_tokens_per_rank=0) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta) -> ()");
 }
 

@@ -30,7 +30,7 @@ static void sm100_fp8_fp4_mega_moe_situ(
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_shared_experts,
-    const int& num_tokens, const int& num_topk,
+    const int& num_tokens, const int& num_expected_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_alpha,
     const float& activation_beta,
@@ -45,7 +45,7 @@ static void sm100_fp8_fp4_mega_moe_situ(
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
+        num_max_tokens_per_rank, num_expected_tokens_per_rank, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
         MmaKind::MXFP8FP4);
 

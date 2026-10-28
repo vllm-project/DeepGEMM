@@ -92,6 +92,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     shared_intermediate_hidden = intermediate_hidden * num_shared_experts
     assert num_tokens <= num_max_tokens_per_rank
 
+    # Ranks with unequal batches size the tiles for at least their average (`num_expected_tokens_per_rank`)
+    num_tiling_tokens = num_tokens
+    if args.tile_by_average_tokens:
+        assert not is_bf16xbf16, 'Only the FP8/FP4 Mega MoE kernel takes `num_expected_tokens_per_rank`'
+        num_total_tokens = torch.tensor([num_tokens], dtype=torch.int64, device='cuda')
+        dist.all_reduce(num_total_tokens, group=group)
+        num_tiling_tokens = max(num_tokens, (int(num_total_tokens.item()) + num_ranks - 1) // num_ranks)
+
     # Allocate symmetric memory
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, num_experts,
@@ -158,7 +166,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             # FP8 path: cast inputs and weights with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
-                num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
+                num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tiling_tokens, num_topk, args.mma_type)
             x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
             x = (x_fp8, x_sf)
             shared_x = (x_fp8, x_sf_tma)
@@ -218,6 +226,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             fast_math=bool(args.fast_math),
             activation_alpha=args.activation_alpha,
             activation_beta=args.activation_beta)
+        if args.tile_by_average_tokens:
+            kernel_kwargs.update(num_expected_tokens_per_rank=num_tiling_tokens)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -454,6 +464,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')
     parser.add_argument('--num-tokens', type=int, default=0, help='Number of tokens per rank (follow max minus removed if 0)')
     parser.add_argument('--num-max-removed-tokens', type=int, default=0, help='Maximum number of tokens to remove')
+    parser.add_argument('--tile-by-average-tokens', action='store_true',
+                        help="Size the tiles for at least the ranks' average token count (`num_expected_tokens_per_rank`)")
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--num-shared-experts', type=int, default=1, help='Number of shared experts (use 0 to disable)')

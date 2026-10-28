@@ -510,6 +510,7 @@ def fp8_fp4_mega_moe(
     fast_math,
     activation_alpha,
     activation_beta,
+    num_expected_tokens_per_rank=0,
 ):
     return _torch_ops.fp8_fp4_mega_moe(
         y,
@@ -534,6 +535,7 @@ def fp8_fp4_mega_moe(
         fast_math,
         activation_alpha,
         activation_beta,
+        num_expected_tokens_per_rank,
     )
 
 

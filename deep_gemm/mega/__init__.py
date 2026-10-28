@@ -185,7 +185,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
                      activation_alpha: float = 1.0,
-                     activation_beta: float = 0.0):
+                     activation_beta: float = 0.0,
+                     num_expected_tokens_per_rank: int = 0):
     _validate_activation(activation)
     _C.fp8_fp4_mega_moe(
         y,
@@ -199,7 +200,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         recipe,
         activation, activation_clamp,
         fast_math,
-        activation_alpha, activation_beta
+        activation_alpha, activation_beta,
+        num_expected_tokens_per_rank
     )
 
 def bf16_mega_moe(y: torch.Tensor,
