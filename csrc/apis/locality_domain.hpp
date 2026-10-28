@@ -224,7 +224,7 @@ static torch::stable::Tensor get_probe_chain() {
 // (num_domains, num_sms, probe_chunks, probe_chunk_bytes) -> (num_domains, num_sms).
 static torch::stable::Tensor probe(const torch::stable::Tensor& buf) {
     const auto words = torch::stable::view(
-        torch_compat::view_dtype(buf, torch::headeronly::ScalarType::Int),
+        torch::stable::view(buf, torch::headeronly::ScalarType::Int),
         {buf.size(0), -1, kNumLocalityDomainProbeChunkBytes / 4});
     torch_compat::copy_(words, get_probe_chain());
     const auto latency = stable_ops::zeros(

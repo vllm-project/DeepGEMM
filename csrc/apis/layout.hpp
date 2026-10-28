@@ -51,7 +51,7 @@ static torch::stable::Tensor transform_sf_into_required_layout(const torch::stab
     if (sf.scalar_type() == torch::headeronly::ScalarType::Float and (gran_k == 32 or gran_k == 128) and (arch_major == 10 or arch_major == 12)) {
         DG_HOST_ASSERT(not disable_ue8m0_cast);
         const auto broadcasted = gran_mn == 1 ? sf :
-                                 torch_compat::index_select(sf, -2, torch_compat::floor_divide(deep_gemm_arange_int64(mn, sf.device()), gran_mn));
+                                 torch::stable::index_select(sf, -2, torch_compat::floor_divide(deep_gemm_arange_int64(mn, sf.device()), gran_mn));
         return get_mn_major_tma_aligned_packed_ue8m0_tensor(broadcasted, psum_layout);
     }
 

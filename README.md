@@ -32,7 +32,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - Python 3.10 or higher
 - Compilers and standard libraries with C++20 `<format>` support
 - CUDA Toolkit 12.9 or higher
-- PyTorch 2.11 or higher
+- PyTorch 2.14 or higher
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 
 ### Development
