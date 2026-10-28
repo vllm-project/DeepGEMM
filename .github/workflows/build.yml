@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       torch-version:
-        description: "PyTorch build version (2.11 or newer)"
+        description: "PyTorch build version (2.14 or newer; targets the 2.11 stable ABI)"
         required: true
         type: string
       upload-to-release:
