@@ -263,7 +263,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -274,7 +274,7 @@ static void __instantiate_kernel() {{
     config.num_q_stages, config.num_kv_stages, config.num_tmem_stages,
     num_sms,
     config.num_specialized_threads, config.num_math_threads,
-    config.qk_dtype_name()));
+    config.qk_dtype_name(), to_string(logits.scalar_type())));
 
     // Launch
     jit->launch(
@@ -350,7 +350,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -361,7 +361,7 @@ static void __instantiate_kernel() {{
     config.num_q_stages, config.num_kv_stages, config.num_tmem_stages,
     config.split_kv, kMQALogitsSplitsPerChunk,
     config.num_specialized_threads, config.num_math_threads,
-    config.qk_dtype_name()));
+    config.qk_dtype_name(), to_string(logits.scalar_type())));
 
     // Launch
     jit->launch(

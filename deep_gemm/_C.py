@@ -177,18 +177,21 @@ def _register_deep_gemm_kernels():
             *_unpack_epilogue(epilogue),
         )
 
-    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta=None):
+    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k,
+                           logits_dtype=torch.float32, schedule_meta=None):
         q_fp, q_sf = q[0], q[1]
         kv_fp, kv_sf = _unpack_kv(kv)
         return _torch_ops.fp8_fp4_mqa_logits(
-            q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta,
+            q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k,
+            logits_dtype, schedule_meta,
         )
 
     def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len,
-                                 indices=None):
+                                 logits_dtype=torch.float32, indices=None):
         q_fp, q_sf = q[0], q[1]
         return _torch_ops.fp8_fp4_paged_mqa_logits(
-            q_fp, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices,
+            q_fp, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len,
+            logits_dtype, indices,
         )
 
     globals().update({

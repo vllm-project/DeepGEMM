@@ -74,6 +74,7 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
                                         const torch::stable::Tensor& cu_seq_len_k_start,
                                         const torch::stable::Tensor& cu_seq_len_k_end,
                                         const int& max_seqlen_k,
+                                        const torch::headeronly::ScalarType& logits_dtype,
                                         const std::optional<torch::stable::Tensor>& schedule_meta = std::nullopt) {
     const auto [q_fp, q_sf] = q;
     const auto [kv_fp, kv_sf] = kv;
@@ -81,7 +82,7 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
     const bool is_fp4 = qk_dtype == kPackedFP4;
     const bool is_mx_sf = q_sf.has_value();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = arch_major == 10 ? torch::headeronly::ScalarType::BFloat16 : torch::headeronly::ScalarType::Float;
+    DG_HOST_ASSERT(logits_dtype == torch::headeronly::ScalarType::Float or logits_dtype == torch::headeronly::ScalarType::BFloat16);
 
     // Check Q, SF Q and weights
     const auto [seq_len, num_heads, head_dim] = get_logical_shape<3>(q_fp);
@@ -116,9 +117,9 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
     const int block_kv = arch_major == 10 ? kMQALogitsSplitKV : (arch_major == 12 ? sm120::kMqaBlockKv : 256);
     const int aligned_seq_len = align(seq_len, block_q);
     // Logits row stride must be 1024-byte aligned
-    const int stride_logits_alignment = 1024 / static_cast<int>(torch_compat::element_size(out_dtype));
+    const int stride_logits_alignment = 1024 / static_cast<int>(torch_compat::element_size(logits_dtype));
     const int stride_logits = align(align(max_seqlen_k, block_kv), stride_logits_alignment);
-    auto logits = torch::stable::new_empty(q_fp, {aligned_seq_len, stride_logits}, out_dtype);
+    auto logits = torch::stable::new_empty(q_fp, {aligned_seq_len, stride_logits}, logits_dtype);
     logits = torch_compat::narrow(torch_compat::narrow(logits, 0, 0, seq_len), 1, 0, max_seqlen_k);
 
     // Dispatch implementation
@@ -136,7 +137,7 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
         DG_HOST_ASSERT(not schedule_meta.has_value());
         DG_HOST_ASSERT(qk_dtype == torch::headeronly::ScalarType::Float8_e4m3fn or qk_dtype == kPackedFP4);
         DG_HOST_ASSERT(num_heads == 16 or num_heads == 32 or num_heads == 64);
-        sm120_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, out_dtype,
+        sm120_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                          seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
                          is_mx_sf, qk_dtype);
     } else {
@@ -203,6 +204,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
                                               const torch::stable::Tensor& block_table,
                                               const torch::stable::Tensor& schedule_meta,
                                               const int& max_context_len,
+                                              const torch::headeronly::ScalarType& logits_dtype,
                                               const std::optional<torch::stable::Tensor>& indices) {
     const auto [q_fp, q_sf] = q;
     const auto qk_dtype = q_fp.scalar_type();
@@ -214,7 +216,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
     int block_table_stride = block_table.stride(0);
     int num_sms = runtime->get_num_sms();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = arch_major == 10 ? torch::headeronly::ScalarType::BFloat16 : torch::headeronly::ScalarType::Float;
+    DG_HOST_ASSERT(logits_dtype == torch::headeronly::ScalarType::Float or logits_dtype == torch::headeronly::ScalarType::BFloat16);
 
     // Check Q, SF Q and weights
     const auto [batch_size, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
@@ -286,10 +288,10 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
     // SM120: 2 groups x 64 KV rows = 128
     const int split_kv = arch_major == 10 ? kMQALogitsSplitKV : (arch_major == 12 ? sm120::kPagedSplitKv : 256);
     // Logits row stride must be 1024-byte aligned and hold whole KV splits
-    const int stride_logits_alignment = 1024 / static_cast<int>(torch_compat::element_size(out_dtype));
+    const int stride_logits_alignment = 1024 / static_cast<int>(torch_compat::element_size(logits_dtype));
     const int split_stride_alignment = split_kv / math::constexpr_gcd(split_kv, stride_logits_alignment) * stride_logits_alignment;
     const auto aligned_max_context_len = align(max_context_len, split_stride_alignment);
-    auto logits = torch::stable::new_empty(q_fp, {batch_size * next_n, aligned_max_context_len}, out_dtype);
+    auto logits = torch::stable::new_empty(q_fp, {batch_size * next_n, aligned_max_context_len}, logits_dtype);
     logits = torch_compat::slice(logits, -1, 0, max_context_len);
 
     // Dispatch implementation
@@ -308,7 +310,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
         DG_HOST_ASSERT(qk_dtype == torch::headeronly::ScalarType::Float8_e4m3fn or qk_dtype == kPackedFP4);
         DG_HOST_ASSERT(num_heads == 16 or num_heads == 32 or num_heads == 64);
         sm120_paged_mqa_logits(q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
-                               out_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
+                               logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv,
                                is_mx_sf, qk_dtype);
     } else {
@@ -506,12 +508,13 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(
     const torch::stable::Tensor& cu_seq_len_k_start,
     const torch::stable::Tensor& cu_seq_len_k_end,
     const int64_t& max_seqlen_k,
+    const torch::headeronly::ScalarType& logits_dtype,
     const std::optional<torch::stable::Tensor>& schedule_meta) {
     return attention::fp8_fp4_mqa_logits(
         std::make_tuple(q, q_sf),
         std::make_tuple(kv, kv_sf),
         weights, cu_seq_len_k_start, cu_seq_len_k_end,
-        static_cast<int>(max_seqlen_k), schedule_meta);
+        static_cast<int>(max_seqlen_k), logits_dtype, schedule_meta);
 }
 
 static torch::stable::Tensor get_paged_mqa_logits_metadata(
@@ -530,11 +533,12 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(
     const torch::stable::Tensor& block_table,
     const torch::stable::Tensor& schedule_meta,
     const int64_t& max_context_len,
+    const torch::headeronly::ScalarType& logits_dtype,
     const std::optional<torch::stable::Tensor>& indices) {
     return attention::fp8_fp4_paged_mqa_logits(
         std::make_tuple(q, q_sf),
         kv_cache, weights, context_lens, block_table, schedule_meta,
-        static_cast<int>(max_context_len), indices);
+        static_cast<int>(max_context_len), logits_dtype, indices);
 }
 
 static torch::stable::Tensor get_sparse_mqa_logits_metadata(
@@ -591,11 +595,11 @@ static torch::stable::Tensor fp8_fp4_paged_sparse_mqa_logits(
 STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("get_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, int num_heads) -> Tensor");
     m.def(
-        "fp8_fp4_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv, Tensor kv_sf, Tensor weights, Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int max_seqlen_k, Tensor? schedule_meta=None) -> Tensor");
+        "fp8_fp4_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv, Tensor kv_sf, Tensor weights, Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int max_seqlen_k, ScalarType logits_dtype=float, Tensor? schedule_meta=None) -> Tensor");
     m.def(
         "get_paged_mqa_logits_metadata(Tensor context_lens, int block_kv, int num_sms, Tensor? indices=None) -> Tensor");
     m.def(
-        "fp8_fp4_paged_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_cache, Tensor weights, Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, Tensor? indices=None) -> Tensor");
+        "fp8_fp4_paged_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_cache, Tensor weights, Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, ScalarType logits_dtype=float, Tensor? indices=None) -> Tensor");
     m.def("get_sparse_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv, bool use_unaligned_ks=False) -> Tensor");
     m.def("get_paged_sparse_mqa_logits_metadata(Tensor context_lens, Tensor block_table, Tensor indices, int page_kv, Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv) -> Tensor");
     m.def("fp8_fp4_sparse_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv, Tensor kv_sf, Tensor weights, Tensor metadata, int num_max_sparse_blocks, int sparse_block_kv, bool use_unaligned_ks=False) -> Tensor");
