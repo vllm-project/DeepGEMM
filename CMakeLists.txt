@@ -30,7 +30,7 @@ add_library(_C_extension MODULE csrc/python_api.cpp)
 set_target_properties(_C_extension PROPERTIES PREFIX "")
 target_compile_definitions(_C_extension PRIVATE
     DJ_DISABLE_GIL=1
-    TORCH_TARGET_VERSION=0x020b000000000000
+    TORCH_TARGET_VERSION=0x020e000000000000
     USE_CUDA)
 target_link_libraries(_C_extension PRIVATE ${TORCH_LIBRARIES} CUDA::cudart)
 

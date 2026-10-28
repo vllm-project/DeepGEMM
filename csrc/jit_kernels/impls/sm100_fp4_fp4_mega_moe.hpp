@@ -55,8 +55,8 @@ static void sm100_fp4_fp4_mega_moe(
     // View all packed-FP4 tensors as raw bytes: TMA moves plain byte rows, so the
     // K dimensions below are all `elements / 2`
     constexpr int kGranK = 16;
-    const auto l1_weights_bytes = torch_compat::view_dtype(l1_weights, torch::headeronly::ScalarType::Byte);
-    const auto l2_weights_bytes = torch_compat::view_dtype(l2_weights, torch::headeronly::ScalarType::Byte);
+    const auto l1_weights_bytes = torch::stable::view(l1_weights, torch::headeronly::ScalarType::Byte);
+    const auto l2_weights_bytes = torch::stable::view(l2_weights, torch::headeronly::ScalarType::Byte);
     const int block_k_bytes = config.block_k / 2;
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
 

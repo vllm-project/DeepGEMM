@@ -149,7 +149,7 @@ static torch::stable::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(
     // First, convert into UE8M0 `uint8_t`
     const auto ue8m0_tensor = torch::stable::to(
         torch_compat::bitwise_right_shift(
-            torch_compat::view_dtype(sf_reshaped, torch::headeronly::ScalarType::Int), 23),
+            torch::stable::view(sf_reshaped, torch::headeronly::ScalarType::Int), 23),
         torch::headeronly::ScalarType::Byte);
 
     // Second, make padded packed tensors
@@ -163,7 +163,7 @@ static torch::stable::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(
     torch_compat::copy_(
         torch_compat::slice(torch_compat::slice(padded, 1, 0, mn), 2, 0, k), ue8m0_tensor);
     padded = torch::stable::view(
-        torch_compat::view_dtype(torch::stable::view(padded, {-1}), torch::headeronly::ScalarType::Int),
+        torch::stable::view(torch::stable::view(padded, {-1}), torch::headeronly::ScalarType::Int),
         {num_sf_batches, aligned_mn, aligned_k / 4});
 
     // Finally, transpose

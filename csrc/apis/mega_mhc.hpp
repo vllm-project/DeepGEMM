@@ -238,7 +238,7 @@ static void mega_mhc(const torch::stable::Tensor& x,
 
     // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary.
     const auto y_bf16_storage = needs_bf16_scratch ? torch::stable::view(
-        torch_compat::view_dtype(torch_compat::narrow(scratch, 0, num_mhc_scratch_bytes, num_bf16_scratch_bytes),
+        torch::stable::view(torch_compat::narrow(scratch, 0, num_mhc_scratch_bytes, num_bf16_scratch_bytes),
                                 torch::headeronly::ScalarType::BFloat16), {num_tokens, hidden})
         : y_bf16.value_or(x);
 
