@@ -40,11 +40,13 @@ static void check_mqa_logits_q_and_weights(const torch::stable::Tensor& q_fp, co
         DG_HOST_ASSERT(q_sf->scalar_type() == torch::headeronly::ScalarType::Int);
     }
 
-    // Check weights: rows are loaded by TMA, so the row stride must be 16-byte aligned (pad `num_heads` up)
+    // Check weights: rows are loaded by TMA, so the row stride must be 16-byte aligned (pad `num_heads` up).
+    // FP32 everywhere; SM100 also takes BF16, which reduces in BF16
     const auto [_num_q_tokens, _num_heads] = get_shape<2>(weights);
     DG_HOST_ASSERT(num_q_tokens == _num_q_tokens and num_heads == _num_heads);
     DG_HOST_ASSERT(weights.stride(1) == 1 and (weights.stride(0) * weights.element_size()) % 16 == 0);
-    DG_HOST_ASSERT(weights.scalar_type() == (arch_major == 10 ? torch::headeronly::ScalarType::BFloat16 : torch::headeronly::ScalarType::Float));
+    DG_HOST_ASSERT(weights.scalar_type() == torch::headeronly::ScalarType::Float or
+                   (arch_major == 10 and weights.scalar_type() == torch::headeronly::ScalarType::BFloat16));
 }
 
 static torch::stable::Tensor get_mqa_logits_metadata(const torch::stable::Tensor& cu_seq_len_k_start,
@@ -83,6 +85,7 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
     const bool is_mx_sf = q_sf.has_value();
     const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT(logits_dtype == torch::headeronly::ScalarType::Float or logits_dtype == torch::headeronly::ScalarType::BFloat16);
+    DG_HOST_ASSERT(weights.scalar_type() != torch::headeronly::ScalarType::BFloat16 or logits_dtype == torch::headeronly::ScalarType::BFloat16);
 
     // Check Q, SF Q and weights
     const auto [seq_len, num_heads, head_dim] = get_logical_shape<3>(q_fp);
@@ -124,7 +127,7 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
 
     // Dispatch implementation
     if (arch_major == 10) {
-        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, false);
+        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, weights.scalar_type(), false);
         sm100_mqa_logits(config, q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
                          logits, seq_len, seq_len_kv, stride_logits, schedule_meta);
     } else if (arch_major == 9) {
@@ -217,6 +220,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
     int num_sms = runtime->get_num_sms();
     const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT(logits_dtype == torch::headeronly::ScalarType::Float or logits_dtype == torch::headeronly::ScalarType::BFloat16);
+    DG_HOST_ASSERT(weights.scalar_type() != torch::headeronly::ScalarType::BFloat16 or logits_dtype == torch::headeronly::ScalarType::BFloat16);
 
     // Check Q, SF Q and weights
     const auto [batch_size, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
@@ -296,7 +300,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
 
     // Dispatch implementation
     if (arch_major == 10) {
-        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, true);
+        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, weights.scalar_type(), true);
         sm100_paged_mqa_logits(config, q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits,
                                block_table, indices_tensor, schedule_meta, batch_size, num_kv_blocks, block_kv,
                                aligned_max_context_len, block_table_stride);

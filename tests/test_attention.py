@@ -27,7 +27,7 @@ def sample_mqa_cases(name: str, cases: List[tuple]) -> List[tuple]:
 
 
 def to_mqa_weights(weights: torch.Tensor) -> torch.Tensor:
-    # Rows are padded to 16 bytes for the TMA loads (BF16 on SM100, float on SM90)
+    # Rows are padded to 16 bytes for the TMA loads
     element_size = weights.element_size()
     stride = ceil_div(weights.size(1) * element_size, 16) * 16 // element_size
     storage = torch.empty((weights.size(0), stride), device=weights.device, dtype=weights.dtype)
@@ -40,18 +40,23 @@ def dtype_tag(dtype: torch.dtype) -> str:
     return 'BF16' if dtype == torch.bfloat16 else 'FP32'
 
 
-# SM100 takes MXFP4 / MXFP8 with BF16 weights; SM90 takes E4M3 with one float scale per KV token and float weights;
-# SM120 takes MXFP4 or E4M3 with one float scale per KV token and float weights. All emit BF16 or FP32 logits
+# SM100 takes MXFP4 / MXFP8; SM90 takes E4M3 with one float scale per KV token; SM120 takes MXFP4 or E4M3 with one
+# float scale per KV token
 def mqa_logits_formats():
     if get_arch_major() == 10:
-        return [(fmt, torch.bfloat16) for fmt in ('mxfp4', 'mxfp8')]
+        return ('mxfp4', 'mxfp8')
     if get_arch_major() == 12:
-        return [('mxfp4', torch.float), ('fp8', torch.float)]
-    return [('fp8', torch.float)]
+        return ('mxfp4', 'fp8')
+    return ('fp8', )
 
 
+# `(weights, logits)` dtypes: FP32 weights reduce in FP32 and emit either logits dtype; BF16 weights (SM100 only)
+# reduce in BF16 and emit BF16 logits
 def mqa_logits_dtypes():
-    return (torch.bfloat16, torch.float)
+    dtypes = [(torch.float, torch.float), (torch.float, torch.bfloat16)]
+    if get_arch_major() == 10:
+        dtypes.append((torch.bfloat16, torch.bfloat16))
+    return dtypes
 
 
 def mqa_logits_heads(is_mxfp4: bool):
@@ -130,9 +135,9 @@ def test_mqa_logits():
         return ks, ke
 
     def enumerate_mqa_logits():
-        for fmt, weights_dtype in mqa_logits_formats():
+        for fmt in mqa_logits_formats():
             heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
-            for logits_dtype in mqa_logits_dtypes():
+            for weights_dtype, logits_dtype in mqa_logits_dtypes():
                 for seq_len in (2048, 8192):
                     for seq_len_kv in (8192, 65536):
                         for num_heads in heads:
@@ -316,7 +321,7 @@ def test_paged_mqa_logits():
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_q_tokens = 16 * 1024
         for is_varlen in varlen_options:
-            for fmt, weights_dtype in mqa_logits_formats():
+            for fmt in mqa_logits_formats():
                 heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
                 if arch_major == 10:
                     block_kvs = (64, 128, 32)
@@ -331,7 +336,7 @@ def test_paged_mqa_logits():
                 else:
                     # SM90 next_n=4 splits its Q rows across a two-CTA cluster; SM120 pads odd next_n >= 3
                     next_ns = (1, 2, 3, 4, 5, 6) if arch_major == 12 else (1, 2, 4)
-                for logits_dtype in mqa_logits_dtypes():
+                for weights_dtype, logits_dtype in mqa_logits_dtypes():
                     for block_kv in block_kvs:
                         for num_sequences in (64, 256, ):
                             for max_tokens_per_batch in next_ns:
