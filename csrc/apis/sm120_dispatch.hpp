@@ -58,7 +58,7 @@ static torch::stable::Tensor fp4_repack_to_k_major(const torch::stable::Tensor& 
     shape_view[ndim - 1] = k / 2;
     shape_view.push_back(2);
     auto codes2 = torch::stable::view(codes, shape_view);
-    auto result = torch_compat::bitwise_or(
+    auto result = torch::stable::bitwise_or(
         torch_compat::bitwise_and(torch::stable::select(codes2, -1, 0), 0x0F),
         torch::stable::to(torch_compat::bitwise_left_shift(
             torch::stable::to(torch_compat::bitwise_and(torch::stable::select(codes2, -1, 1), 0x0F),

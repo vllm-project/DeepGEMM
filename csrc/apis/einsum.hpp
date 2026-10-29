@@ -322,42 +322,42 @@ static void fp8_einsum(const std::string& expr,
         // NOTES: the FP8 output SF columns are flattened over D's last two dims (matching a
         //        per-token cast of `d.flatten(1, 2)`), so the SF layout is invariant under
         //        the `(b, h)` permute of the data dims
-        const auto perm_a = torch_compat::permute(a.first, {1, 0, 2});
-        const auto perm_sfa = torch_compat::permute(a.second, {1, 0, 2});
+        const auto perm_a = torch::stable::permute(a.first, {1, 0, 2});
+        const auto perm_sfa = torch::stable::permute(a.second, {1, 0, 2});
         auto perm_d = d;
         if (const auto d_fp8 = std::get_if<std::pair<torch::stable::Tensor, torch::stable::Tensor>>(&perm_d))
-            d_fp8->first = torch_compat::permute(d_fp8->first, {1, 0, 2});
+            d_fp8->first = torch::stable::permute(d_fp8->first, {1, 0, 2});
         else
-            std::get<torch::stable::Tensor>(perm_d) = torch_compat::permute(
+            std::get<torch::stable::Tensor>(perm_d) = torch::stable::permute(
                 std::get<torch::stable::Tensor>(perm_d), {1, 0, 2});
         const auto perm_c = c.has_value()
-            ? std::make_optional(torch_compat::permute(c.value(), {1, 0, 2}))
+            ? std::make_optional(torch::stable::permute(c.value(), {1, 0, 2}))
             : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", epilogue_class, use_128x4_sfd_layout);
     } else if (expr == "bhd,hdr->bhr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, b, r, d)
         DG_HOST_ASSERT(std::holds_alternative<torch::stable::Tensor>(d));
-        const auto perm_a = torch_compat::permute(a.first, {1, 0, 2});
-        const auto perm_sfa = torch_compat::permute(a.second, {1, 0, 2});
+        const auto perm_a = torch::stable::permute(a.first, {1, 0, 2});
+        const auto perm_sfa = torch::stable::permute(a.second, {1, 0, 2});
         // SM120: B is MN-major after permute; .contiguous() to K-major (scalar MN-major path ~3x slower)
-        const auto perm_b_view = torch_compat::permute(b.first, {0, 2, 1});
+        const auto perm_b_view = torch::stable::permute(b.first, {0, 2, 1});
         const auto perm_b = arch_major == 12 ? torch::stable::contiguous(perm_b_view) : perm_b_view;
-        const auto perm_sfb = torch_compat::permute(b.second, {0, 2, 1});
-        const auto perm_d = torch_compat::permute(std::get<torch::stable::Tensor>(d), {1, 0, 2});
+        const auto perm_sfb = torch::stable::permute(b.second, {0, 2, 1});
+        const auto perm_d = torch::stable::permute(std::get<torch::stable::Tensor>(d), {1, 0, 2});
         const auto perm_c = c.has_value()
-            ? std::make_optional(torch_compat::permute(c.value(), {1, 0, 2}))
+            ? std::make_optional(torch::stable::permute(c.value(), {1, 0, 2}))
             : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk", epilogue_class, use_128x4_sfd_layout);
     } else if (expr == "bhd,bhr->hdr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, d, r, b)
         DG_HOST_ASSERT(std::holds_alternative<torch::stable::Tensor>(d));
         // SM120: A/B are MN-major after permute; force K-major (MN-major A unsupported, scalar path ~3x slower)
-        const auto perm_a_view = torch_compat::permute(a.first, {1, 2, 0});
+        const auto perm_a_view = torch::stable::permute(a.first, {1, 2, 0});
         const auto perm_a = arch_major == 12 ? torch::stable::contiguous(perm_a_view) : perm_a_view;
-        const auto perm_sfa = torch_compat::permute(a.second, {1, 2, 0});
-        const auto perm_b_view = torch_compat::permute(b.first, {1, 2, 0});
+        const auto perm_sfa = torch::stable::permute(a.second, {1, 2, 0});
+        const auto perm_b_view = torch::stable::permute(b.first, {1, 2, 0});
         const auto perm_b = arch_major == 12 ? torch::stable::contiguous(perm_b_view) : perm_b_view;
-        const auto perm_sfb = torch_compat::permute(b.second, {1, 2, 0});
+        const auto perm_sfb = torch::stable::permute(b.second, {1, 2, 0});
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn", epilogue_class, use_128x4_sfd_layout);
     } else {
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
