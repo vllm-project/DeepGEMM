@@ -218,7 +218,21 @@ def fp4_fp4_mega_moe(y: torch.Tensor,
                      l2_alphas: Optional[torch.Tensor] = None,
                      a2_scales: Optional[torch.Tensor] = None,
                      post_expert_norm_gamma: Optional[torch.Tensor] = None,
-                     post_expert_norm_eps: float = 0.0):
+                     post_expert_norm_eps: float = 0.0,
+                     weight_layout: str = "native"):
+    """Run NVFP4 MegaMoE with native or explicitly prepared TRT-LLM weights.
+
+    ``trtllm`` expects the shuffled SwiGLU [up; gate] weights and block-swizzled
+    packed E4M3 scales produced by TRT-LLM weight preparation, not plain tensors
+    with the same shape. L1 alphas remain in [gate, up] order. This path requires
+    SM100-family GPUs, hidden sizes divisible by 256, and no fused shared experts.
+    Currently scoped to Muse Spark, it requires ``post_expert_norm_gamma`` for
+    per-expert RMSNorm before the routing-weighted reduction. The gain must be
+    gain-centered by the caller. Tensor metadata cannot verify packed contents
+    or gate/up ordering. Native layout retains optional post-expert norm.
+    """
+    if weight_layout not in ("native", "trtllm"):
+        raise ValueError(f"Unsupported weight layout: {weight_layout}")
     # NVFP4 x NVFP4 fused MoE: weights and activations are packed E2M1 with
     # per-16-element E4M3 SFs. `l1_alphas`/`l2_alphas` are optional per-local-expert
     # scales (e.g. modelopt's `weight_scale_2`), applied before the activation
@@ -244,7 +258,8 @@ def fp4_fp4_mega_moe(y: torch.Tensor,
     assert (shared_l1_weights is None) == (shared_l2_weights is None) == (x_bf16 is None)
     assert post_expert_norm_gamma is None or shared_l1_weights is None, \
         'Post-expert norm cannot be combined with fused shared experts'
-    _C.fp4_fp4_mega_moe(
+    op = _C.fp4_fp4_mega_moe_trtllm if weight_layout == "trtllm" else _C.fp4_fp4_mega_moe
+    op(
         y,
         l1_weights, l2_weights,
         shared_l1_weights, shared_l2_weights, x_bf16,

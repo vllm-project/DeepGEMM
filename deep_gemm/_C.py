@@ -633,6 +633,58 @@ def fp4_fp4_mega_moe(
     )
 
 
+def fp4_fp4_mega_moe_trtllm(
+    y,
+    l1_weights_tuple,
+    l2_weights_tuple,
+    shared_l1_weights_opt,
+    shared_l2_weights_opt,
+    x_bf16_opt,
+    cumulative_local_expert_recv_stats,
+    sym_buffer,
+    sym_buffer_ptrs,
+    rank_idx,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    recipe,
+    activation,
+    activation_clamp_opt,
+    fast_math,
+    l1_alphas_opt,
+    l2_alphas_opt,
+    a2_scales_opt,
+    post_expert_norm_gamma_opt,
+    post_expert_norm_eps,
+):
+    return _torch_ops.fp4_fp4_mega_moe_trtllm(
+        y,
+        l1_weights_tuple[0],
+        l1_weights_tuple[1],
+        l2_weights_tuple[0],
+        l2_weights_tuple[1],
+        shared_l1_weights_opt,
+        shared_l2_weights_opt,
+        x_bf16_opt,
+        cumulative_local_expert_recv_stats,
+        sym_buffer,
+        sym_buffer_ptrs,
+        rank_idx,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        list(recipe),
+        activation,
+        activation_clamp_opt,
+        fast_math,
+        l1_alphas_opt,
+        l2_alphas_opt,
+        a2_scales_opt,
+        post_expert_norm_gamma_opt,
+        post_expert_norm_eps,
+    )
+
+
 use_deterministic_algorithms = _torch_ops.use_deterministic_algorithms
 fp4_gemm_nt = fp8_fp4_gemm_nt
 m_grouped_fp4_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous

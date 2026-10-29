@@ -450,6 +450,7 @@ static void fp8_fp4_mega_moe(
         torch_compat::zero_(sym_buffer);
 }
 
+template <bool use_trtllm_weights>
 static void fp4_fp4_mega_moe(
     const torch::stable::Tensor& y,
     const std::tuple<torch::stable::Tensor, torch::stable::Tensor>& l1_weights_tuple,
@@ -500,12 +501,28 @@ static void fp4_fp4_mega_moe(
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
 
-    // Check weight SF layout for E4M3 packing, MN-major, and TMA alignment
+    if constexpr (use_trtllm_weights) {
+        DG_HOST_ASSERT(arch_major == 10 and "TRT-LLM NVFP4 weight layout requires SM100-family GPUs");
+        DG_HOST_ASSERT(post_expert_norm_gamma_opt.has_value() and
+                       "TRT-LLM weight layout currently requires Muse Spark post-expert RMSNorm");
+        DG_HOST_ASSERT(not shared_l1_weights_opt.has_value() and
+                       not shared_l2_weights_opt.has_value() and not x_bf16_opt.has_value() and
+                       "TRT-LLM weight layout does not support fused shared experts");
+        // Each expert must start on a complete weight/SF tile, not just the full tensor.
+        DG_HOST_ASSERT(hidden > 0 and intermediate_hidden > 0 and
+                       hidden % 256 == 0 and intermediate_hidden % 256 == 0 and
+                       "TRT-LLM NVFP4 weight layout requires hidden sizes divisible by 256");
+        DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous() and
+                       l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous() and
+                       "TRT-LLM weights and packed E4M3 scales must be contiguous");
+    }
+
+    // Check packed E4M3 SF shapes; native SFs additionally require MN-major TMA strides.
     constexpr int kGranMN = 1, kGranK = 16;
     check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::headeronly::ScalarType::Int);
+                    num_experts_per_rank, not use_trtllm_weights, false, torch::headeronly::ScalarType::Int);
     check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::headeronly::ScalarType::Int);
+                    num_experts_per_rank, not use_trtllm_weights, false, torch::headeronly::ScalarType::Int);
 
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -601,7 +618,7 @@ static void fp4_fp4_mega_moe(
 
     // Dispatch into different architectures
     if (arch_major == 10) {
-        sm100_fp4_fp4_mega_moe(y,
+        sm100_fp4_fp4_mega_moe<use_trtllm_weights>(y,
                                l1_acts, l1_acts_sf,
                                l2_acts, l2_acts_sf,
                                num_shared_experts > 0 ? x_bf16 : l1_acts,
@@ -862,6 +879,7 @@ static void bf16_mega_moe(
         post_expert_norm_gamma_opt, static_cast<float>(post_expert_norm_eps));
 }
 
+template <bool use_trtllm_weights>
 static void fp4_fp4_mega_moe(
     const torch::stable::Tensor& y,
     const torch::stable::Tensor& l1_weights_tuple,
@@ -887,7 +905,7 @@ static void fp4_fp4_mega_moe(
     const std::optional<torch::stable::Tensor>& a2_scales_opt,
     const std::optional<torch::stable::Tensor>& post_expert_norm_gamma_opt,
     const double& post_expert_norm_eps) {
-    mega::fp4_fp4_mega_moe(
+    mega::fp4_fp4_mega_moe<use_trtllm_weights>(
         y, {l1_weights_tuple, l1_weights_tuple_sf}, {l2_weights_tuple, l2_weights_tuple_sf},
         shared_l1_weights_opt, shared_l2_weights_opt, x_bf16_opt,
         cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs,
@@ -926,6 +944,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
     m.def("fp4_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
+    m.def("fp4_fp4_mega_moe_trtllm(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {
@@ -938,7 +957,8 @@ STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
 
     m.impl("fp8_fp4_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::fp8_fp4_mega_moe));
     m.impl("bf16_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::bf16_mega_moe));
-    m.impl("fp4_fp4_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::fp4_fp4_mega_moe));
+    m.impl("fp4_fp4_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::fp4_fp4_mega_moe<false>));
+    m.impl("fp4_fp4_mega_moe_trtllm", TORCH_BOX(&deep_gemm::torch_registration::fp4_fp4_mega_moe<true>));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {

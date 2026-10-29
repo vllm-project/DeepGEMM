@@ -86,6 +86,7 @@ template <
     // (post-expert norm). Moves the routing weight out of the L2
     // epilogue and into the combine, where the whole hidden row is available.
     bool kWithPostExpertNorm,
+    bool kUseTrtllmWeights = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -152,6 +153,10 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
     // NVFP4 layout checks: SF rows (per 16 elements) must stay TMA-aligned (16B)
     DG_STATIC_ASSERT(kHidden % 256 == 0 and kIntermediateHidden % 256 == 0, "Invalid hidden sizes for NVFP4");
+    DG_STATIC_ASSERT(not kUseTrtllmWeights or
+                     (kWithPostExpertNorm and not kHasShared and kNumSharedExperts == 0 and BLOCK_N == 128 and
+                      SF_BLOCK_N == 128 and BLOCK_K % 256 == 0),
+                     "TRT-LLM NVFP4 weights require post-expert norm, no shared experts, and supported tiles");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -909,6 +914,44 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
                 uint32_t sfb_k_idx = task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / (kGranK * 4));
 
+                // TRT layouts alias the canonical decode weights and scales.
+                if constexpr (kUseTrtllmWeights) {
+                    if (task_info.block_phase == sched::BlockPhase::Linear1) {
+                        if (cute::elect_one_sync())
+                            tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, uint8_t>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
+                    } else {
+                        #pragma unroll
+                        for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++atom) {
+                            if (cute::elect_one_sync())
+                                cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                    tensor_map_b_ptr,
+                                    reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]),
+                                    static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                    shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128,
+                                    k_idx + atom * 128, 0, 0, n_idx / 32);
+                        }
+                    }
+                    __syncwarp();
+                    if (cute::elect_one_sync()) {
+                        auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                        const auto hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                        const uint32_t sf_row_block = n_idx / 128;
+                        const uint32_t sf_k_chunk = k_block_idx * (BLOCK_K / 64);
+                        if (task_info.block_phase == sched::BlockPhase::Linear1)
+                            cute::SM100_TMA_2SM_LOAD_3D::copy(tensor_map_sfb_ptr, full, hint,
+                                shared_storage.smem_sfb[stage_idx], 0, sf_k_chunk, sf_row_block);
+                        else
+                            cute::SM100_TMA_2SM_LOAD_5D::copy(tensor_map_sfb_ptr, full, hint,
+                                shared_storage.smem_sfb[stage_idx], 0, 0, 0, sf_k_chunk, sf_row_block);
+                        if (is_leader_cta)
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                sizeof(SharedStorage::smem_b[0]) * 2 + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                        else
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                    }
+                } else {
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
                     if (task_info.is_shared()) {
@@ -935,6 +978,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
                     }
+                }
                 }
                 __syncwarp();
             }
@@ -1067,7 +1111,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                                 }
                                 #pragma unroll
                                 for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                                    auto smem_ptr = shared_storage.smem_sfb[stage_idx] + sf_group_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems;
+                                    auto smem_ptr = shared_storage.smem_sfb[stage_idx] + (kUseTrtllmWeights
+                                        ? i * (BLOCK_K / 64 * kNumUTCCPAlignedElems) + sf_group_idx * kNumUTCCPAlignedElems
+                                        : sf_group_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                     mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                                     cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                                 }
@@ -1337,8 +1383,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             // Apply the per-expert L1 scales before the non-linear activation
-                            auto bf16_gate = __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + 0], {l1_alpha.x, l1_alpha.x}));
-                            auto bf16_up =   __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + 1], {l1_alpha.y, l1_alpha.y}));
+                            auto bf16_gate = __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + (kUseTrtllmWeights ? 1 : 0)], {l1_alpha.x, l1_alpha.x}));
+                            auto bf16_up =   __float22bfloat162_rn(__fmul2_rn(fp32_values[k * 2 + (kUseTrtllmWeights ? 0 : 1)], {l1_alpha.y, l1_alpha.y}));
 
                             // Clamp
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
@@ -1418,6 +1464,17 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         const float2 scaled_k0 = __fmul2_rn(activation_values[i][0], sf_inv);
                         const float2 scaled_k1 = __fmul2_rn(activation_values[i][1], sf_inv);
 
+                        if constexpr (kUseTrtllmWeights) {
+                            // TRT's row shuffle puts even/odd output channels in
+                            // the two TMEM fragments held by the same lane.
+                            const uint32_t token_0 = i * ATOM_M + (lane_idx % 4) * 2;
+                            const uint32_t byte_in_row = warp_idx_in_wg * 8 + lane_idx / 4;
+                            auto* smem_base = shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx];
+                            smem_base[(token_0 + 0) * L1_OUT_BLOCK_N_BYTES + byte_in_row] =
+                                static_cast<uint8_t>(cvt_into_e2m1x2(scaled_k1.x, scaled_k0.x));
+                            smem_base[(token_0 + 1) * L1_OUT_BLOCK_N_BYTES + byte_in_row] =
+                                static_cast<uint8_t>(cvt_into_e2m1x2(scaled_k1.y, scaled_k0.y));
+                        } else {
                         // Exchange with the adjacent-channel lane
                         const float2 paired_k0 = {
                             __shfl_xor_sync(0xffffffff, scaled_k0.x, 4),
@@ -1446,6 +1503,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                                 static_cast<uint8_t>(cvt_into_e2m1x2(paired_k0.y, scaled_k0.y));
                             smem_base[(token_0 + 1) * L1_OUT_BLOCK_N_BYTES + byte_in_row_k1] =
                                 static_cast<uint8_t>(cvt_into_e2m1x2(paired_k1.y, scaled_k1.y));
+                        }
                         }
                         __syncwarp();
                     }

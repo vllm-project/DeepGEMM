@@ -14,6 +14,66 @@
 
 namespace deep_gemm {
 
+// TRT layout reader adapted from sgl-project/DeepGEMM cbe1727eacd9ad704795584ce1421dd1f5a8d67e.
+// MIT licensed; see the retained LICENSE.
+// Undo TRT's L2 shuffle: GMEM row 32*i3 + 8*i1 + i2 -> SMEM row 32*i3 + 4*i2 + i1.
+static CUtensorMap make_trtllm_fp4_l2_tma_desc(
+    const torch::stable::Tensor& weights, const int inner_bytes, const int rows) {
+    DG_HOST_ASSERT(weights.is_contiguous() and rows % 128 == 0);
+    DG_HOST_ASSERT(inner_bytes % 128 == 0);
+    CUtensorMap result;
+    const cuuint64_t dims[4] = {static_cast<cuuint64_t>(inner_bytes), 4, 8,
+                                static_cast<cuuint64_t>(rows / 32)};
+    const cuuint64_t strides[3] = {8ull * inner_bytes,
+                                   static_cast<cuuint64_t>(inner_bytes), 32ull * inner_bytes};
+    const cuuint32_t box[4] = {128, 4, 8, 4};
+    const cuuint32_t element_strides[4] = {1, 1, 1, 1};
+    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+        &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, weights.mutable_data_ptr(), dims,
+        strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return result;
+}
+
+// TRT SFs: [row block][k chunk][128 words]. L2 also undoes the 32-row shuffle.
+static CUtensorMap make_trtllm_fp4_sf_tma_desc(
+    const torch::stable::Tensor& sf, const bool& is_l1,
+    const int& num_row_blocks, const int& num_k_chunks,
+    const int& box_k_chunks, const int& box_row_blocks) {
+    DG_HOST_ASSERT(num_row_blocks > 0 and num_k_chunks > 0);
+    DG_HOST_ASSERT(box_k_chunks <= num_k_chunks and box_row_blocks <= num_row_blocks);
+    CUtensorMap result;
+    const auto row_block_stride = static_cast<cuuint64_t>(num_k_chunks) * 512ull;
+    const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
+    if (is_l1) {
+        const cuuint64_t dims[3] = {128, static_cast<cuuint64_t>(num_k_chunks),
+                                    static_cast<cuuint64_t>(num_row_blocks)};
+        const cuuint64_t strides[2] = {512ull, row_block_stride};
+        const cuuint32_t box[3] = {128, static_cast<cuuint32_t>(box_k_chunks),
+                                   static_cast<cuuint32_t>(box_row_blocks)};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 3, sf.mutable_data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    } else {
+        const cuuint64_t dims[5] = {4, 4, 8, static_cast<cuuint64_t>(num_k_chunks),
+                                    static_cast<cuuint64_t>(num_row_blocks)};
+        const cuuint64_t strides[4] = {128ull, 16ull, 512ull, row_block_stride};
+        const cuuint32_t box[5] = {4, 4, 8, static_cast<cuuint32_t>(box_k_chunks),
+                                   static_cast<cuuint32_t>(box_row_blocks)};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, sf.mutable_data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+    return result;
+}
+
+
+template <bool use_trtllm_weights>
 static void sm100_fp4_fp4_mega_moe(
     const torch::stable::Tensor& y,
     const torch::stable::Tensor& l1_acts, const torch::stable::Tensor& l1_acts_sf,
@@ -51,6 +111,14 @@ static void sm100_fp4_fp4_mega_moe(
         MmaKind::NVFP4);
     // The NVFP4 kernel has a single store block size for both layers
     DG_HOST_ASSERT(config.store_block_m_l1 == config.store_block_m_l2);
+    if constexpr (use_trtllm_weights) {
+        // The shuffled TMA boxes and L1 output packing below use exactly 128 rows.
+        DG_HOST_ASSERT(num_shared_experts == 0);
+        DG_HOST_ASSERT(config.block_n == 128 and config.load_block_n == 128 and
+                       config.sf_block_n == 128 and config.swizzle_weights_mode == 128 and
+                       config.block_k % 256 == 0 and
+                       "Unsupported tile configuration for TRT-LLM NVFP4 weight layout");
+    }
 
     // View all packed-FP4 tensors as raw bytes: TMA moves plain byte rows, so the
     // K dimensions below are all `elements / 2`
@@ -76,7 +144,9 @@ static void sm100_fp4_fp4_mega_moe(
                                                         block_k_bytes, config.load_block_n,
                                                         static_cast<int>(l1_weights_bytes.stride(-2)),
                                                         config.swizzle_weights_mode);
-    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
+    const auto tensor_map_l1_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+        l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
+        hidden / 64, sf_smem_outer_dim, config.block_n / 128) : make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
@@ -99,12 +169,15 @@ static void sm100_fp4_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
-    const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
+    const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
+        l2_weights_bytes, intermediate_hidden / 2, num_experts_per_rank * hidden) : make_tma_2d_desc(l2_weights_bytes,
                                                         intermediate_hidden / 2, num_experts_per_rank * hidden,
                                                         block_k_bytes, config.load_block_n,
                                                         static_cast<int>(l2_weights_bytes.stride(-2)),
                                                         config.swizzle_weights_mode);
-    const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
+    const auto tensor_map_l2_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+        l2_weights_sf, false, num_experts_per_rank * hidden / 128,
+        intermediate_hidden / 64, sf_smem_outer_dim, config.block_n / 128) : make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
@@ -176,6 +249,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -194,7 +268,8 @@ static void __instantiate_kernel() {{
         num_sms, num_ranks,
         to_string(activation_clamp),
         fast_math ? "true" : "false",
-        post_expert_norm_gamma != nullptr ? "true" : "false"));
+        post_expert_norm_gamma != nullptr ? "true" : "false",
+        use_trtllm_weights ? "true" : "false"));
 
     // Launch
     jit->launch(
