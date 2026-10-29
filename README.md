@@ -92,9 +92,10 @@ Take the non-paged version `fp8_fp4_mqa_logits` as an example. Its main inputs a
 
 - `q`, a `(q_data, q_sf)` tuple; SM100 accepts MXFP4/MXFP8 data with packed UE8M0 scales
 - `kv`, a `(kv_data, kv_sf)` tuple with shape `[seq_len_kv, head_dim]` logically
-- `weights`, tensor with shape `[seq_len, num_heads]` (BF16 on SM100)
+- `weights`, tensor with shape `[seq_len, num_heads]`; FP32 weights reduce in FP32, and SM100 also accepts BF16 weights, which reduce in BF16
 - `cu_seq_len_k_start` and `cu_seq_len_k_end`, int tensor with shape `[seq_len]`
 - `max_seqlen_k`, the maximum valid KV span of any query row
+- `logits_dtype`, the output dtype, `torch.float32` (default) or `torch.bfloat16`; BF16 weights require `torch.bfloat16`
 
 The output is compressed to `[seq_len, max_seqlen_k]`; row `i` stores its valid KV span starting at column zero.
 For each token `i` in `q`, it will iterate all tokens `j` from `[cu_seq_len_k_start[i], cu_seq_len_k_end[i])`,

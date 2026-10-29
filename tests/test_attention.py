@@ -27,7 +27,7 @@ def sample_mqa_cases(name: str, cases: List[tuple]) -> List[tuple]:
 
 
 def to_mqa_weights(weights: torch.Tensor) -> torch.Tensor:
-    # Rows are padded to 16 bytes for the TMA loads (BF16 on SM100, float on SM90)
+    # Rows are padded to 16 bytes for the TMA loads
     element_size = weights.element_size()
     stride = ceil_div(weights.size(1) * element_size, 16) * 16 // element_size
     storage = torch.empty((weights.size(0), stride), device=weights.device, dtype=weights.dtype)
@@ -40,14 +40,23 @@ def dtype_tag(dtype: torch.dtype) -> str:
     return 'BF16' if dtype == torch.bfloat16 else 'FP32'
 
 
-# SM100 takes MXFP4 / MXFP8 with BF16 weights and logits; SM90 takes E4M3 with one float scale per KV token, float
-# weights and float logits; SM120 takes MXFP4 or E4M3 with one float scale per KV token, float weights and float logits
+# SM100 takes MXFP4 / MXFP8; SM90 takes E4M3 with one float scale per KV token; SM120 takes MXFP4 or E4M3 with one
+# float scale per KV token
 def mqa_logits_formats():
     if get_arch_major() == 10:
-        return [(fmt, torch.bfloat16) for fmt in ('mxfp4', 'mxfp8')]
+        return ('mxfp4', 'mxfp8')
     if get_arch_major() == 12:
-        return [('mxfp4', torch.float), ('fp8', torch.float)]
-    return [('fp8', torch.float)]
+        return ('mxfp4', 'fp8')
+    return ('fp8', )
+
+
+# `(weights, logits)` dtypes: FP32 weights reduce in FP32 and emit either logits dtype; BF16 weights (SM100 only)
+# reduce in BF16 and emit BF16 logits
+def mqa_logits_dtypes():
+    dtypes = [(torch.float, torch.float), (torch.float, torch.bfloat16)]
+    if get_arch_major() == 10:
+        dtypes.append((torch.bfloat16, torch.bfloat16))
+    return dtypes
 
 
 def mqa_logits_heads(is_mxfp4: bool):
@@ -76,8 +85,8 @@ def quantize_mqa_q(q: torch.Tensor, fmt: str):
         q_simulated.view(q.shape)
 
 
-def mqa_logits_tolerances(fmt: str):
-    return (1e-3, 5e-6) if fmt == 'fp8' else (0.02, 3e-5)
+def mqa_logits_tolerances(fmt: str, has_bf16: bool):
+    return (1e-3, 3e-5 if has_bf16 else 5e-6) if fmt == 'fp8' else (0.02, 3e-5)
 
 
 def ref_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
@@ -126,24 +135,25 @@ def test_mqa_logits():
         return ks, ke
 
     def enumerate_mqa_logits():
-        for fmt, dtype in mqa_logits_formats():
+        for fmt in mqa_logits_formats():
             heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
-            for seq_len in (2048, 8192):
-                for seq_len_kv in (8192, 65536):
-                    for num_heads in heads:
-                        for head_dim in head_dims:
-                            for disable_cp in (False, True):
-                                if not disable_cp and (seq_len_kv % seq_len != 0 or seq_len % 2 != 0):
-                                    continue
-                                yield fmt, dtype, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
+            for weights_dtype, logits_dtype in mqa_logits_dtypes():
+                for seq_len in (2048, 8192):
+                    for seq_len_kv in (8192, 65536):
+                        for num_heads in heads:
+                            for head_dim in head_dims:
+                                for disable_cp in (False, True):
+                                    if not disable_cp and (seq_len_kv % seq_len != 0 or seq_len % 2 != 0):
+                                        continue
+                                    yield fmt, weights_dtype, logits_dtype, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
 
     print('Testing MQA Logits:')
 
-    for fmt, dtype, seq_len, seq_len_kv, num_heads, head_dim, disable_cp in sample_mqa_cases('prefill', list(enumerate_mqa_logits())):
+    for fmt, weights_dtype, logits_dtype, seq_len, seq_len_kv, num_heads, head_dim, disable_cp in sample_mqa_cases('prefill', list(enumerate_mqa_logits())):
         # Generate random inputs
         q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
         kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
-        weights = torch.randn(seq_len, num_heads, device='cuda', dtype=dtype)
+        weights = torch.randn(seq_len, num_heads, device='cuda', dtype=weights_dtype)
         kernel_weights = to_mqa_weights(weights)
         ks, ke = generate_ks_ke_tests(seq_len, seq_len_kv, disable_cp)
 
@@ -166,12 +176,12 @@ def test_mqa_logits():
         kernel_kwargs = dict(
             q=q_in, kv=kv_in, weights=kernel_weights,
             cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
-            max_seqlen_k=max_seqlen_k,
+            max_seqlen_k=max_seqlen_k, logits_dtype=logits_dtype,
         )
 
         # Run kernel
         logits = deep_gemm.fp8_fp4_mqa_logits(**kernel_kwargs)
-        assert logits.dtype == dtype
+        assert logits.dtype == logits_dtype
 
         self_mask = torch.arange(logits.size(1), device='cuda')[None, :] < (ke - ks)[:, None]
         masked_logits = logits.masked_fill(~self_mask, 0)
@@ -203,7 +213,7 @@ def test_mqa_logits():
         logits = logits.masked_fill(ref_neginf_mask, 0)
         diff = calc_diff(logits, ref_logits)
         simulated_diff = calc_diff(logits, simulated_logits)
-        diff_tol, simulated_diff_tol = mqa_logits_tolerances(fmt)
+        diff_tol, simulated_diff_tol = mqa_logits_tolerances(fmt, torch.bfloat16 in (weights_dtype, logits_dtype))
         assert diff < diff_tol, f"Diff: {diff}"
         assert simulated_diff < simulated_diff_tol, f"Simulated Diff: {simulated_diff}"
 
@@ -218,11 +228,11 @@ def test_mqa_logits():
                 ks, ke, seq_len_kv, num_heads), 'mqa_logits_metadata')
         reduce_relus = ref_cost * num_heads
         relu_per_sm_cycle = reduce_relus / (t * deep_gemm.get_num_sms() * 1.9 * 1e9)
-        print(f' > Fmt={fmt:5}, DType={dtype_tag(dtype):4}, '
+        print(f' > Fmt={fmt:5}, Weights={dtype_tag(weights_dtype):4}, Logits={dtype_tag(logits_dtype):4}, '
               f'SQ={seq_len:4}, SK={seq_len_kv:5}, H={num_heads:2}, D={head_dim:3}, CP={0 if disable_cp else 1}: '
               f'{tflops / t:4.0f} TFLOPS, {t * 1e6:4.0f} us '
               f'(scheduled {t_scheduled * 1e6:4.0f} us, build {t_build * 1e6:4.1f} us), '
-              f'{(count_bytes(q_in, kv_in, kernel_weights, ks, ke) + ref_cost * dtype.itemsize) / t / 1e9:4.0f} GB/s, '
+              f'{(count_bytes(q_in, kv_in, kernel_weights, ks, ke) + ref_cost * logits_dtype.itemsize) / t / 1e9:4.0f} GB/s, '
               f'{relu_per_sm_cycle:4.1f} relu/cyc/SM')
     print()
 
@@ -311,7 +321,7 @@ def test_paged_mqa_logits():
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_q_tokens = 16 * 1024
         for is_varlen in varlen_options:
-            for fmt, dtype in mqa_logits_formats():
+            for fmt in mqa_logits_formats():
                 heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
                 if arch_major == 10:
                     block_kvs = (64, 128, 32)
@@ -326,21 +336,22 @@ def test_paged_mqa_logits():
                 else:
                     # SM90 next_n=4 splits its Q rows across a two-CTA cluster; SM120 pads odd next_n >= 3
                     next_ns = (1, 2, 3, 4, 5, 6) if arch_major == 12 else (1, 2, 4)
-                for block_kv in block_kvs:
-                    for num_sequences in (64, 256, ):
-                        for max_tokens_per_batch in next_ns:
-                            for num_heads in heads:
-                                for head_dim in head_dims:
-                                    for avg_kv in (8192, 65536, 256 * 1024):
-                                        if num_sequences * avg_kv > max_kv_pool_tokens:
-                                            continue
-                                        if num_sequences * max_tokens_per_batch > max_q_tokens:
-                                            continue
-                                        yield is_varlen, fmt, dtype, block_kv, num_sequences, max_tokens_per_batch, num_heads, head_dim, avg_kv
+                for weights_dtype, logits_dtype in mqa_logits_dtypes():
+                    for block_kv in block_kvs:
+                        for num_sequences in (64, 256, ):
+                            for max_tokens_per_batch in next_ns:
+                                for num_heads in heads:
+                                    for head_dim in head_dims:
+                                        for avg_kv in (8192, 65536, 256 * 1024):
+                                            if num_sequences * avg_kv > max_kv_pool_tokens:
+                                                continue
+                                            if num_sequences * max_tokens_per_batch > max_q_tokens:
+                                                continue
+                                            yield is_varlen, fmt, weights_dtype, logits_dtype, block_kv, num_sequences, max_tokens_per_batch, num_heads, head_dim, avg_kv
 
     print('Testing Paged MQA Logits:')
 
-    for is_varlen, fmt, dtype, block_kv, num_sequences, max_tokens_per_batch, num_heads, head_dim, avg_kv in sample_mqa_cases('paged', list(enumerate_paged_mqa_logits())):
+    for is_varlen, fmt, weights_dtype, logits_dtype, block_kv, num_sequences, max_tokens_per_batch, num_heads, head_dim, avg_kv in sample_mqa_cases('paged', list(enumerate_paged_mqa_logits())):
         # Query layout: varlen rows `(num_q_tokens, 1)` or fixed `(num_sequences, next_n)`
         if is_varlen:
             tokens_per_seq = torch.randint(1, max_tokens_per_batch + 1, (num_sequences,), device='cuda', dtype=torch.int)
@@ -353,7 +364,7 @@ def test_paged_mqa_logits():
 
         # Generate random inputs
         q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-        weights = torch.randn((num_q_tokens, num_heads), device='cuda', dtype=dtype)
+        weights = torch.randn((num_q_tokens, num_heads), device='cuda', dtype=weights_dtype)
         kernel_weights = to_mqa_weights(weights)
         context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (num_sequences,), device='cuda', dtype=torch.int)
 
@@ -411,7 +422,7 @@ def test_paged_mqa_logits():
             q=q_in, kv_cache=kv_in, weights=kernel_weights,
             context_lens=context_lens_nextn, block_table=block_table,
             schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(**metadata_kwargs),
-            max_context_len=max_model_len,
+            max_context_len=max_model_len, logits_dtype=logits_dtype,
             indices=indices,
         )
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kernel_kwargs)
@@ -423,7 +434,7 @@ def test_paged_mqa_logits():
             assert_bitwise_equal(logits_again, masked_logits, 'paged mqa logits self-consistency')
 
         # Validation
-        assert logits.dtype == dtype
+        assert logits.dtype == logits_dtype
         logits = logits.to(torch.float)
 
         logits_masked = logits.masked_fill(ref_neginf_mask, 0)
@@ -431,7 +442,7 @@ def test_paged_mqa_logits():
         simulated_masked = simulated_logits.masked_fill(ref_neginf_mask, 0)
         diff = calc_diff(logits_masked, ref_masked)
         simulated_diff = calc_diff(logits_masked, simulated_masked)
-        diff_tol, simulated_diff_tol = mqa_logits_tolerances(fmt)
+        diff_tol, simulated_diff_tol = mqa_logits_tolerances(fmt, torch.bfloat16 in (weights_dtype, logits_dtype))
         assert diff < diff_tol, f"Diff: {diff}"
         assert simulated_diff < simulated_diff_tol, f"Simulated Diff: {simulated_diff}"
 
@@ -440,7 +451,7 @@ def test_paged_mqa_logits():
         tflops_calc = 2 * sum_lens * num_heads * head_dim / 1e12
         kv_bytes_per_token = head_dim / (2 if fmt == 'mxfp4' else 1) + 4
         # KV is read once per sequence; per-token sum_lens overcounts it.
-        total_bytes = q_weight_bytes + seq_sum_lens * kv_bytes_per_token + (sum_lens * dtype.itemsize)
+        total_bytes = q_weight_bytes + seq_sum_lens * kv_bytes_per_token + (sum_lens * logits_dtype.itemsize)
 
         metadata_t = bench_kineto(
             lambda: deep_gemm.get_paged_mqa_logits_metadata(**metadata_kwargs),
@@ -450,7 +461,7 @@ def test_paged_mqa_logits():
         reduce_relus = sum_lens * num_heads
         relu_per_sm_cycle = reduce_relus / (t * deep_gemm.get_num_sms() * 1.9 * 1e9)
         tokens_desc = f'MaxTPR={max_tokens_per_batch:2}' if is_varlen else f'NextN={next_n:2}'
-        print(f' > Fmt={fmt:5}, DType={dtype_tag(dtype):4}, '
+        print(f' > Fmt={fmt:5}, Weights={dtype_tag(weights_dtype):4}, Logits={dtype_tag(logits_dtype):4}, '
               f'PAGE_KV={block_kv:3}, BSZ={num_sequences:4}, {tokens_desc}, H={num_heads:2}, D={head_dim:3}, L={avg_kv:6}: '
               f'{tflops_calc / t:4.0f} TFLOPS, {t * 1e6:4.0f} us, Metadata={metadata_t * 1e6:4.0f} us, '
               f'{total_bytes / t / 1e9:4.0f} GB/s, {relu_per_sm_cycle:4.1f} relu/cyc/SM')
@@ -688,7 +699,7 @@ def test_sparse_mqa_logits() -> None:
                 q=q, kv_cache=kv_cache, weights=weights, context_lens=context_lens_2d, block_table=block_table,
                 schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(
                     context_lens_2d, page_kv, deep_gemm.get_num_sms(), indices),
-                max_context_len=max(context_lens), indices=indices)
+                max_context_len=max(context_lens), logits_dtype=torch.bfloat16, indices=indices)
             run_sparse = lambda: deep_gemm.fp8_fp4_paged_sparse_mqa_logits(**sparse_kwargs)
             run_full = lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**full_kwargs)
             sparse_kernel_name, full_kernel_name = 'sm100_paged_sparse_mqa_logits', 'paged_mqa_logits'
@@ -711,7 +722,7 @@ def test_sparse_mqa_logits() -> None:
             if use_unaligned_ks:
                 sparse_kwargs['use_unaligned_ks'] = True
             full_kwargs = dict(q=q, kv=kv, weights=weights, cu_seq_len_k_start=starts, cu_seq_len_k_end=ends,
-                               max_seqlen_k=num_kv_tokens)
+                               max_seqlen_k=num_kv_tokens, logits_dtype=torch.bfloat16)
             run_sparse = lambda: deep_gemm.fp8_fp4_sparse_mqa_logits(**sparse_kwargs)
             run_full = lambda: deep_gemm.fp8_fp4_mqa_logits(**full_kwargs)
             sparse_kernel_name, full_kernel_name = 'sm100_sparse_mqa_logits', 'mqa_logits'
