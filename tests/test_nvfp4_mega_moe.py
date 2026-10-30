@@ -41,6 +41,29 @@ def shared_sf_layout(sf, block_m, dst):
     dst[indices] = sf
 
 
+def check_l2_activation_scale_tensor(kernel, y, transformed, buf, kwargs, l2_alpha, expected, args):
+    """A device L2 activation scale matches the float one, and a CUDA graph
+    replay uses the value written to it after capture."""
+    kwargs = dict(kwargs, cumulative_local_expert_recv_stats=None)
+    scale = torch.full((1,), args.mid_scale, dtype=torch.float32, device='cuda')
+    kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=scale))
+    torch.testing.assert_close(y, expected, atol=0.03125, rtol=0.02)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=scale))
+    # Scale both together: a replay that kept the captured scale would double the output
+    scale.mul_(2)
+    l2_alpha.mul_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = y.clone()
+    kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=args.mid_scale * 2))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, y, atol=0.03125, rtol=0.02)
+    l2_alpha.div_(2)
+
+
 def quantize(x, mode, scale=1.0):
     if mode == 'nvfp4':
         return per_token_cast_to_nvfp4(x, scale)
@@ -249,6 +272,10 @@ def run(local_rank, local_world, args):
                     lambda: deep_gemm.fp8_fp4_mega_moe(y, *transformed, buf),
                     lambda: kernel(y, *transformed, buf, **dict(kwargs, l1_alpha=l1_alpha.double())),
                     lambda: kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=0.0)),
+                    lambda: kernel(y, *transformed, buf, **dict(
+                        kwargs, l2_activation_scale=torch.ones(1, dtype=torch.float64, device='cuda'))),
+                    lambda: kernel(y, *transformed, buf, **dict(
+                        kwargs, l2_activation_scale=torch.ones(2, dtype=torch.float32, device='cuda'))),
                 ]
                 # Prove that Python dispatches to its own native entry point,
                 # without a hidden dependency on the legacy FP8/FP4 binding.
@@ -298,6 +325,8 @@ def run(local_rank, local_world, args):
                 kernel(y, *transformed, buf, **dict(kwargs, l1_alpha=None, l2_alpha=None,
                                                    cumulative_local_expert_recv_stats=None))
                 torch.testing.assert_close(y, first, atol=0.03125, rtol=0.02)
+            if nv and m:
+                check_l2_activation_scale_tensor(kernel, y, transformed, buf, kwargs, l2_alpha, first, args)
                 assert torch.equal(stats, count.chunk(world)[rank] * 2)
         if args.benchmark:
             row.update(measure(fn, not args.warm_cache, args.repeats))

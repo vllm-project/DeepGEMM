@@ -89,7 +89,10 @@ The optional `l1_alpha` and `l2_alpha` are contiguous CUDA float32 vectors,
 one entry per local expert, containing activation-global × weight-global
 dequantization scales for each GEMM. They multiply FP32 accumulators before
 BF16 rounding. `l2_activation_scale` controls the fused intermediate quantizer
-and must also be included in `l2_alpha`. All default to one. Input global
+and must also be included in `l2_alpha`. All default to one.
+`l2_activation_scale` may also be a one-element CUDA float32 tensor; the kernel
+reads it at launch, so a CUDA graph captured once sees later in-place updates
+(for example, a weight update that changes the down-projection input scale). Input global
 scaling must be consistent across ranks when using per-expert L1 products.
 
 `per_token_cast_to_nvfp4` and `cast_back_from_nvfp4` are PyTorch reference

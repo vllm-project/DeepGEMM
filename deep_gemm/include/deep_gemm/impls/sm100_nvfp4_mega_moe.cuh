@@ -69,7 +69,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const float* l1_alpha,
                             const float* l2_alpha,
-                            const float l2_activation_scale,
+                            const float* l2_activation_scale_ptr,
+                            const float l2_activation_scale_value,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
@@ -1191,6 +1192,9 @@ sm100_nvfp4_mega_moe_impl(void* y,
         const auto epilogue_wg_idx = epilogue_warp_idx / 4;
         const auto epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
         const auto warp_idx_in_wg = epilogue_warp_idx % 4;
+        // A device scale is read at launch, so a CUDA graph replay sees its current value
+        const float l2_activation_scale =
+            l2_activation_scale_ptr == nullptr ? l2_activation_scale_value : *l2_activation_scale_ptr;
         DG_STATIC_ASSERT((kNumDispatchWarps + kNumMMANonEpilogueWarps) % 4 == 0 and
                          kNumEpilogueWarps % 4 == 0, "Invalid epilogue warps");
 

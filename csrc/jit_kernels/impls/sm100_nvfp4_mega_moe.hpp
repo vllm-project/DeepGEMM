@@ -41,6 +41,7 @@ static void sm100_nvfp4_mega_moe(
     const std::optional<torch::stable::Tensor>& l1_alpha,
     const std::optional<torch::stable::Tensor>& l2_alpha,
     const float& l2_activation_scale,
+    const std::optional<torch::stable::Tensor>& l2_activation_scale_tensor,
     const bool& use_x_scales
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -241,6 +242,7 @@ static void __instantiate_kernel() {{
         cumulative_local_expert_recv_stats_ptr,
         l1_alpha.has_value() ? l1_alpha->const_data_ptr<float>() : nullptr,
         l2_alpha.has_value() ? l2_alpha->const_data_ptr<float>() : nullptr,
+        l2_activation_scale_tensor.has_value() ? l2_activation_scale_tensor->const_data_ptr<float>() : nullptr,
         l2_activation_scale,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
