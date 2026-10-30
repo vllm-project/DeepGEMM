@@ -181,6 +181,31 @@ def relayout_fp4_weights_for_sm90_mega_moe(w: torch.Tensor) -> torch.Tensor:
     return words.transpose(-3, -2).flatten(-4).contiguous().view(torch.int8)
 
 
+def clamp_fp4_exponent_span_for_sm90_mega_moe(w: torch.Tensor, sf: torch.Tensor,
+                                              max_span: int = 11) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Raise nonzero 32-element groups more than `max_span` exponents below their row maximum to that span,
+    # re-rounding their FP4 codes to nearest even; `w` is packed, not relayouted
+    assert w.dtype == torch.int8 and sf.dtype == torch.int and w.shape[-1] == sf.shape[-1] * 64
+    exps = torch.stack([(sf >> (8 * i)) & 0xff for i in range(4)], dim=-1).flatten(-2)
+    codes = w.view(torch.uint8).unflatten(-1, (-1, 16))
+    is_nonzero = (codes & 0x77).amax(dim=-1) != 0
+    max_exps = torch.where(is_nonzero, exps, 0).amax(dim=-1, keepdim=True)
+    shifts = torch.where(is_nonzero, (max_exps - max_span - exps).clamp(min=0), 0)
+    if not bool((shifts > 0).any()):
+        return w, sf
+    # `_REROUND[d][c]`: E2M1 magnitude code `c` times `2 ^ -d`, rounded to nearest even (all zero from `d = 5`)
+    table = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7], [0, 0, 1, 2, 2, 3, 4, 5], [0, 0, 0, 1, 1, 2, 2, 3],
+                          [0, 0, 0, 0, 0, 1, 1, 2], [0, 0, 0, 0, 0, 0, 0, 1], [0] * 8], dtype=torch.uint8, device=w.device)
+    d = shifts.clamp(max=5).to(torch.long)[..., None]
+    rerounded = []
+    for nibble in (codes & 0xf, codes >> 4):
+        mag = table[d, (nibble & 0x7).to(torch.long)]
+        rerounded.append(torch.where(mag != 0, mag | (nibble & 0x8), 0))
+    new_w = (rerounded[0] | (rerounded[1] << 4)).flatten(-2).view(torch.int8)
+    new_exps = (exps + shifts).to(torch.uint8).unflatten(-1, (-1, 4)).contiguous().view(torch.int).squeeze(-1)
+    return new_w, sf.clone().copy_(new_exps)
+
+
 def transform_fp4_sf_for_sm90_mega_moe(sf: torch.Tensor, w: Optional[torch.Tensor] = None) -> torch.Tensor:
     # Per row, the base `max(e) - 6` in bits 7..0 of every SF word, and the 4 per-32 table shifts `e - base + 5` in bits 31..16
     # All-zero groups of `w` (packed) or, without `w`, all-zero SF words are exempt; rows with a maximum below 7 get a zero scale
@@ -228,6 +253,7 @@ def transform_weights_for_mega_moe(
         if l1_weights[0].dtype == torch.float8_e4m3fn:
             l1_weights, l2_weights = (requantize_fp8_weights_for_sm90_mega_moe(w) for w in (l1_weights, l2_weights))
         else:
+            l1_weights, l2_weights = (clamp_fp4_exponent_span_for_sm90_mega_moe(*w) for w in (l1_weights, l2_weights))
             l1_weights, l2_weights = ((relayout_fp4_weights_for_sm90_mega_moe(w), transform_fp4_sf_for_sm90_mega_moe(sf, w))
                                       for w, sf in (l1_weights, l2_weights))
     if isinstance(l1_weights, tuple):

@@ -238,6 +238,9 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
             torch::headeronly::ScalarType::Float8_e4m3fn : torch::headeronly::ScalarType::BFloat16;
         const int64_t hidden_cols = is_fp4 ? layout_info.hidden / 2 : layout_info.hidden;
         const int64_t intermediate_cols = is_fp4 ? layout_info.intermediate_hidden / 2 : layout_info.intermediate_hidden;
+        // SM90 activation SF are FP32 scales per 128 K, SM100 ones words of 4 UE8M0 (or E4M3) scales
+        const auto act_sf_dtype = (jit->device.get_arch_major() == 9 and not is_fp4) ?
+            torch::headeronly::ScalarType::Float : torch::headeronly::ScalarType::Int;
         const int64_t sf_gran_k = get_mma_sf_gran_k(layout_info.mma_kind);
         const int64_t hidden_sf_cols = layout_info.hidden / (sf_gran_k * 4);
         const int64_t intermediate_sf_cols = layout_info.intermediate_hidden / (sf_gran_k * 4);
@@ -249,7 +252,7 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
         auto x_sf = layout_info.with_sf ? torch_compat::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.input_sf_base),
             {layout_info.num_max_tokens_per_rank, hidden_sf_cols},
-            buffer.device(), torch::headeronly::ScalarType::Int) : torch::stable::Tensor();
+            buffer.device(), act_sf_dtype) : torch::stable::Tensor();
         auto topk_idx = torch_compat::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.input_topk_idx_base),
             {layout_info.num_max_tokens_per_rank, layout_info.num_topk},
@@ -264,7 +267,7 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.shared_l1_sf_base),
             {layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.hidden / 128},
             {1, layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)},
-            buffer.device(), torch::headeronly::ScalarType::Int) : torch::stable::Tensor();
+            buffer.device(), act_sf_dtype) : torch::stable::Tensor();
         auto shared_l2_acts = layout_info.num_shared_experts > 0 ? torch_compat::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.shared_l2_token_base),
             {layout_info.num_max_tokens_per_rank, layout_info.shared_intermediate_hidden},
@@ -273,7 +276,7 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.shared_l2_sf_base),
             {layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.shared_intermediate_hidden / 128},
             {1, layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)},
-            buffer.device(), torch::headeronly::ScalarType::Int) : torch::stable::Tensor();
+            buffer.device(), act_sf_dtype) : torch::stable::Tensor();
 
         auto l1_acts = torch_compat::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.l1_token_base),
@@ -283,7 +286,7 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.l1_sf_base),
             {layout_info.num_sf_ring_tokens, hidden_sf_cols},
             {1, layout_info.num_sf_ring_tokens},
-            buffer.device(), torch::headeronly::ScalarType::Int) : torch::stable::Tensor();
+            buffer.device(), act_sf_dtype) : torch::stable::Tensor();
         auto l2_acts = torch_compat::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.l2_token_base),
             {layout_info.num_ring_tokens, intermediate_cols},
@@ -292,7 +295,7 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.l2_sf_base),
             {layout_info.num_sf_ring_tokens, intermediate_sf_cols},
             {1, layout_info.num_sf_ring_tokens},
-            buffer.device(), torch::headeronly::ScalarType::Int) : torch::stable::Tensor();
+            buffer.device(), act_sf_dtype) : torch::stable::Tensor();
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
                                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);

@@ -213,6 +213,7 @@ _SWEEP_CASES = (
     (7, 7168, 2304, 8, 6, 0, 10, 'random', dict(weight_exp_span=9)),
     (8192, 4096, 2304, 65, 6, 1, 10, 'random', dict(weight_exp_span=10)),
     (1000, 2048, 128, 48, 6, 2, None, 'hot', dict(weight_exp_span=11)),
+    (1000, 4096, 256, 8, 6, 1, 10, 'random', dict(weight_exp_span=14)),
     (128, 4096, 1536, 8, 6, 1, None, 'random', dict(weight_exp_shift=120)),
     (1000, 2048, 2304, 48, 6, 1, None, 'masked', dict(weight_exp_shift=120, weight_exp_span=8)),
     (128, 7168, 256, 8, 6, 1, None, 'random', dict(weight_exp_shift=-105)),
@@ -431,7 +432,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 if use_ue8m0:
                     x_scales = _exp2(x_exps)
             # SM90 SF words hold the FP32 scales, SM100 ones the UE8M0 exponents of 4 groups
-            x_sf = x_scales.contiguous().view(torch.int) if arch_major == 9 else x_exps.to(torch.uint8).view(torch.int)
+            x_sf = x_scales.contiguous() if arch_major == 9 else x_exps.to(torch.uint8).view(torch.int)
             ref_x = (x_fp8, x_scales)
             x = (x_fp8, x_sf)
             shared_x = (x_fp8, _to_mn_major_sf(x_sf))
@@ -751,7 +752,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             dist_print(f' > Accuracy (rank {rank_idx}): calc_diff={diff:.3e}, max_token_diff={max_token_diff:.3e}, hi_diff={hi_diff:.3e}')
             if is_exact_inputs:
                 assert torch.equal(fused_y, ref_y), f'calc_diff={diff}'
-            # SM90 WGMMA accumulation is not bit-equal to FP32, so random inputs get a looser tolerance
+            # Hopper FP8 WGMMA accumulates with less than FP32 precision, so random inputs get a looser tolerance
             max_diff, max_token_diff_limit = (1e-4, 1e-2) if arch_major == 9 else (1e-5, 1e-4)
             assert diff < max_diff and max_token_diff < max_token_diff_limit and hi_diff < 2e-3, \
                 f'calc_diff={diff}, max_token_diff={max_token_diff}, hi_diff={hi_diff}'
