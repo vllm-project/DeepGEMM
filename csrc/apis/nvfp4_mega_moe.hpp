@@ -283,7 +283,7 @@ static void nvfp4_mega_moe(
     const float& activation_beta,
     const std::optional<torch::stable::Tensor>& l1_alpha_opt,
     const std::optional<torch::stable::Tensor>& l2_alpha_opt,
-    const float& l2_activation_scale,
+    const std::optional<torch::stable::Tensor>& l2_activation_scale,
     const bool& use_x_scales,
     const std::string& activation
 ) {
@@ -292,7 +292,6 @@ static void nvfp4_mega_moe(
 
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
-    DG_HOST_ASSERT(std::isfinite(l2_activation_scale) and l2_activation_scale > 0);
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // Activation checks
@@ -333,6 +332,11 @@ static void nvfp4_mega_moe(
             DG_HOST_ASSERT(alpha->dim() == 1 and alpha->numel() == num_experts_per_rank);
             DG_HOST_ASSERT(alpha->device() == y.device());
         }
+    }
+    if (l2_activation_scale.has_value()) {
+        DG_HOST_ASSERT(l2_activation_scale->scalar_type() == torch::headeronly::ScalarType::Float);
+        DG_HOST_ASSERT(l2_activation_scale->numel() == 1);
+        DG_HOST_ASSERT(l2_activation_scale->device() == y.device());
     }
 
     // Packed E4M3 block-scale bytes, MN-major and TMA aligned.
@@ -484,7 +488,8 @@ static void nvfp4_mega_moe(
     double activation_alpha, double activation_beta,
     const std::optional<torch::stable::Tensor>& l1_alpha,
     const std::optional<torch::stable::Tensor>& l2_alpha,
-    double l2_activation_scale, bool use_x_scales, const std::string& activation) {
+    const std::optional<torch::stable::Tensor>& l2_activation_scale,
+    bool use_x_scales, const std::string& activation) {
     DG_HOST_ASSERT(shared_l1_weights.has_value() == shared_l2_weights.has_value());
     std::optional<std::tuple<torch::stable::Tensor, std::optional<torch::stable::Tensor>>> shared_l1;
     std::optional<std::tuple<torch::stable::Tensor, std::optional<torch::stable::Tensor>>> shared_l2;
@@ -504,7 +509,7 @@ static void nvfp4_mega_moe(
             : std::nullopt,
         fast_math, static_cast<float>(activation_alpha),
         static_cast<float>(activation_beta), l1_alpha, l2_alpha,
-        static_cast<float>(l2_activation_scale), use_x_scales, activation);
+        l2_activation_scale, use_x_scales, activation);
 }
 
 } // namespace deep_gemm::torch_registration
@@ -514,7 +519,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("get_block_m_for_nvfp4_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_tokens, int num_topk) -> int");
     m.def("get_symm_buffer_size_for_nvfp4_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, int num_shared_experts=0, bool shared_bf16=False) -> (int, int[])");
     m.def("_slice_symm_buffer_for_nvfp4_mega_moe(Tensor(a) buffer, int[] layout_info) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
-    m.def("nvfp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? l1_alpha=None, Tensor? l2_alpha=None, float l2_activation_scale=1.0, bool use_x_scales=False, str activation='swiglu') -> ()");
+    m.def("nvfp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? l1_alpha=None, Tensor? l2_alpha=None, Tensor? l2_activation_scale=None, bool use_x_scales=False, str activation='swiglu') -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {

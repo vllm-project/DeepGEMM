@@ -41,6 +41,26 @@ def shared_sf_layout(sf, block_m, dst):
     dst[indices] = sf
 
 
+def check_graph_replay_reads_scales(kernel, y, transformed, buf, kwargs):
+    """A CUDA graph replay uses the L2 scales written after capture."""
+    kwargs = dict(kwargs, cumulative_local_expert_recv_stats=None)
+    scale, l2_alpha = kwargs['l2_activation_scale'], kwargs['l2_alpha']
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernel(y, *transformed, buf, **kwargs)
+    # Scale both together: a replay that kept the captured scale would double the output
+    scale.mul_(2)
+    l2_alpha.mul_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = y.clone()
+    kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=scale.clone(), l2_alpha=l2_alpha.clone()))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, y, atol=0.03125, rtol=0.02)
+    scale.div_(2)
+    l2_alpha.div_(2)
+
+
 def quantize(x, mode, scale=1.0):
     if mode == 'nvfp4':
         return per_token_cast_to_nvfp4(x, scale)
@@ -227,7 +247,8 @@ def run(local_rank, local_world, args):
                       activation=args.activation, activation_clamp=args.clamp, activation_alpha=args.alpha, activation_beta=args.beta,
                       fast_math=not args.exact_math)
         if nv:
-            kwargs.update(l1_alpha=l1_alpha, l2_alpha=l2_alpha, l2_activation_scale=args.mid_scale,
+            mid_scale = torch.full((1,), args.mid_scale, dtype=torch.float32, device='cuda')
+            kwargs.update(l1_alpha=l1_alpha, l2_alpha=l2_alpha, l2_activation_scale=mid_scale,
                           use_x_scales=args.x_scales)
         kernel = deep_gemm.nvfp4_mega_moe if nv else deep_gemm.fp8_fp4_mega_moe
         fn = lambda: kernel(y, *transformed, buf, **kwargs)
@@ -248,7 +269,9 @@ def run(local_rank, local_world, args):
                     lambda: kernel(y[:, :-1], *transformed, buf, **kwargs),
                     lambda: deep_gemm.fp8_fp4_mega_moe(y, *transformed, buf),
                     lambda: kernel(y, *transformed, buf, **dict(kwargs, l1_alpha=l1_alpha.double())),
-                    lambda: kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=0.0)),
+                    lambda: kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=args.mid_scale)),
+                    lambda: kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=mid_scale.double())),
+                    lambda: kernel(y, *transformed, buf, **dict(kwargs, l2_activation_scale=mid_scale.repeat(2))),
                 ]
                 # Prove that Python dispatches to its own native entry point,
                 # without a hidden dependency on the legacy FP8/FP4 binding.
@@ -295,9 +318,11 @@ def run(local_rank, local_world, args):
             assert torch.equal(stats, count.chunk(world)[rank] * 2)
             torch.testing.assert_close(y, first, atol=0.03125, rtol=0.02)
             if nv and args.input_scale == args.weight_scale == args.mid_scale == 1.0:
-                kernel(y, *transformed, buf, **dict(kwargs, l1_alpha=None, l2_alpha=None,
+                kernel(y, *transformed, buf, **dict(kwargs, l1_alpha=None, l2_alpha=None, l2_activation_scale=None,
                                                    cumulative_local_expert_recv_stats=None))
                 torch.testing.assert_close(y, first, atol=0.03125, rtol=0.02)
+            if nv and m:
+                check_graph_replay_reads_scales(kernel, y, transformed, buf, kwargs)
                 assert torch.equal(stats, count.chunk(world)[rank] * 2)
         if args.benchmark:
             row.update(measure(fn, not args.warm_cache, args.repeats))
