@@ -92,7 +92,7 @@ def nvfp4_mega_moe(y: torch.Tensor,
                   activation_beta: float = 0.0,
                   l1_alpha: Optional[torch.Tensor] = None,
                   l2_alpha: Optional[torch.Tensor] = None,
-                  l2_activation_scale: Union[float, torch.Tensor] = 1.0,
+                  l2_activation_scale: Optional[torch.Tensor] = None,
                   use_x_scales: bool = False,
                   activation: str = 'swiglu'):
     """Fused NVFP4 routed experts and MXFP8 or BF16 shared experts (SM100/SM103).
@@ -107,11 +107,10 @@ def nvfp4_mega_moe(y: torch.Tensor,
     Optional CUDA float32 vectors ``l1_alpha`` and ``l2_alpha`` (one entry per
     local expert) multiply GEMM accumulators before BF16 rounding. They contain
     the products of activation and weight global dequantization scales.
-    ``l2_activation_scale`` is the positive global dequantization scale used
-    when quantizing routed SwiGLU outputs; include it in ``l2_alpha``. It may be
-    a one-element CUDA float32 tensor, which the kernel reads at launch, so a
-    CUDA graph replay sees values written to it after capture (as it does for
-    ``l1_alpha`` and ``l2_alpha``); a float is fixed into the launch.
+    ``l2_activation_scale`` is an optional one-element CUDA float32 tensor holding
+    the positive global dequantization scale used when quantizing routed SwiGLU
+    outputs; include it in ``l2_alpha``. Like ``l1_alpha`` and ``l2_alpha``, it is
+    read at launch, so a CUDA graph replay sees values written after capture.
     ``activation='swiglustep'`` clips the gate after SiLU and supports routed
     experts only, with alpha=1 and beta=0. The default clips before SiLU.
     Defaults use unit global scales. The routed L2 input is the unweighted
@@ -128,6 +127,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
         assert activation_alpha == 1.0 and activation_beta == 0.0
         assert sym_buffer.num_shared_experts == 0, 'swiglustep supports routed experts only'
     assert isinstance(sym_buffer, NVFP4SymmBuffer), 'NVFP4 requires NVFP4SymmBuffer'
+    assert l2_activation_scale is None or isinstance(l2_activation_scale, torch.Tensor), \
+        'l2_activation_scale must be a one-element CUDA float32 tensor'
     assert (shared_l1_weights is not None) == (sym_buffer.num_shared_experts > 0)
     assert (shared_l2_weights is not None) == (sym_buffer.num_shared_experts > 0)
     if isinstance(shared_l1_weights, torch.Tensor):
@@ -139,8 +140,6 @@ def nvfp4_mega_moe(y: torch.Tensor,
         assert shared_l1_weights[0].dtype == shared_l2_weights[0].dtype == sym_buffer.shared_dtype
         assert shared_l2_weights[0].shape == (sym_buffer.hidden,
                                              sym_buffer.intermediate_hidden * sym_buffer.num_shared_experts)
-    l2_scale_tensor = l2_activation_scale if isinstance(l2_activation_scale, torch.Tensor) else None
-    l2_scale_value = 1.0 if l2_scale_tensor is not None else l2_activation_scale
     _C.nvfp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -152,5 +151,5 @@ def nvfp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         activation_clamp, fast_math,
         activation_alpha, activation_beta,
-        l1_alpha, l2_alpha, l2_scale_value, use_x_scales, activation, l2_scale_tensor
+        l1_alpha, l2_alpha, l2_activation_scale, use_x_scales, activation
     )
