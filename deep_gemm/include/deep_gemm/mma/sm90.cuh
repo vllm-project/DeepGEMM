@@ -75,6 +75,43 @@ struct FP8MMASelector {
 };
 
 template <int N_, typename MMA>
+struct FP8MMARS {
+    template <size_t ...Idx>
+    CUTLASS_DEVICE static void call_fma_impl(const uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(a[0], a[1], a[2], a[3], desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    CUTLASS_DEVICE static void wgmma(const uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d) {
+        call_fma_impl(a, desc_b, d, scale_d, cute::make_index_sequence<N_ / 2>{});
+    }
+
+    static constexpr int M = 64;
+    static constexpr int N = N_;
+    static constexpr int K = 32;
+    static constexpr int kNumAccum = M * N / 128;
+};
+
+template <int N>
+struct FP8MMARSSelector {
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 16) return MMA_64x16x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 32) return MMA_64x32x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 64) return MMA_64x64x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 128) return MMA_64x128x32_F32E4M3E4M3_RS_TN();
+        DG_STATIC_ASSERT(N == 8 or N == 16 or N == 32 or N == 64 or N == 128, "Invalid N");
+    }
+
+    static constexpr auto select_type() {
+        return FP8MMARS<N, decltype(select_mma())>();
+    }
+
+    using type = decltype(select_type());
+};
+
+template <int N_, typename MMA>
 struct BF16MMA {
     template <size_t ...Idx>
     CUTLASS_DEVICE static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {

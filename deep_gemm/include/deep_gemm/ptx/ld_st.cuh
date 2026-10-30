@@ -111,6 +111,14 @@ CUTLASS_DEVICE void fence_acq_rel_cta() {
     asm volatile("fence.acq_rel.cta;" ::: "memory");
 }
 
+CUTLASS_DEVICE void fence_acq_rel_cluster() {
+    asm volatile("fence.acq_rel.cluster;" ::: "memory");
+}
+
+CUTLASS_DEVICE void fence_proxy_async_global() {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 /// Shared memory
 CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
     uint32_t ret;
@@ -139,6 +147,19 @@ CUTLASS_DEVICE uint4 ld_shared(const uint4* ptr) {
 CUTLASS_DEVICE float ld_shared(const float* ptr) {
     float ret;
     asm volatile("ld.shared.f32 %0, [%1];" : "=f"(ret) : "l"(__cvta_generic_to_shared(ptr)));
+    return ret;
+}
+
+// From a 32-bit shared memory address
+CUTLASS_DEVICE uint32_t ld_shared_u32(const uint32_t& smem_addr) {
+    uint32_t ret;
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(ret) : "r"(smem_addr));
+    return ret;
+}
+
+CUTLASS_DEVICE uint4 ld_shared_u32x4(const uint32_t& smem_addr) {
+    uint4 ret;
+    asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "r"(smem_addr));
     return ret;
 }
 

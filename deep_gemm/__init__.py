@@ -89,6 +89,10 @@ from ._C import (
 from .mega import (
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
+    requantize_fp8_weights_for_sm90_mega_moe,
+    relayout_fp4_weights_for_sm90_mega_moe,
+    clamp_fp4_exponent_span_for_sm90_mega_moe,
+    transform_fp4_sf_for_sm90_mega_moe,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
     fp4_fp4_mega_moe,

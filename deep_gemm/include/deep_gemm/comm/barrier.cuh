@@ -17,7 +17,9 @@ CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_
     const auto start_clock = clock64();
     while (not pred()) {
         if (clock64() - start_clock >= kNumTimeoutCycles) {
+#ifndef DG_NO_DEVICE_PRINTF
             print_timeout();
+#endif
             DG_DEVICE_ASSERT(false and "Timeout");
         }
     }

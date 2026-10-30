@@ -173,6 +173,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumRingBlocks, uint32_t kNumLocalityDomains,
           uint32_t kNumSharedExperts = 0,
           bool kDecodeShaped = false,
+          bool kPingPong = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -204,6 +205,8 @@ struct MegaMoEScheduler {
     const layout::Workspace& workspace;
 
     // Scheduler configs
+    // NOTES: with ping-pong, each math warpgroup (and its TMA producer warp) consumes only its own schedule stage,
+    // the scheduler publishes into whichever stage is released first, and `sched_phase` holds one phase bit per stage
     static constexpr uint32_t kNumScheduleStages = 2;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     uint32_t sched_stage_idx = 0;
@@ -240,14 +243,38 @@ struct MegaMoEScheduler {
         task_info_empty_barriers(task_info_empty_barriers),
         task_infos(task_infos) {}
 
+    CUTLASS_DEVICE uint32_t get_sched_phase() const {
+        return kPingPong ? (sched_phase >> sched_stage_idx) & 1 : sched_phase;
+    }
+
     CUTLASS_DEVICE void advance_sched_pipeline() {
         DG_STATIC_ASSERT(kNumScheduleStages == 2, "Invalid stages");
-        sched_stage_idx ^= 1;
-        sched_phase ^= sched_stage_idx == 0;
+        if constexpr (kPingPong) {
+            sched_phase ^= 1u << sched_stage_idx;
+        } else {
+            sched_stage_idx ^= 1;
+            sched_phase ^= sched_stage_idx == 0;
+        }
+    }
+
+    // Ping-pong consumers only read the schedule stage of their math warpgroup
+    CUTLASS_DEVICE void bind_to_sched_stage(const uint32_t& stage_idx) {
+        sched_stage_idx = stage_idx;
+    }
+
+    // Wait for an empty schedule stage: the next one in order, or with ping-pong the first released one
+    CUTLASS_DEVICE void wait_empty_sched_stage() {
+        if constexpr (kPingPong) {
+            // Probe the other stage first, and choose with lane 0's observation so that the warp agrees
+            do {
+                sched_stage_idx ^= 1;
+            } while (not __shfl_sync(0xffffffff, task_info_empty_barriers[sched_stage_idx].test_wait(get_sched_phase() ^ 1), 0));
+        }
+        task_info_empty_barriers[sched_stage_idx].wait(get_sched_phase() ^ 1);
     }
 
     CUTLASS_DEVICE bool get_next_task(task_info_t& task_info) {
-        task_info_full_barriers[sched_stage_idx].wait(sched_phase);
+        task_info_full_barriers[sched_stage_idx].wait(get_sched_phase());
         task_info = task_infos[sched_stage_idx];
         advance_sched_pipeline();
         return task_info.is_valid();
@@ -256,7 +283,7 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE void release_task_info() const {
         // Complete metadata reads before the scheduler can overwrite this slot.
         ptx::fence_acq_rel_cta();
-        task_info_empty_barriers[sched_stage_idx ^ 1].arrive(0u);
+        task_info_empty_barriers[kPingPong ? sched_stage_idx : sched_stage_idx ^ 1].arrive(0u);
     }
 
     CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
@@ -435,7 +462,7 @@ struct MegaMoEScheduler {
         const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
         uint32_t m_block_idx, n_cluster_idx;
         while (true) {
-            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            wait_empty_sched_stage();
 
             // Use dynamic scheduling to reduce tailing across shared L1/L2 tile shapes.
             if (not get_next_task_idx<kNumNClusters>(task_count_ptr, num_m_blocks, m_block_idx, n_cluster_idx))
@@ -469,7 +496,7 @@ struct MegaMoEScheduler {
         // schedule slot is released by consumers.
         task_info_t task_info;
         do {
-            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            wait_empty_sched_stage();
             task_info = get_next_task();
             if (task_info.is_valid()) publish_task(task_info, lane_idx);
         } while (task_info.is_valid());
@@ -480,9 +507,14 @@ struct MegaMoEScheduler {
                     num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }
 
-        // Sentinel.
-        task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
-        publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
+        // Sentinel, into every schedule stage with ping-pong
+        #pragma unroll
+        for (uint32_t i = 0; i < (kPingPong ? kNumScheduleStages : 1); ++ i) {
+            if constexpr (kPingPong)
+                sched_stage_idx = i;
+            task_info_empty_barriers[sched_stage_idx].wait(get_sched_phase() ^ 1);
+            publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
+        }
     }
 };
 
