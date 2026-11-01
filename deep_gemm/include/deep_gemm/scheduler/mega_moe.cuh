@@ -217,6 +217,9 @@ struct MegaMoEScheduler {
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
 
+    // Pool block offset of each cached expert (same layout), computed once per call instead of in every `create_task`
+    uint32_t stored_pool_block_offsets[kNumExpertsPerLane] = {};
+
     // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
     static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
     uint32_t num_sched_l1_waves = 0;
@@ -307,6 +310,18 @@ struct MegaMoEScheduler {
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
     }
 
+    CUTLASS_DEVICE void store_pool_block_offsets() {
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        uint32_t block_offset = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const uint32_t num_m_blocks = math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+            const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
+            stored_pool_block_offsets[i] = block_offset + inclusive_num_m_blocks - num_m_blocks;
+            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
+        }
+    }
+
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
                                         const uint32_t& m_block_idx,
                                         const uint32_t& n_cluster_idx,
@@ -315,20 +330,18 @@ struct MegaMoEScheduler {
         const uint32_t lane_idx = ptx::get_lane_idx();
 
         task_info_t result(block_phase, 0, 0, n_cluster_idx, m_block_idx, 0, shape_n, shape_k);
-        uint32_t block_offset = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             // Reduce whether task fall in the expert
             const uint32_t expert_idx = i * 32 + lane_idx;
             const uint32_t num_tokens = stored_num_tokens_per_expert[i];
             const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
-            const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
-            const uint32_t lane_pool_block_offset = block_offset + inclusive_num_m_blocks - num_m_blocks;
+            const uint32_t lane_pool_block_offset = stored_pool_block_offsets[i];
             const bool is_owner = expert_idx < kNumExpertsPerRank and
                 m_block_idx >= lane_pool_block_offset and m_block_idx < lane_pool_block_offset + num_m_blocks;
             const uint32_t owner_mask = __ballot_sync(0xffffffff, is_owner);
 
-            // Exchange the expert info
+            // Exchange the expert info (experts own disjoint pool blocks, so there is at most one owner)
             if (owner_mask) {
                 const uint32_t owner_lane_idx = static_cast<uint32_t>(__ffs(owner_mask) - 1);
                 const uint32_t owner_m_block_idx = m_block_idx - lane_pool_block_offset;
@@ -336,8 +349,8 @@ struct MegaMoEScheduler {
                 result.local_expert_idx = ptx::exchange(expert_idx, owner_lane_idx);
                 result.m_block_idx = ptx::exchange(owner_m_block_idx, owner_lane_idx);
                 result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
+                break;
             }
-            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
         }
         return result;
     }
@@ -463,6 +476,7 @@ struct MegaMoEScheduler {
 
         // Wait dispatch's results
         fetch_expert_recv_count();
+        store_pool_block_offsets();
 
         // Generate routed tasks. Keep the original wait -> claim -> publish ordering:
         // `get_next_task()` advances global task counters and must not run before the
