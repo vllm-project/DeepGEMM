@@ -296,6 +296,15 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
+    // L1 SF staging, past the L1 output tiles in `smem_d`
+    DG_STATIC_ASSERT(sizeof(SharedStorage::smem_d.l1) +
+                     kNumEpilogueWarpgroups * kNumTMAStoreStages * STORE_BLOCK_M * sizeof(uint32_t) <=
+                     sizeof(SharedStorage::smem_d), "No room to stage L1 SFs");
+    const auto l1_sf_stage = [&](const uint32_t& wg_idx, const uint32_t& stage_idx) {
+        return reinterpret_cast<uint8_t*>(shared_storage.smem_d.l1) + sizeof(shared_storage.smem_d.l1) +
+               (wg_idx * kNumTMAStoreStages + stage_idx) * STORE_BLOCK_M * sizeof(uint32_t);
+    };
+
     // Send buffers
     constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
     const auto smem_send_buffers = layout::Buffer(
@@ -1433,17 +1442,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // NOTES: `k_uint_idx = n_block_idx` since each BLOCK_N tile produces exactly
                         // 64 output elements = 4 SF groups = 1 packed `uint32_t` on L2's K
                         if (lane_idx < 4) {
-                            const uint32_t k_uint_idx = n_block_idx, byte_idx = warp_idx_in_wg;
-                            const uint32_t mn_stride = kNumSFRingTokens * sizeof(uint32_t);
-                            const auto sf_base_ptr = buffer.l2_sf_buffer.get_base_ptr<uint8_t>();
-                            // NOTES: consecutive tokens (t, t + 1) are in the same 32-group, so `sf_idx` differs by 4
-                            const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
-                            __builtin_assume(token_base_idx < BLOCK_M);
-                            const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M
-                                + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
-                            const auto sf_addr = k_uint_idx * mn_stride + sf_ring_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
-                            sf_base_ptr[sf_addr] = static_cast<uint8_t>(sf_bytes & 0xffu);
-                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] = static_cast<uint8_t>(sf_bytes >> 8);
+                            const auto stage = l1_sf_stage(epilogue_wg_idx, s % kNumTMAStoreStages);
+                            stage[(i * 8 + lane_idx * 2 + 0) * 4 + warp_idx_in_wg] = static_cast<uint8_t>(sf_bytes & 0xffu);
+                            stage[(i * 8 + lane_idx * 2 + 1) * 4 + warp_idx_in_wg] = static_cast<uint8_t>(sf_bytes >> 8);
                         }
                         __syncwarp();
                     }
@@ -1452,6 +1453,19 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                     const uint32_t tma_stage_idx = s % kNumTMAStoreStages;
                     ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                    // NOTES: consecutive tokens (t, t + 1) are in the same 32-group, so `sf_idx` differs by 4
+                    DG_STATIC_ASSERT(STORE_BLOCK_M <= 128, "One word per WG thread");
+                    if (const uint32_t t = warp_idx_in_wg * 32 + lane_idx; t < STORE_BLOCK_M) {
+                        const uint32_t atom_idx = t / 8, src_lane = t % 8 / 2, half = t % 2;
+                        const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + atom_idx * ATOM_M;
+                        __builtin_assume(token_base_idx < BLOCK_M);
+                        const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M
+                            + transform_sf_token_idx(token_base_idx) + (src_lane * 2 + half) * 4;
+                        const auto sf_word_ptr = buffer.l2_sf_buffer.get_base_ptr<uint32_t>()
+                            + n_block_idx * kNumSFRingTokens + sf_ring_token_idx;
+                        *sf_word_ptr = reinterpret_cast<const uint32_t*>(l1_sf_stage(epilogue_wg_idx, tma_stage_idx))[t];
+                    }
 
                     // Cast to packed E2M1 and store into shared memory
                     // Thread value layout: lane `t` holds 2 tokens (`2 * (t % 4) + {0, 1}`) at output
@@ -1570,6 +1584,19 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         break;
                     }
 
+                    // Fetch each written row's destination ahead of the TMEM loads
+                    layout::TokenSrcMetadata dst_metadata[kNumRowsPerWarp];
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
+                        const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M +
+                                                        j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
+                        if (m_idx_in_block < valid_m) {
+                            dst_metadata[j] = task_info.is_shared() ?
+                                layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + m_idx_in_block, kNumTopk) :
+                                *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
+                        }
+                    }
+
                     #pragma unroll
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
                         // Load from TMEM using .16x256b shape to satisfy STSM layout requirements
@@ -1635,18 +1662,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         if (m_idx_in_block >= valid_m)
                             break;
 
-                        uint32_t dst_rank_idx, dst_token_idx, dst_topk_idx;
-                        if (task_info.is_shared()) {
-                            // Shared output stays local: the extra combine slot beyond top-k
-                            dst_rank_idx = sym_buffer.rank_idx;
-                            dst_token_idx = pool_m_idx + m_idx_in_block;
-                            dst_topk_idx = kNumTopk;
-                        } else {
-                            const auto src_metadata = *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
-                            dst_rank_idx = src_metadata.rank_idx;
-                            dst_token_idx = src_metadata.token_idx;
-                            dst_topk_idx = src_metadata.topk_idx;
-                        }
+                        // Shared output stays local, in the extra combine slot beyond top-k
+                        const auto& [dst_rank_idx, dst_token_idx, dst_topk_idx] = dst_metadata[j];
 
                         // Read from shared memory
                         const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
@@ -1654,35 +1671,6 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                             row_in_store * kSwizzleCDMode +
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
                         auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
-
-                        // Fuse the local RMS statistic into GEMM2's epilogue,
-                        // after the model's BF16 output rounding and gamma.
-                        // Each half warp owns 128 columns of one token. The
-                        // existing NVLink barrier makes all N-tile partials
-                        // visible before combine computes the reciprocal RMS.
-                        if constexpr (kWithPostExpertNorm) {
-                            DG_STATIC_ASSERT(BLOCK_N == 128, "Norm partials require 128-column tiles");
-                            const auto* bf = reinterpret_cast<const nv_bfloat162*>(&packed);
-                            float partial = 0.0f;
-                            #pragma unroll
-                            for (uint32_t q = 0; q < 4; ++q) {
-                                const auto v = __bfloat1622float2(bf[q]);
-                                const auto g = *reinterpret_cast<const float2*>(
-                                    post_expert_norm_gamma + n_idx + (lane_idx % 16) * 8 + q * 2);
-                                const float x = v.x * g.x;
-                                const float y = v.y * g.y;
-                                partial += x * x + y * y;
-                            }
-                            const auto active = __activemask();
-                            #pragma unroll
-                            for (uint32_t offset = 8; offset > 0; offset >>= 1)
-                                partial += __shfl_xor_sync(active, partial, offset, 16);
-                            if (lane_idx % 16 == 0) {
-                                auto* dst = buffer.combine_norm_buffer.get_rank_buffer(dst_topk_idx)
-                                    .get_data_buffer(dst_token_idx).template get_base_ptr<float>() + n_idx / 128;
-                                *sym_buffer.map(dst, dst_rank_idx) = partial;
-                            }
-                        }
 
                         // Apply the per-token top-k routing weight here (post-L2), not before
                         // the intermediate quant. Shared-expert output carries no routing weight.
@@ -1706,6 +1694,35 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
                         *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+
+                        // Fuse the local RMS statistic into GEMM2's epilogue,
+                        // after the model's BF16 output rounding and gamma.
+                        // Each half warp owns 128 columns of one token. The
+                        // existing NVLink barrier makes all N-tile partials
+                        // visible before combine computes the reciprocal RMS.
+                        if constexpr (kWithPostExpertNorm) {
+                            DG_STATIC_ASSERT(BLOCK_N == 128, "Norm partials require 128-column tiles");
+                            const auto* bf = reinterpret_cast<const nv_bfloat162*>(&packed);
+                            float partial = 0.0f;
+                            #pragma unroll
+                            for (uint32_t q = 0; q < 4; ++q) {
+                                const auto v = __bfloat1622float2(bf[q]);
+                                const auto g = __ldg(reinterpret_cast<const float2*>(
+                                    post_expert_norm_gamma + n_idx + (lane_idx % 16) * 8 + q * 2));
+                                const float x = v.x * g.x;
+                                const float y = v.y * g.y;
+                                partial += x * x + y * y;
+                            }
+                            const auto active = __activemask();
+                            #pragma unroll
+                            for (uint32_t offset = 8; offset > 0; offset >>= 1)
+                                partial += __shfl_xor_sync(active, partial, offset, 16);
+                            if (lane_idx % 16 == 0) {
+                                auto* dst = buffer.combine_norm_buffer.get_rank_buffer(dst_topk_idx)
+                                    .get_data_buffer(dst_token_idx).template get_base_ptr<float>() + n_idx / 128;
+                                *sym_buffer.map(dst, dst_rank_idx) = partial;
+                            }
+                        }
                     }
                 }
 
@@ -1763,8 +1780,11 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
         // output pairs. Only the current pair stays live in FP32 registers.
         constexpr uint32_t kParallelNormBytes =
             kNumTopk * (kNumHiddenBytes + sizeof(float));
-        if constexpr (kWithPostExpertNorm and kNumTopk <= kNumEpilogueWarps and
-                      kParallelNormBytes <= kNumReusableSmemBytes) {
+        constexpr bool kCanCombinePerCTAToken = kWithPostExpertNorm and kNumTopk <= kNumEpilogueWarps and
+                                                kParallelNormBytes <= kNumReusableSmemBytes;
+        // One token per CTA for few tokens, otherwise the pipelined per-warp loop
+        if (kCanCombinePerCTAToken and num_tokens <= kNumSMs * 4) {
+          if constexpr (kCanCombinePerCTAToken) {
             const auto raw_rows = reinterpret_cast<uint4*>(smem_buffer);
             const auto norm_scales = reinterpret_cast<float*>(
                 reinterpret_cast<uint8_t*>(smem_buffer) + kNumTopk * kNumHiddenBytes);
@@ -1828,6 +1848,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
+          }
         } else {
 
             // Per-warp buffer: 2 stage load buffers + 1 store buffer

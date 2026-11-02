@@ -37,6 +37,7 @@ template <
     float kActivationBeta,
     bool kFastMath,
     bool kWithPostExpertNorm,
+    bool kUseTrtllmWeights = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -137,6 +138,8 @@ sm100_bf16_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_K = 16;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
+    DG_STATIC_ASSERT(not kUseTrtllmWeights or (not kHasShared and BLOCK_K == 64 and LOAD_BLOCK_N % 32 == 0),
+                     "TRT-LLM BF16 weights require no shared experts, 64-element K blocks and 32-row aligned tiles");
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
 
@@ -720,8 +723,21 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // TMA copy weights
                 if (cute::elect_one_sync()) {
-                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
-                        tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    if constexpr (kUseTrtllmWeights) {
+                        const uint32_t k_block_offset = expert_idx * (shape_k / BLOCK_K) + k_block_idx;
+                        if (task_info.block_phase == sched::BlockPhase::Linear1) {
+                            tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 3>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2,
+                                0, n_idx, k_block_offset);
+                        } else {
+                            tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 5>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2,
+                                0, 0, 0, n_idx / 32, k_block_offset);
+                        }
+                    } else {
+                        tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    }
                     if (is_leader_cta) {
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]) * 2);
                     } else {
@@ -954,8 +970,11 @@ sm100_bf16_mega_moe_impl(void* y,
                         auto fp32_values = reinterpret_cast<float*>(values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
-                            auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
-                            auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
+                            // TRT's row shuffle puts up before gate
+                            constexpr uint32_t kGateOffset = kUseTrtllmWeights ? 2 : 0;
+                            constexpr uint32_t kUpOffset = 2 - kGateOffset;
+                            auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + kGateOffset], fp32_values[k * 4 + kGateOffset + 1]));
+                            auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + kUpOffset], fp32_values[k * 4 + kUpOffset + 1]));
 
                             // Clamp
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
@@ -999,17 +1018,35 @@ sm100_bf16_mega_moe_impl(void* y,
 
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
-                        // STSM
-                        uint32_t row = lane_idx % 8;
-                        uint32_t col = warp_idx_in_wg * 2 + lane_idx / 8;
-                        const auto smem_ptr = shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx]
-                                            + (i * ATOM_M + row) * L1_OUT_BLOCK_N
-                                            + (col ^ row) * (kNumBankGroupBytes / sizeof(d_dtype_t));
-                        ptx::SM90_U32x2_STSM_T<__nv_bfloat162>::copy(
-                            bf16x2_output[i * 2 + 0],
-                            bf16x2_output[i * 2 + 1],
-                            smem_ptr
-                        );
+                        if constexpr (kUseTrtllmWeights) {
+                            // TRT shuffle: lane `t` holds channels `2 * (t / 4) + {0, 1}`
+                            constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(d_dtype_t);
+                            const uint32_t channel = warp_idx_in_wg * 16 + (lane_idx / 4) * 2;
+                            #pragma unroll
+                            for (uint32_t t = 0; t < 2; ++ t) {
+                                const uint32_t row = (lane_idx % 4) * 2 + t;
+                                const auto smem_ptr = shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx]
+                                                    + (i * ATOM_M + row) * L1_OUT_BLOCK_N
+                                                    + ((channel / kNumElemsPerBankGroup) ^ row) * kNumElemsPerBankGroup
+                                                    + channel % kNumElemsPerBankGroup;
+                                const auto pair = t == 0 ?
+                                    __halves2bfloat162(bf16x2_output[i * 2 + 0].x, bf16x2_output[i * 2 + 1].x) :
+                                    __halves2bfloat162(bf16x2_output[i * 2 + 0].y, bf16x2_output[i * 2 + 1].y);
+                                *reinterpret_cast<__nv_bfloat162*>(smem_ptr) = pair;
+                            }
+                        } else {
+                            // STSM
+                            uint32_t row = lane_idx % 8;
+                            uint32_t col = warp_idx_in_wg * 2 + lane_idx / 8;
+                            const auto smem_ptr = shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx]
+                                                + (i * ATOM_M + row) * L1_OUT_BLOCK_N
+                                                + (col ^ row) * (kNumBankGroupBytes / sizeof(d_dtype_t));
+                            ptx::SM90_U32x2_STSM_T<__nv_bfloat162>::copy(
+                                bf16x2_output[i * 2 + 0],
+                                bf16x2_output[i * 2 + 1],
+                                smem_ptr
+                            );
+                        }
                     }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 

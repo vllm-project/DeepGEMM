@@ -288,10 +288,15 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation_alpha: float = 1.0,
                   activation_beta: float = 0.0,
                   post_expert_norm_gamma: Optional[torch.Tensor] = None,
-                  post_expert_norm_eps: float = 0.0):
+                  post_expert_norm_eps: float = 0.0,
+                  weight_layout: str = "native"):
+    """``weight_layout="trtllm"`` takes TRT-LLM's BF16 MoE weights as is (no shared experts)."""
     assert activation in ('swiglu', 'swiglustep'), \
         f'BF16 Mega MoE supports `swiglu` or `swiglustep`, got `{activation}`'
-    _C.bf16_mega_moe(
+    if weight_layout not in ("native", "trtllm"):
+        raise ValueError(f"Unsupported weight layout: {weight_layout}")
+    op = _C.bf16_mega_moe_trtllm if weight_layout == "trtllm" else _C.bf16_mega_moe
+    op(
         y,
         l1_weights,
         l2_weights,
