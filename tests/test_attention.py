@@ -15,6 +15,12 @@ from deep_gemm.utils import (ceil_div, per_token_cast_to_fp4, cast_back_from_fp4
                              cast_back_from_fp8, per_custom_dims_cast_to_fp8)
 
 
+def get_mqa_arch_major() -> int:
+    # SM110 (Thor) runs the SM100 MQA-logits kernels, so it enumerates the SM100 cases.
+    arch_major = get_arch_major()
+    return 10 if arch_major == 11 else arch_major
+
+
 def sample_mqa_cases(name: str, cases: List[tuple]) -> List[tuple]:
     num_cases = os.getenv('DG_MQA_NUM_CASES')
     if num_cases is None:
@@ -43,9 +49,9 @@ def dtype_tag(dtype: torch.dtype) -> str:
 # SM100 takes MXFP4 / MXFP8; SM90 takes E4M3 with one float scale per KV token; SM120 takes MXFP4 or E4M3 with one
 # float scale per KV token
 def mqa_logits_formats():
-    if get_arch_major() == 10:
+    if get_mqa_arch_major() == 10:
         return ('mxfp4', 'mxfp8')
-    if get_arch_major() == 12:
+    if get_mqa_arch_major() == 12:
         return ('mxfp4', 'fp8')
     return ('fp8', )
 
@@ -54,17 +60,17 @@ def mqa_logits_formats():
 # reduce in BF16 and emit BF16 logits
 def mqa_logits_dtypes():
     dtypes = [(torch.float, torch.float), (torch.float, torch.bfloat16)]
-    if get_arch_major() == 10:
+    if get_mqa_arch_major() == 10:
         dtypes.append((torch.bfloat16, torch.bfloat16))
     return dtypes
 
 
 def mqa_logits_heads(is_mxfp4: bool):
-    if get_arch_major() == 10:
+    if get_mqa_arch_major() == 10:
         heads = (8, 12, 16, 20, 32, 64)
         head_dims = (64, 128) if is_mxfp4 else (32, 64, 128)
         return heads, head_dims
-    if get_arch_major() == 12:
+    if get_mqa_arch_major() == 12:
         # SM120 FP4 MQA is head_dim=128 only (`DG_STATIC_ASSERT(kHeadDim == 128)` in the SM120 FP4 kernels)
         return (16, 32, 64), ((128, ) if is_mxfp4 else (32, 64, 128))
     return (32, 64), (32, 64, 128)
@@ -190,7 +196,7 @@ def test_mqa_logits():
             assert_bitwise_equal(logits_again, masked_logits, 'mqa logits self-consistency')
 
         workspace = None
-        if get_arch_major() == 10:
+        if get_mqa_arch_major() == 10:
             workspace = deep_gemm.get_mqa_logits_metadata(ks, ke, seq_len_kv, num_heads)
             scheduled_logits = deep_gemm.fp8_fp4_mqa_logits(**kernel_kwargs, schedule_meta=workspace)
             scheduled_logits = scheduled_logits.masked_fill(~self_mask, 0)
@@ -314,7 +320,7 @@ def kv_cache_cast_to_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 def test_paged_mqa_logits():
     # SM100 flattens varlen requests into `[num_q_tokens, 1]` rows tied together by `indices`; SM90 takes
     # `[batch_size, next_n]` queries; SM120 takes both. All give every row its own context length
-    arch_major = get_arch_major()
+    arch_major = get_mqa_arch_major()
     varlen_options = (True, ) if arch_major == 10 else ((False, True) if arch_major == 12 else (False, ))
 
     def enumerate_paged_mqa_logits():
