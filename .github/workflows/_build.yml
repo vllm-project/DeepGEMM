@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       torch-version:
-        description: "PyTorch build version (2.11 or newer)"
+        description: "PyTorch build version (2.14 or newer; targets the 2.11 stable ABI)"
         required: true
         type: string
       upload-to-release:
@@ -78,7 +78,7 @@ jobs:
 
       - name: Install CUDA ${{ inputs.cuda-version }}
         if: ${{ inputs.cuda-version != 'cpu' }}
-        uses: Jimver/cuda-toolkit@v0.2.26
+        uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
           cuda: ${{ inputs.cuda-version }}
@@ -97,7 +97,8 @@ jobs:
       - name: Install PyTorch ${{ inputs.torch-version }}+cu${{ inputs.cuda-version }}
         run: |
           pip install --upgrade pip
-          # The stable target needs torch >= 2.11. Use the selected CUDA index.
+          # The native convenience wrappers need torch >= 2.14 headers.
+          # Keep the stable ABI target at 2.11. Use the selected CUDA index.
           export TORCH_CUDA_VERSION=$MATRIX_CUDA_VERSION
           if [[ ${{ inputs.torch-version }} == *"dev"* ]]; then
             # Can't use --no-deps because we need cudnn etc.
@@ -107,7 +108,7 @@ jobs:
           else
             pip install --no-cache-dir torch==${{ inputs.torch-version }} --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
           fi
-          python -c "import torch; from packaging.version import Version; assert Version(torch.__version__).release[:2] >= (2, 11), 'Stable ABI requires torch >= 2.11'"
+          python -c "import torch; from packaging.version import Version; assert Version(torch.__version__).release[:2] >= (2, 14), 'Building DeepGEMM requires torch >= 2.14'"
           nvcc --version
           python --version
           python -c "import torch; print('PyTorch:', torch.__version__)"
