@@ -56,6 +56,18 @@ cat install.sh
 
 Then, import `deep_gemm` in your Python project, and enjoy!
 
+For native Windows builds, `setup.py` initializes the CUTLASS and DeepJIT submodules
+in a Git checkout, then applies the CUTLASS host-header patch before compiling
+the extension. Repeated builds detect an already-applied patch; incompatible
+patch context fails the build. Build systems that bypass `setup.py` should run
+`.venv\Scripts\python.exe scripts\apply_cutlass_patch.py third-party\cutlass`
+after populating CUTLASS. The patch changes only the local submodule worktree,
+not its pinned commit.
+
+Windows CUDA does not support locality-domain allocation. Availability queries
+return false, allowing MegaMoE to use its existing non-localized SM mapping.
+Explicit localized allocation requests fail instead of returning ordinary memory.
+
 ## Interfaces
 
 #### Notices

@@ -30,6 +30,8 @@ class MLOPart:
     """
 
     def __init__(self, device_uuid: bytes) -> None:
+        if sys.platform == 'win32':
+            raise MLOPartUnavailable('Locality allocation is unavailable in Windows CUDA')
         self.device_uuid = device_uuid
         self.sock, client_sock = socket.socketpair()
         env = {k: v for k, v in os.environ.items() if k not in ('CUDA_VISIBLE_DEVICES', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT')}
@@ -65,6 +67,11 @@ def _get(device_uuid: bytes) -> MLOPart:
 
 
 def is_available(device_uuid: bytes) -> bool:
+    # Windows CUDA does not support localization and reports one locality domain.
+    # CUDA Programming Guide 4.7.5.3, "Compatibility Notes":
+    # https://docs.nvidia.com/cuda/cuda-programming-guide/
+    if sys.platform == 'win32':
+        return False
     return _get(device_uuid).available
 
 

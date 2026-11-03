@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <numeric>
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.cuh>
