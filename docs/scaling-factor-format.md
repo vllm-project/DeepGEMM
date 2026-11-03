@@ -398,7 +398,7 @@ Sources: `csrc/apis/mega_moe.hpp` (host checks), `deep_gemm/mega/__init__.py` (P
   - Shared expert SFs (optional; weights are FP8 instead of FP4): same contract, 2-D without the group dimension.
 - **An extra mega-MoE-only layout step is mandatory**: pass weights + SFs through `deep_gemm.transform_weights_for_mega_moe` before the call. It (a) interleaves gate/up rows of L1 (weights AND SF, 8-row granularity) and (b) applies a UTCCP intra-128-row transpose to both L1 and L2 SFs (`reshape(-1, 4, 32, packed_sf_k).transpose(2, 3)`; requires `mn % 128 == 0`) — `deep_gemm/mega/__init__.py:97-149`. The SFs in Section 3 layout alone are NOT directly consumable by the kernel.
   On SM90 it first applies `relayout_fp4_weights_for_sm90_mega_moe` and `transform_fp4_sf_for_sm90_mega_moe` (FP4) or `requantize_fp8_weights_for_sm90_mega_moe` (FP8).
-- **Activation SFs are internal**: they live in slices of the symmetric buffer (`x_sf` is K-major `[num_max_tokens_per_rank, hidden // 128]` `int32`; the intermediate `l1/l2_acts_sf` are MN-major), produced by the kernel pipeline — not user-supplied arguments (mega.hpp:96-153).
+- **Activation SFs are internal**: they live in slices of the symmetric buffer (`x_sf` is K-major `[num_max_tokens_per_rank, hidden // 128]`, `int32` on SM100 and `float` on SM90; the intermediate `l1/l2_acts_sf` are MN-major), produced by the kernel pipeline — not user-supplied arguments (mega.hpp:96-153).
 
 ```python
 from deep_gemm.utils import per_token_cast_to_fp4

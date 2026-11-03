@@ -181,27 +181,35 @@ def relayout_fp4_weights_for_sm90_mega_moe(w: torch.Tensor) -> torch.Tensor:
     return words.transpose(-3, -2).flatten(-4).contiguous().view(torch.int8)
 
 
-def clamp_fp4_exponent_span_for_sm90_mega_moe(w: torch.Tensor, sf: torch.Tensor,
-                                              max_span: int = 11) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Raise nonzero 32-element groups more than `max_span` exponents below their row maximum to that span,
+# The SM90 kernel's E4M3 tables cover FP4 group exponents at most 11 below their row maximum
+_SM90_FP4_MAX_EXP_SPAN = 11
+
+
+def clamp_fp4_exponent_span_for_sm90_mega_moe(w: torch.Tensor, sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Raise nonzero 32-element groups more than `_SM90_FP4_MAX_EXP_SPAN` exponents below their row maximum to that span,
     # re-rounding their FP4 codes to nearest even; `w` is packed, not relayouted
     assert w.dtype == torch.int8 and sf.dtype == torch.int and w.shape[-1] == sf.shape[-1] * 64
     exps = torch.stack([(sf >> (8 * i)) & 0xff for i in range(4)], dim=-1).flatten(-2)
     codes = w.view(torch.uint8).unflatten(-1, (-1, 16))
     is_nonzero = (codes & 0x77).amax(dim=-1) != 0
     max_exps = torch.where(is_nonzero, exps, 0).amax(dim=-1, keepdim=True)
-    shifts = torch.where(is_nonzero, (max_exps - max_span - exps).clamp(min=0), 0)
-    if not bool((shifts > 0).any()):
+    shifts = torch.where(is_nonzero, (max_exps - _SM90_FP4_MAX_EXP_SPAN - exps).clamp(min=0), 0)
+    is_clamped = shifts > 0
+    if not bool(is_clamped.any()):
         return w, sf
-    # `_REROUND[d][c]`: E2M1 magnitude code `c` times `2 ^ -d`, rounded to nearest even (all zero from `d = 5`)
+    # `table[d][c]`: E2M1 magnitude code `c` times `2 ^ -d`, rounded to nearest even (all zero from `d = 5`)
     table = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7], [0, 0, 1, 2, 2, 3, 4, 5], [0, 0, 0, 1, 1, 2, 2, 3],
                           [0, 0, 0, 0, 0, 1, 1, 2], [0, 0, 0, 0, 0, 0, 0, 1], [0] * 8], dtype=torch.uint8, device=w.device)
-    d = shifts.clamp(max=5).to(torch.long)[..., None]
+    # Gather, re-round and scatter only the clamped groups
+    clamped_codes = codes[is_clamped]
+    d = shifts[is_clamped].clamp(max=5).to(torch.long)[:, None]
     rerounded = []
-    for nibble in (codes & 0xf, codes >> 4):
+    for nibble in (clamped_codes & 0xf, clamped_codes >> 4):
         mag = table[d, (nibble & 0x7).to(torch.long)]
         rerounded.append(torch.where(mag != 0, mag | (nibble & 0x8), 0))
-    new_w = (rerounded[0] | (rerounded[1] << 4)).flatten(-2).view(torch.int8)
+    new_codes = codes.clone()
+    new_codes[is_clamped] = rerounded[0] | (rerounded[1] << 4)
+    new_w = new_codes.flatten(-2).view(torch.int8)
     new_exps = (exps + shifts).to(torch.uint8).unflatten(-1, (-1, 4)).contiguous().view(torch.int).squeeze(-1)
     return new_w, sf.clone().copy_(new_exps)
 
@@ -221,10 +229,10 @@ def transform_fp4_sf_for_sm90_mega_moe(sf: torch.Tensor, w: Optional[torch.Tenso
     is_zero_row = max_exps < 7
     exps = torch.where(is_nonzero, exps, max_exps)
     max_span = torch.where(is_zero_row, 0, max_exps - exps).amax().item()
-    assert max_span <= 11, \
-        (f'SM90 Mega MoE needs the UE8M0 exponents of each FP4 weight row to span at most 11, got {max_span}'
+    assert max_span <= _SM90_FP4_MAX_EXP_SPAN, \
+        (f'SM90 Mega MoE needs the UE8M0 exponents of each FP4 weight row to span at most {_SM90_FP4_MAX_EXP_SPAN}, got {max_span}'
          f'{"" if w is not None else " (pass `w`, so that all-zero 32-element groups are exempt)"}')
-    shifts = torch.where(is_zero_row, 0, exps - max_exps + 11).to(torch.uint8)
+    shifts = torch.where(is_zero_row, 0, exps - max_exps + _SM90_FP4_MAX_EXP_SPAN).to(torch.uint8)
     words = torch.stack((torch.where(is_zero_row[..., 0], 0, max_exps[..., 0] - 6).to(torch.uint8).expand_as(shifts[..., 0]),
                          torch.zeros_like(shifts[..., 0]), shifts[..., 0] | (shifts[..., 1] << 4), shifts[..., 2] | (shifts[..., 3] << 4)),
                         dim=-1)

@@ -1150,8 +1150,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     return fmaxf(ptx::ld_shared(local_amax + i), ptx::ld_shared(peer_amax + i));
                 };
 
-                // FP32 scale `amax * (1 / 448)` as in `per_token_cast_to_fp8`, and its inverse correctly rounded by one Newton step
-                const auto get_sf = [](const float& amax) { return fmaxf(amax, 1e-4f) * (1.0f / 448.0f); };
+                // FP32 scale `amax / 448` and its inverse, both correctly rounded by one FMA refinement step
+                const auto get_sf = [](const float& amax) {
+                    const float a = fmaxf(amax, 1e-4f), q = a * (1.0f / 448.0f);
+                    return __fmaf_rn(__fmaf_rn(-q, 448.0f, a), 1.0f / 448.0f, q);
+                };
                 const auto get_sf_inv = [](const float& sf) {
                     const float r = math::fast_rcp(sf);
                     return __fmaf_rn(__fmaf_rn(-sf, r, 1.0f), r, r);

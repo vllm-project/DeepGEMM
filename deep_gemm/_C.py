@@ -513,7 +513,7 @@ def fp8_fp4_mega_moe(
     fast_math,
     activation_alpha,
     activation_beta,
-    num_tokens_for_block_m,
+    num_tokens_for_block_m=None,
 ):
     return _torch_ops.fp8_fp4_mega_moe(
         y,

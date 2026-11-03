@@ -82,8 +82,41 @@ def test_fp4_sf_zero_groups():
     assert torch.equal(deep_gemm.transform_fp4_sf_for_sm90_mega_moe(exps.view(torch.int)), words.view(5, 2, 4).view(torch.int).squeeze(-1))
 
 
+def test_fp4_exponent_span_clamp():
+    # On the CPU: nonzero groups more than 11 exponents below their row maximum move to `max - 11` with re-rounded codes,
+    # all other groups keep their bytes
+    e2m1 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.double)
+
+    def dequantize(w, sf):
+        codes = w.view(torch.uint8)
+        codes = torch.stack((codes & 0xf, codes >> 4), dim=-1).flatten(-2).long()
+        scales = torch.exp2(sf.view(torch.uint8).double() - 127).repeat_interleave(32, dim=-1)
+        return (e2m1[codes & 7] * (1 - 2 * (codes >> 3)) * scales).view(8, 256)
+
+    # Row `r`: group 0 at the row maximum 140, group 1 at `129 - r`, group 2 all -0 at 1, the others at 135;
+    # the nonzero groups hold all 16 codes twice
+    w = (torch.arange(0, 16, 2) | (torch.arange(1, 16, 2) << 4)).to(torch.uint8).repeat(8, 16)
+    w[:, 32:48] = 0x88
+    exps = torch.tensor([140, 0, 1, 135, 135, 135, 135, 135], dtype=torch.uint8).repeat(8, 1)
+    exps[:, 1] = 129 - torch.arange(8)
+    w, sf = w.view(2, 4, 128).view(torch.int8), exps.view(2, 4, 8).view(torch.int)
+    new_w, new_sf = deep_gemm.clamp_fp4_exponent_span_for_sm90_mega_moe(w, sf)
+    deep_gemm.transform_fp4_sf_for_sm90_mega_moe(new_sf, new_w)
+
+    is_clamped = torch.zeros((8, 8), dtype=torch.bool)
+    is_clamped[1:, 1] = True
+    assert torch.equal(new_sf.view(torch.uint8).view(8, 8), torch.where(is_clamped, 129, exps).to(torch.uint8))
+    assert torch.equal(new_w.view(torch.uint8).view(8, 8, 16)[~is_clamped], w.view(torch.uint8).view(8, 8, 16)[~is_clamped])
+    expected = dequantize(w, sf)
+    x = expected[1:, 32:64] / 4
+    codes = ((x.abs()[..., None] - e2m1).abs() + (torch.arange(8) & 1) * 2 ** -20).argmin(dim=-1)
+    expected[1:, 32:64] = e2m1[codes] * x.sign() * 4
+    assert torch.equal(dequantize(new_w, new_sf), expected)
+
+
 if __name__ == '__main__':
     test_cpu_transform()
     test_weights_device()
     test_fp4_sf_zero_groups()
+    test_fp4_exponent_span_clamp()
     print('CUDA available:', torch.cuda.is_available(), '- all transform tests passed')

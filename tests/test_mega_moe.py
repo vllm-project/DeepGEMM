@@ -752,8 +752,8 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             dist_print(f' > Accuracy (rank {rank_idx}): calc_diff={diff:.3e}, max_token_diff={max_token_diff:.3e}, hi_diff={hi_diff:.3e}')
             if is_exact_inputs:
                 assert torch.equal(fused_y, ref_y), f'calc_diff={diff}'
-            # Hopper FP8 WGMMA accumulates with less than FP32 precision, so random inputs get a looser tolerance
-            max_diff, max_token_diff_limit = (1e-4, 1e-2) if arch_major == 9 else (1e-5, 1e-4)
+            # Hopper FP8 WGMMA accumulates with less than FP32 precision, so SM90 gets looser limits
+            max_diff, max_token_diff_limit = (1e-4, 3e-3) if arch_major == 9 else (1e-5, 1e-4)
             assert diff < max_diff and max_token_diff < max_token_diff_limit and hi_diff < 2e-3, \
                 f'calc_diff={diff}, max_token_diff={max_token_diff}, hi_diff={hi_diff}'
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
