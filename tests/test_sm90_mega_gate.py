@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import deep_gemm
 from deep_gemm.testing import (
     assert_bitwise_equal,
-    bench_kineto,
     count_bytes,
     get_arch_major,
     test_filter,
@@ -28,18 +27,28 @@ from test_mega_gate import (
 def test_sm90_mega_gate() -> None:
     torch.manual_seed(0)
 
-    print('Testing BF16 GEMM + MoE top-k gate:')
+    print('Testing BF16 GEMM + MoE top-k gate (CUDA Graph, warm L2):')
     for num_tokens, hidden, num_routed_experts in enumerate_cases():
         inputs = make_inputs(num_tokens, hidden, num_routed_experts)
         outputs = make_outputs(inputs)
         weight_diff = check_correctness(inputs, outputs)
 
-        kernel_names = (('sm90_bf16_mega_gate_gemv', 'sm90_bf16_mega_gate_route')
-                        if num_tokens <= 16 else 'mega_gate')
-        fused_t = bench_kineto(
-            lambda: run_mega_gate(inputs, outputs), kernel_names, suppress_kineto_output=True)
-        if isinstance(fused_t, tuple):
-            fused_t = sum(fused_t)
+        # CUDA events over a captured call include GEMM and routing on every path.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run_mega_gate(inputs, outputs)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run_mega_gate(inputs, outputs)
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(30):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        fused_t = start.elapsed_time(end) / 30 / 1000
         num_flops = 2 * num_tokens * num_routed_experts * hidden
         num_bytes = count_bytes(*inputs.values(), *outputs.values())
         print(f' > Perf (m={num_tokens:6}, n={num_routed_experts:4}, k={hidden:4}, topk={NUM_TOPK}): '
@@ -50,8 +59,8 @@ def test_sm90_mega_gate() -> None:
     print()
 
 
-def check_small_batch_routing_controls() -> None:
-    num_tokens, hidden, num_routed_experts = 16, 4096, 384
+def check_small_batch_routing_controls(num_tokens: int = 16) -> None:
+    hidden, num_routed_experts = 4096, 384
     inputs = make_inputs(num_tokens, hidden, num_routed_experts, use_shared_as_routed=True, with_image_bias=True)
     outputs = make_outputs(inputs, use_shared_as_routed=True, with_unmapped_topk_idx=True)
     logits = run_reference_gemm(inputs)
@@ -77,6 +86,13 @@ def check_small_batch_routing_controls() -> None:
     assert torch.all(sorted_random_idx[:, 1:] != sorted_random_idx[:, :-1]).item()
     assert torch.all(unmapped_topk_idx[active_force_random] == -1).item()
 
+    # Omitting fixed routing exercises the split-N merge's random/masked paths.
+    run_mega_gate(inputs, outputs, True, mask=mask, force_random=force_random)
+    check_topk_weights(inputs, outputs, logits, mask, force_random)
+    assert torch.all(unmapped_topk_idx[active_force_random] == -1).item()
+    assert torch.equal(outputs['topk_idx'][active_force_random], random_idx)
+    assert torch.equal(outputs['topk_weights'][active_force_random], random_weights)
+
 
 @test_filter(lambda: get_arch_major() == 9)
 @torch.no_grad()
@@ -84,6 +100,40 @@ def test_sm90_mega_gate_api_contract() -> None:
     # Reuse upstream contract checks, bypassing only their SM100 architecture filter.
     _test_mega_gate_api_contract.__wrapped__()
     check_small_batch_routing_controls()
+
+
+@test_filter(lambda: get_arch_major() == 9)
+@torch.no_grad()
+def test_sm90_mega_gate_split_n() -> None:
+    torch.manual_seed(6)
+    # The last expert tile may have fewer valid experts than its local top-k.
+    for num_experts in (132, 260, 388, 512):
+        check_case(32769, 256, num_experts, num_topk=32, with_image_bias=True,
+                   with_mask=True, with_unmapped_topk_idx=True)
+    check_case(32768, 5120, 384, with_bias=False, with_physical_map=False)
+    check_case(32769, 5120, 384, with_image_bias=True, with_mask=True, with_unmapped_topk_idx=True)
+    check_small_batch_routing_controls(32769)
+
+    inputs = make_inputs(32769, 256, 384, with_physical_map=False)
+    inputs['x'].zero_()
+    inputs['bias'].zero_()
+    outputs = make_outputs(inputs)
+    expected = torch.tensor([0, 127, 128, 255, 256, 383], device='cuda')
+    inputs['bias'][expected] = 1
+    idx, weights = run_mega_gate(inputs, outputs)
+    assert torch.equal(idx, expected.expand_as(idx))
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.5 / NUM_TOPK))
+
+    # Equal rankings across all expert groups must prefer the smallest IDs.
+    inputs['bias'].zero_()
+    idx, _ = run_mega_gate(inputs, outputs)
+    assert torch.equal(idx, torch.arange(NUM_TOPK, device='cuda').expand_as(idx))
+
+    for key in ('bias', 'image_bias'):
+        inputs[key] = torch.randn((385,), device='cuda')[1:]
+    inputs['image_token_mask'] = torch.arange(32769, device='cuda') % 2 == 0
+    inputs['x'].normal_()
+    check_correctness(inputs, outputs)
 
 
 @test_filter(lambda: get_arch_major() in (9, 10))
@@ -126,7 +176,7 @@ def test_mega_gate_cuda_graph() -> None:
     torch.manual_seed(4)
     # Independent captures on multiple streams catch shared workspace/barrier reuse.
     jobs = []
-    for num_tokens, num_experts in ((3, 132), (17, 132), (129, 388)):
+    for num_tokens, num_experts in ((3, 132), (17, 132), (129, 388), (32769, 260), (32769, 384)):
         inputs = make_inputs(num_tokens, 256, num_experts, with_image_bias=True, with_mask=True)
         outputs = make_outputs(inputs, with_unmapped_topk_idx=True)
         storage = torch.full((num_tokens, NUM_TOPK + 3), -123, dtype=torch.int64, device='cuda')
@@ -180,6 +230,7 @@ def test_sm90_mega_gate_batch_invariance() -> None:
 if __name__ == '__main__':
     test_sm90_mega_gate_api_contract()
     test_mega_gate_boundaries()
+    test_sm90_mega_gate_split_n()
     test_mega_gate_cuda_graph()
     test_sm90_mega_gate_batch_invariance()
     test_sm90_mega_gate()

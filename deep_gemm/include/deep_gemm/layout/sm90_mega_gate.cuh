@@ -4,9 +4,9 @@
 
 namespace deep_gemm::layout::sm90_mega_gate {
 
-// The operands and the logits have disjoint lifetimes. Reuse the TMA pipeline
-// storage for the complete row of logits, keeping routing entirely inside a CTA.
-template <uint32_t kBlockTokens, uint32_t kNumExperts>
+// Operand storage becomes a tile of logits after WGMMA completes. Split-N CTAs
+// rank only their own expert tile before the global candidate merge.
+template <uint32_t kBlockTokens, uint32_t kNumExperts, bool kSplitExperts = false>
 struct Config {
     static constexpr uint32_t kBlockK = 64;
     static constexpr uint32_t kMmaTokens = 64;
@@ -21,7 +21,7 @@ struct Config {
     static constexpr uint32_t kWeightStageBytes = kNumExperts * kBlockK * sizeof(cutlass::bfloat16_t);
     static constexpr uint32_t kStageBytes = kXStageBytes + kWeightStageBytes;
     static constexpr uint32_t kMaxStages = (232448u - 1024u) / kStageBytes;
-    static constexpr uint32_t kNumStages = kMaxStages < 4 ? kMaxStages : 4;
+    static constexpr uint32_t kNumStages = kSplitExperts ? 3 : (kMaxStages < 4 ? kMaxStages : 4);
     static constexpr uint32_t kPipelineBytes = kNumStages * kStageBytes;
     static constexpr uint32_t kScoreBytes = kBlockTokens * kNumExperts * sizeof(float);
     static constexpr uint32_t kBarrierOffset = kPipelineBytes > kScoreBytes ? kPipelineBytes : kScoreBytes;
