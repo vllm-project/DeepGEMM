@@ -110,6 +110,41 @@ out_ij = out_ij.sum()  # Scalar
 
 For more details and the paged version `fp8_fp4_paged_mqa_logits`, please refer to `tests/test_attention.py`.
 
+#### SM90 paged sparse MQA logits
+
+`fp8_fp4_paged_sparse_mqa_logits` also supports candidate-only FP8 scoring on SM90
+(including H20). It accepts contiguous E4M3 Q of shape `[R, 1, 32, 128]`,
+`q_scale=None`, and FP32 weights `[R, 32]` with Q scales already folded in.
+The output is FP32 `[R, S * sparse_block_kv]`; invalid columns are `-inf`.
+Check the loaded implementation with
+`is_sm90_paged_sparse_mqa_logits_supported(32, 128, page_kv, sparse_block_kv, torch.float8_e4m3fn)`.
+
+Supported page sizes are 32 and 64, with sparse blocks of 8 or 16 positions and
+up to 4096 blocks per query. The uint8 cache view is `[pages, page_kv, 1, 132]`:
+each page contains all FP8 K values followed by one FP32 scale per position.
+The physical page stride and base address must be 4-byte aligned; gaps between
+pages and offsets beyond 2 GiB are supported. No global gathered K buffer is used.
+
+```python
+metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+    context_lens, block_table, request_indices, page_kv,
+    sparse_blocks, torch.float8_e4m3fn, sparse_block_kv,
+    valid_sparse_tokens=valid_columns,
+)
+logits = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+    (q_fp8, None), kv_cache, weights_fp32, metadata, S, sparse_block_kv,
+)
+```
+
+Lengths, candidate blocks and page-table rows are per query, including speculative
+decode queries. Each candidate row has a sorted unique valid prefix; padding
+repeats its last block. `valid_sparse_tokens` is required on SM90 to distinguish
+empty candidate rows from block-zero padding and to mask partial tails. Metadata
+can be shared by layers using the same candidates, lengths and page table within
+one step; regenerate it when these inputs change. Both calls support CUDA Graph
+capture and replay. Non-paged sparse prefill and SM100's MXFP4/MXFP8 contracts
+are unchanged; SM100 callers omit `valid_sparse_tokens`.
+
 #### Mega MoE
 
 Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), a gated activation, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:

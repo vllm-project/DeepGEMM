@@ -551,6 +551,152 @@ def test_paged_mqa_logits_zero_context():
     print(' > Passed\n')
 
 
+def make_sm90_sparse_case(rows, page_kv, sparse_block_kv=8, capacity=2048, gap=0, offset=0, exact=False):
+    """Paged FP8 inputs with distinct per-query candidates and explicit empty rows."""
+    rng = random.Random(173 + rows + page_kv)
+    max_len = 32768 if rows == 1 else 4096
+    pages = max_len // page_kv
+    q = torch.randn((rows, 1, 32, 128), device='cuda').to(torch.float8_e4m3fn)
+    weights = torch.randn((rows, 32), device='cuda')
+    values = torch.randn((pages, page_kv, 1, 128), device='cuda')
+    packed, dequant = kv_cache_cast_to_fp8(values)
+    if exact:
+        q.fill_(1)
+        weights.fill_(1)
+        packed.view(pages, -1)[:, :page_kv * 128].copy_(
+            torch.ones((pages, page_kv * 128), device='cuda').to(torch.float8_e4m3fn).view(torch.uint8))
+        scales = torch.arange(1, pages * page_kv + 1, dtype=torch.float32, device='cuda').view(pages, page_kv)
+        packed.view(pages, -1)[:, page_kv * 128:].copy_(scales.view(torch.uint8))
+        dequant = scales[:, :, None, None].expand(pages, page_kv, 1, 128).contiguous()
+    stride = page_kv * 132 + gap
+    storage = torch.empty(offset + pages * stride, device='cuda', dtype=torch.uint8)
+    cache = storage.as_strided((pages, page_kv, 1, 132), (stride, 132, 132, 1), offset)
+    cache.copy_(packed)
+    table = torch.stack([torch.randperm(pages, device='cuda', dtype=torch.int32) for _ in range(rows)])
+    contexts, candidates, ends = [], [], []
+    for row in range(rows):
+        context = max_len - (row % 7)
+        if rows > 1 and row == 0:
+            context = 0
+        available = ceil_div(context, sparse_block_kv)
+        count = min(capacity, available)
+        blocks = sorted(rng.sample(range(available), count))
+        if rows > 2 and row == 1:
+            blocks = []  # Nonempty context, no candidates: cannot infer length from context.
+        if rows > 2 and row == 2:
+            blocks = [0]
+        end = (len(blocks) - 1) * sparse_block_kv + min(sparse_block_kv, context - blocks[-1] * sparse_block_kv) if blocks else 0
+        contexts.append(context)
+        candidates.append(blocks + [blocks[-1] if blocks else 0] * (capacity - len(blocks)))
+        ends.append(end)
+    return dict(q=q, weights=weights, cache=cache, packed=packed, dequant=dequant, table=table,
+                contexts=torch.tensor(contexts, dtype=torch.int32, device='cuda'),
+                candidates=torch.tensor(candidates, dtype=torch.int32, device='cuda'),
+                ends=torch.tensor(ends, dtype=torch.int32, device='cuda'),
+                indices=torch.arange(rows, dtype=torch.int32, device='cuda'),
+                page_kv=page_kv, sparse_block_kv=sparse_block_kv, capacity=capacity, max_len=max_len)
+
+
+def run_sm90_sparse_case(case):
+    metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+        case['contexts'], case['table'], case['indices'], case['page_kv'], case['candidates'],
+        torch.float8_e4m3fn, case['sparse_block_kv'], valid_sparse_tokens=case['ends'])
+    return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+        (case['q'], None), case['cache'], case['weights'], metadata,
+        case['capacity'], case['sparse_block_kv'])
+
+
+@test_filter(lambda: get_arch_major() == 9)
+def test_sm90_paged_sparse_mqa_logits():
+    """Candidate scores preserve dense semantics across padding and physical cache layouts."""
+    torch.manual_seed(17)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        cases = [(1, 32, 8, 2048, 0, 0), (3, 64, 8, 2048, 64, 16),
+                 (6, 64, 8, 2048, 260, 4), (24, 32, 8, 2048, 0, 0),
+                 (48, 64, 8, 2048, 0, 0), (96, 64, 8, 2048, 0, 0),
+                 (3, 64, 8, 5, 0, 0), (2, 32, 16, 9, 4, 4)]
+        for args in cases:
+            case = make_sm90_sparse_case(*args)
+            actual = run_sm90_sparse_case(case)
+            sbk = case['sparse_block_kv']
+            positions = (case['candidates'][:, :, None] * sbk + torch.arange(sbk, device='cuda')).flatten(1)
+            valid = torch.arange(positions.size(1), device='cuda')[None, :] < case['ends'][:, None]
+            ref = ref_paged_mqa_logits(case['q'].float(), case['dequant'], case['weights'],
+                                       case['contexts'][:, None], case['table'], case['max_len'])
+            ref = ref.gather(1, positions.long()).masked_fill(~valid, -float('inf'))
+            assert actual.shape == ref.shape and actual.dtype == torch.float32
+            assert torch.equal(torch.isneginf(actual), ~valid), args
+            diff = calc_diff(actual[valid], ref[valid])
+            assert diff < mqa_logits_tolerances('fp8', False)[1], (args, diff)
+            schedule = deep_gemm.get_paged_mqa_logits_metadata(case['contexts'][:, None], case['page_kv'], deep_gemm.get_num_sms())
+            dense = deep_gemm.fp8_fp4_paged_mqa_logits(
+                (case['q'], None), case['packed'], case['weights'], case['contexts'][:, None],
+                case['table'], schedule, case['max_len'])
+            dense = dense.gather(1, positions.long())
+            dense_diff = calc_diff(actual[valid], dense[valid])
+            assert dense_diff < mqa_logits_tolerances('fp8', False)[1], (args, dense_diff)
+            print(f' > SM90 sparse {args}: reference diff={diff:.3g}, dense diff={dense_diff:.3g}')
+        case = make_sm90_sparse_case(1, 64, exact=True)
+        actual = run_sm90_sparse_case(case)
+        positions = (case['candidates'][:, :, None] * 8 + torch.arange(8, device='cuda')).flatten(1)
+        physical = case['table'].gather(1, positions // 64) * 64 + positions % 64
+        expected = (physical + 1).float() * 4096
+        assert_bitwise_equal(actual, expected, 'SM90 sparse exact scores')
+        assert_bitwise_equal(actual.topk(512).indices.sort().values, expected.topk(512).indices.sort().values,
+                             'SM90 sparse exact selected set')
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
+@test_filter(lambda: get_arch_major() == 9)
+def test_sm90_paged_sparse_mqa_logits_graph():
+    """Graph replay refreshes candidates, page tables and lengths at stable addresses."""
+    case = make_sm90_sparse_case(6, 64)
+    long_contexts, long_ends = case['contexts'].clone(), case['ends'].clone()
+    case['contexts'].zero_()
+    case['ends'].zero_()
+    run_sm90_sparse_case(case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run_sm90_sparse_case(case)
+    for step in range(3):
+        case['contexts'].copy_(long_contexts)
+        case['ends'].copy_(long_ends)
+        case['table'].copy_(case['table'].roll(1, dims=1))
+        if step == 1:
+            case['candidates'].zero_()
+            case['ends'].clamp_(max=8)
+        if step == 2:
+            case['ends'].zero_()
+        graph.replay()
+        assert_bitwise_equal(captured, run_sm90_sparse_case(case), 'SM90 sparse graph replay')
+
+
+@test_filter(lambda: get_arch_major() == 9)
+def test_sm90_paged_sparse_mqa_logits_large_offsets():
+    """Page and scale offsets above INT_MAX must not wrap to another page."""
+    stride = 2**31 + 256
+    storage = torch.empty(stride + 64 * 132, dtype=torch.uint8, device='cuda')
+    cache = storage.as_strided((2, 64, 1, 132), (stride, 132, 132, 1))
+    for page in range(2):
+        raw = cache[page].view(-1)
+        raw[:64 * 128].copy_(torch.ones(64 * 128, device='cuda').to(torch.float8_e4m3fn).view(torch.uint8))
+        raw[64 * 128:].copy_(torch.arange(page * 64 + 1, page * 64 + 65, device='cuda', dtype=torch.float32).view(torch.uint8))
+    case = dict(q=torch.ones((1, 1, 32, 128), device='cuda').to(torch.float8_e4m3fn),
+                weights=torch.ones((1, 32), device='cuda'), cache=cache, page_kv=64,
+                sparse_block_kv=8, capacity=4, contexts=torch.tensor([72], device='cuda', dtype=torch.int32),
+                table=torch.tensor([[1, 0]], device='cuda', dtype=torch.int32),
+                candidates=torch.tensor([[0, 8, 9, 2**29]], device='cuda', dtype=torch.int32),
+                ends=torch.tensor([32], device='cuda', dtype=torch.int32),
+                indices=torch.zeros(1, device='cuda', dtype=torch.int32))
+    actual = run_sm90_sparse_case(case)
+    expected = torch.cat((torch.arange(65, 73), torch.arange(1, 9))).cuda().float() * 4096
+    assert_bitwise_equal(actual[0, :16], expected, 'SM90 sparse 64-bit offsets')
+    assert torch.isneginf(actual[0, 16:]).all()
+
+
 @test_filter(lambda: get_arch_major() == 10)
 def test_sparse_mqa_logits() -> None:
     head_dim, page_kv = 128, 64
@@ -791,4 +937,7 @@ if __name__ == '__main__':
     test_mqa_logits()
     test_paged_mqa_logits()
     test_paged_mqa_logits_zero_context()
+    test_sm90_paged_sparse_mqa_logits()
+    test_sm90_paged_sparse_mqa_logits_graph()
+    test_sm90_paged_sparse_mqa_logits_large_offsets()
     test_sparse_mqa_logits()

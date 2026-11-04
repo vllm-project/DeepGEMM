@@ -320,11 +320,18 @@ def get_sparse_mqa_logits_metadata(
 
 
 def get_paged_sparse_mqa_logits_metadata(
-    context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv
+    context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv,
+    valid_sparse_tokens=None,
 ):
     return _torch_ops.get_paged_sparse_mqa_logits_metadata(
-        context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv
+        context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv,
+        valid_sparse_tokens,
     )
+
+
+def is_sm90_paged_sparse_mqa_logits_supported(num_heads, head_dim, page_kv, sparse_block_kv, qk_dtype):
+    return _torch_ops.is_sm90_paged_sparse_mqa_logits_supported(
+        num_heads, head_dim, page_kv, sparse_block_kv, qk_dtype)
 
 
 def fp8_fp4_sparse_mqa_logits(q, kv, weights, metadata, num_max_sparse_blocks, sparse_block_kv, use_unaligned_ks=False):
@@ -947,6 +954,7 @@ _PUBLIC_API = [
     'get_paged_mqa_logits_metadata',
     'get_sparse_mqa_logits_metadata',
     'get_paged_sparse_mqa_logits_metadata',
+    'is_sm90_paged_sparse_mqa_logits_supported',
     'fp8_fp4_sparse_mqa_logits',
     'fp8_fp4_paged_sparse_mqa_logits',
     'fp8_fp4_paged_mqa_logits',

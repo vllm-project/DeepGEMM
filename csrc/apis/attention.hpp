@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm100_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
+#include "../jit_kernels/impls/sm90_sparse_mqa_logits.hpp"
 
 #include "layout.hpp"
 #include <torch/csrc/stable/library.h>
@@ -16,6 +17,15 @@
 #include "sm120_dispatch.hpp"
 
 namespace deep_gemm::attention {
+
+static bool is_sm90_paged_sparse_mqa_logits_supported(
+    const int64_t& num_heads, const int64_t& head_dim, const int64_t& page_kv,
+    const int64_t& sparse_block_kv, const torch::headeronly::ScalarType& qk_dtype
+) {
+    return jit->device.get_arch_major() == 9 and num_heads == 32 and head_dim == 128 and
+           (page_kv == 32 or page_kv == 64) and (sparse_block_kv == 8 or sparse_block_kv == 16) and
+           qk_dtype == torch::headeronly::ScalarType::Float8_e4m3fn;
+}
 
 // Checks shared by the contiguous and paged APIs
 static void check_mqa_logits_q_and_weights(const torch::stable::Tensor& q_fp, const std::optional<torch::stable::Tensor>& q_sf,
@@ -383,8 +393,10 @@ static torch::stable::Tensor get_paged_sparse_mqa_logits_metadata(const torch::s
                                                           const int& page_kv,
                                                           const torch::stable::Tensor& sparse_kv_block_indices,
                                                           const torch::headeronly::ScalarType& qk_dtype,
-                                                          const int& sparse_block_kv) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+                                                          const int& sparse_block_kv,
+                                                          const std::optional<torch::stable::Tensor>& valid_sparse_tokens) {
+    const int arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT(arch_major == 9 or arch_major == 10);
     const auto [num_q_tokens, num_max_sparse_blocks] = get_shape<2>(sparse_kv_block_indices);
     DG_HOST_ASSERT(num_q_tokens > 0);
     DG_HOST_ASSERT(context_lens.numel() == num_q_tokens and context_lens.scalar_type() == torch::headeronly::ScalarType::Int and context_lens.is_contiguous());
@@ -396,6 +408,24 @@ static torch::stable::Tensor get_paged_sparse_mqa_logits_metadata(const torch::s
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     DG_HOST_ASSERT(page_kv > 0 and page_kv % sparse_block_kv == 0);
     DG_HOST_ASSERT(sparse_kv_block_indices.scalar_type() == torch::headeronly::ScalarType::Int and sparse_kv_block_indices.is_contiguous());
+
+    if (arch_major == 9) {
+        DG_HOST_ASSERT(is_sm90_paged_sparse_mqa_logits_supported(32, 128, page_kv, sparse_block_kv, qk_dtype));
+        DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks <= 4096);
+        DG_HOST_ASSERT(valid_sparse_tokens.has_value());
+        const auto& valid_tokens = valid_sparse_tokens.value();
+        DG_HOST_ASSERT(valid_tokens.dim() == 1 and valid_tokens.size(0) == num_q_tokens and
+                       valid_tokens.is_contiguous() and valid_tokens.scalar_type() == torch::headeronly::ScalarType::Int);
+        DG_HOST_ASSERT(context_lens.device() == sparse_kv_block_indices.device() and
+                       block_table.device() == context_lens.device() and indices.device() == context_lens.device() and
+                       valid_tokens.device() == context_lens.device());
+        auto metadata = torch::stable::new_empty(sparse_kv_block_indices, {num_q_tokens, num_max_sparse_blocks + 1},
+                                                torch::headeronly::ScalarType::Long);
+        launch_sm90_sparse_mqa_logits_metadata(context_lens, block_table, sparse_kv_block_indices,
+                                               valid_tokens, metadata, page_kv, sparse_block_kv);
+        return metadata;
+    }
+    DG_HOST_ASSERT(not valid_sparse_tokens.has_value());
 
     const int split_kv = get_sparse_mqa_split_kv(qk_dtype);
     auto metadata = torch::stable::new_empty(
@@ -458,6 +488,33 @@ static torch::stable::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<to
                                                      const int& sparse_block_kv) {
     using namespace layout::sparse_mqa_logits;
     const auto [q_fp, q_sf_optional] = q;
+    if (jit->device.get_arch_major() == 9) {
+        const auto [num_q_tokens, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
+        const auto [num_pages, page_kv, num_kv_heads, record_bytes] = get_shape<4>(fused_kv_cache);
+        DG_HOST_ASSERT(is_sm90_paged_sparse_mqa_logits_supported(
+            num_heads, head_dim, page_kv, sparse_block_kv, q_fp.scalar_type()));
+        DG_HOST_ASSERT(num_q_tokens > 0 and next_n == 1 and not q_sf_optional.has_value());
+        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(q_fp.mutable_data_ptr()) % 16 == 0);
+        check_mqa_logits_q_and_weights(q_fp, q_sf_optional, weights, num_q_tokens, num_heads, head_dim, 9);
+
+        const auto page_stride = fused_kv_cache.stride(0);
+        DG_HOST_ASSERT(num_pages > 0 and num_kv_heads == 1 and record_bytes == head_dim + static_cast<int>(sizeof(float)));
+        DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::headeronly::ScalarType::Byte and
+                       fused_kv_cache.stride(1) == record_bytes and fused_kv_cache.stride(3) == 1 and
+                       page_stride >= page_kv * record_bytes and page_stride % 4 == 0 and
+                       reinterpret_cast<uintptr_t>(fused_kv_cache.mutable_data_ptr()) % 4 == 0);
+
+        DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks <= 4096);
+        DG_HOST_ASSERT(metadata.scalar_type() == torch::headeronly::ScalarType::Long and metadata.is_contiguous() and
+                       metadata.dim() == 2 and metadata.size(0) == num_q_tokens and metadata.size(1) == num_max_sparse_blocks + 1);
+        DG_HOST_ASSERT(weights.device() == q_fp.device() and fused_kv_cache.device() == q_fp.device() and
+                       metadata.device() == q_fp.device());
+
+        auto logits = torch::stable::new_empty(q_fp, {num_q_tokens, num_max_sparse_blocks * sparse_block_kv},
+                                               torch::headeronly::ScalarType::Float);
+        launch_sm90_paged_sparse_mqa_logits(q_fp, fused_kv_cache, weights, metadata, logits, sparse_block_kv);
+        return logits;
+    }
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and q_sf_optional.has_value());
     DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
@@ -564,9 +621,10 @@ static torch::stable::Tensor get_paged_sparse_mqa_logits_metadata(
     const int64_t& page_kv,
     const torch::stable::Tensor& sparse_kv_block_indices,
     const torch::headeronly::ScalarType& qk_dtype,
-    const int64_t& sparse_block_kv) {
+    const int64_t& sparse_block_kv,
+    const std::optional<torch::stable::Tensor>& valid_sparse_tokens) {
     return attention::get_paged_sparse_mqa_logits_metadata(
-        context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv);
+        context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv, valid_sparse_tokens);
 }
 
 static torch::stable::Tensor fp8_fp4_sparse_mqa_logits(
@@ -605,9 +663,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def(
         "fp8_fp4_paged_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_cache, Tensor weights, Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, ScalarType logits_dtype=float, Tensor? indices=None) -> Tensor");
     m.def("get_sparse_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv, bool use_unaligned_ks=False) -> Tensor");
-    m.def("get_paged_sparse_mqa_logits_metadata(Tensor context_lens, Tensor block_table, Tensor indices, int page_kv, Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv) -> Tensor");
+    m.def("get_paged_sparse_mqa_logits_metadata(Tensor context_lens, Tensor block_table, Tensor indices, int page_kv, Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv, Tensor? valid_sparse_tokens=None) -> Tensor");
+    m.def("is_sm90_paged_sparse_mqa_logits_supported(int num_heads, int head_dim, int page_kv, int sparse_block_kv, ScalarType qk_dtype) -> bool");
     m.def("fp8_fp4_sparse_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv, Tensor kv_sf, Tensor weights, Tensor metadata, int num_max_sparse_blocks, int sparse_block_kv, bool use_unaligned_ks=False) -> Tensor");
     m.def("fp8_fp4_paged_sparse_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_cache, Tensor weights, Tensor metadata, int num_max_sparse_blocks, int sparse_block_kv) -> Tensor");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {
+    m.impl("is_sm90_paged_sparse_mqa_logits_supported", TORCH_BOX(&deep_gemm::attention::is_sm90_paged_sparse_mqa_logits_supported));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {

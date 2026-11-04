@@ -74,6 +74,7 @@ from ._C import (
     fp8_fp4_paged_mqa_logits,
     get_sparse_mqa_logits_metadata,
     get_paged_sparse_mqa_logits_metadata,
+    is_sm90_paged_sparse_mqa_logits_supported,
     fp8_fp4_sparse_mqa_logits,
     fp8_fp4_paged_sparse_mqa_logits,
     # Hyperconnection kernels
