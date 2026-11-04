@@ -1012,6 +1012,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
 
                     // Release the stage after all shared memory reads
+                    // NOTES: TMA (the async proxy) refills the stage, so the generic-proxy reads of its weight codes and SF words
+                    // need a proxy fence before the release (PTX ISA 9.7.10.28.2). Without it, a refill may land before a load
+                    // that is still in flight at the arrive reads its value
+                    ordered_ptx::fence_view_async_shared();
                     __syncwarp();
                     if (lane_idx == 0)
                         shared_storage.empty_barriers[stage_idx].arrive();
