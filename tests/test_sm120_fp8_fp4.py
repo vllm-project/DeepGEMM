@@ -7,8 +7,8 @@ from deep_gemm.testing import (
     get_arch_major, test_filter
 )
 from generators import (
-    MajorTypeAB,
-    generate_k_grouped_contiguous,
+    MajorTypeAB, QuantConfig,
+    generate_k_grouped_contiguous, generate_m_grouped_contiguous,
 )
 
 
@@ -147,6 +147,34 @@ def test_sm120_contiguous_grouped_output_row_stride() -> None:
             assert torch.all(storage[[0, -1]] == -7) and torch.all(storage[1:129, 16:] == -7)
     finally:
         deep_gemm.set_num_sms(old_sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_contiguous_mk_alignment_for_small_expected_m() -> None:
+    # MoE decode pads every expert to this alignment, so 128 for a few rows per expert doubles the GEMM work
+    for expected_m, alignment in ((None, 128), (1, 64), (32, 64), (64, 64), (65, 128), (4096, 128)):
+        actual = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout() if expected_m is None else \
+                 deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(expected_m)
+        assert actual == alignment, f'{expected_m=}, {actual=}, {alignment=}'
+
+    old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    try:
+        for expected_m_per_group in (8, 32, 64):
+            deep_gemm.set_mk_alignment_for_contiguous_layout(
+                deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(expected_m_per_group))
+            # FP8 x FP8, then FP8 x FP4 as in MXFP4 MoE experts
+            for quant_config in (QuantConfig(), QuantConfig((128, 32, False, True))):
+                recipe, recipe_a, recipe_b = quant_config.get_recipes()
+                for num_groups, n, k in ((8, 768, 5120), (32, 5120, 384)):
+                    _, a, b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_contiguous(
+                        num_groups, expected_m_per_group, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+                        use_ue8m0=True, quant_config=quant_config)
+                    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout,
+                                                                   recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+                    diff = calc_diff(d[valid_mask], ref_d[valid_mask])
+                    assert diff < quant_config.max_diff(), f'{expected_m_per_group=}, {n=}, {k=}, {diff=}'
+    finally:
         deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
 
 
@@ -401,6 +429,7 @@ if __name__ == '__main__':
     test_sm120_odd_n_bf16_output_and_accumulation()
     test_sm120_batched_strided_output_and_accumulation()
     test_sm120_contiguous_grouped_output_row_stride()
+    test_sm120_contiguous_mk_alignment_for_small_expected_m()
     test_sm120_kgroup_nt_tn_layouts_and_accumulation()
     test_sm120_asymmetric_scale_recipe_swap()
     test_sm120_scale_dtype_validation()
