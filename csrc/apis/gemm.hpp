@@ -523,9 +523,9 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::stable::Tens
     if (early_return(m, n, sum_k, d, c))
         return;
 
-    // Transform SF with padding (K-major operands carry [mn, sf_k] SF tensors)
-    const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout, true);
-    const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout, true);
+    // Transform SF with padding
+    const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+    const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
 
     // Dispatch implementation
     if (arch_major == 10) {
