@@ -112,7 +112,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
         ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * kEpiSubM)
         : 0u;
-    static constexpr uint32_t kSwizzleCDShift = kSwizzleCDMode > 0 ? (7 - __builtin_ctz(kSwizzleCDMode)) : 0;
+    static constexpr uint32_t kSwizzleCDShift = kSwizzleCDMode > 0 ? (7 - cute::countr_zero(kSwizzleCDMode)) : 0;
     static constexpr uint32_t kSwizzleCDMask = kSwizzleCDMode > 0 ? (kSwizzleCDMode / 16 - 1) : 0;
     static constexpr uint32_t kTMAStoreInnerDim = kSwizzleCDMode / sizeof(cd_dtype_t);
     static constexpr uint32_t kNumTMAStores = kUseTMAStoreEpilogue
@@ -567,9 +567,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                     sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                             }
                         } else {
-                            static constexpr uint32_t kBSwizzleB = kSwizzleBMode > 0 ? (__builtin_ctz(kSwizzleBMode) - 4) : 0;
+                            static constexpr uint32_t kBSwizzleB = kSwizzleBMode > 0 ? (cute::countr_zero(kSwizzleBMode) - 4) : 0;
                             static constexpr uint32_t kBSwizzleMask = kSwizzleBMode > 0 ? ((1u << kBSwizzleB) - 1) : 0;
-                            static constexpr uint32_t kBSwizzleRowShift = kSwizzleBMode > 0 ? (7 - __builtin_ctz(BLOCK_N)) : 0;
+                            static constexpr uint32_t kBSwizzleRowShift = kSwizzleBMode > 0 ? (7 - cute::countr_zero(BLOCK_N)) : 0;
                             #pragma unroll
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 const uint32_t n_col = (n_tile_base + nt) * MMA_N + group_id;
@@ -881,9 +881,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                     sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                             }
                         } else {
-                            static constexpr uint32_t kBSwizzleB = kSwizzleBMode > 0 ? (__builtin_ctz(kSwizzleBMode) - 4) : 0;
+                            static constexpr uint32_t kBSwizzleB = kSwizzleBMode > 0 ? (cute::countr_zero(kSwizzleBMode) - 4) : 0;
                             static constexpr uint32_t kBSwizzleMask = kSwizzleBMode > 0 ? ((1u << kBSwizzleB) - 1) : 0;
-                            static constexpr uint32_t kBSwizzleRowShift = kSwizzleBMode > 0 ? (7 - __builtin_ctz(BLOCK_N)) : 0;
+                            static constexpr uint32_t kBSwizzleRowShift = kSwizzleBMode > 0 ? (7 - cute::countr_zero(BLOCK_N)) : 0;
                             #pragma unroll
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 const uint32_t n_col = (n_tile_base + nt) * MMA_N + group_id;
@@ -1212,9 +1212,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                     sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                             }
                         } else {
-                            static constexpr uint32_t kBSwizzleB = kSwizzleBMode > 0 ? (__builtin_ctz(kSwizzleBMode) - 4) : 0;
+                            static constexpr uint32_t kBSwizzleB = kSwizzleBMode > 0 ? (cute::countr_zero(kSwizzleBMode) - 4) : 0;
                             static constexpr uint32_t kBSwizzleMask = kSwizzleBMode > 0 ? ((1u << kBSwizzleB) - 1) : 0;
-                            static constexpr uint32_t kBSwizzleRowShift = kSwizzleBMode > 0 ? (7 - __builtin_ctz(BLOCK_N)) : 0;
+                            static constexpr uint32_t kBSwizzleRowShift = kSwizzleBMode > 0 ? (7 - cute::countr_zero(BLOCK_N)) : 0;
                             #pragma unroll
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 const uint32_t n_col = (n_tile_base + nt) * MMA_N + group_id;

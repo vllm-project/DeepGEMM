@@ -1,0 +1,13 @@
+diff --git a/include/cutlass/arch/barrier.h b/include/cutlass/arch/barrier.h
+index 2b0d4bb6..bec96e00 100644
+--- a/include/cutlass/arch/barrier.h
++++ b/include/cutlass/arch/barrier.h
+@@ -34,5 +34,8 @@
+ 
+ #pragma once
+ 
++#if !defined(_MSC_VER) || defined(__clang__) || defined(__CUDACC__) || \
++    defined(__CUDACC_RTC__)
+ #include <cutlass/arch/memory_sm75.h>
++#endif
+ #include <cute/arch/cluster_sm90.hpp>

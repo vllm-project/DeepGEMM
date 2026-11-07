@@ -97,7 +97,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
         ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * BLOCK_M)
         : 0u;
-    static constexpr uint32_t kSwizzleCDShift = kSwizzleCDMode > 0 ? (7 - __builtin_ctz(kSwizzleCDMode)) : 0;
+    static constexpr uint32_t kSwizzleCDShift = kSwizzleCDMode > 0 ? (7 - cute::countr_zero(kSwizzleCDMode)) : 0;
     static constexpr uint32_t kSwizzleCDMask = kSwizzleCDMode > 0 ? (kSwizzleCDMode / 16 - 1) : 0;
     static constexpr uint32_t kTMAStoreInnerDim = kSwizzleCDMode / sizeof(cd_dtype_t);
     static constexpr uint32_t kNumTMAStores = kUseTMAStoreEpilogue
