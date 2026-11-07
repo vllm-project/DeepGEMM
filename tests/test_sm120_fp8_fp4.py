@@ -388,11 +388,47 @@ def test_sm120_kgroup_descriptor_reuse_at_default_sms() -> None:
         deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
 
 
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_kgroup_square_sf_orientation() -> None:
+    # The K-major entry point's SF tensor is [mn, sf_k]; when mn == sf_k it is
+    # square, and an orientation inferred from the shape packs it untransposed,
+    # so every row reads another row's scales. Random operands with non-unit
+    # scales are required: constant operands with unit scales cannot see it.
+    old_sms = deep_gemm.get_num_sms()
+    old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    try:
+        deep_gemm.set_num_sms(torch.cuda.get_device_properties(0).multi_processor_count)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        n = 136
+        for m, ks in ((12, [128] * 12), (12, [384] * 4), (16, [512] * 4), (64, [256] * 32)):
+            assert sum(ks) // 128 == m
+            outputs = {}
+            for major, gemm in ((MajorTypeAB.KMajor, deep_gemm.k_grouped_fp8_gemm_nt_contiguous),
+                                (MajorTypeAB.MNMajor, deep_gemm.k_grouped_fp8_gemm_tn_contiguous)):
+                random.seed(0)
+                torch.manual_seed(0)
+                _, a, b, _, initial, ref_d, layout, host_ks = generate_k_grouped_contiguous(
+                    len(ks), m, n, major, major, ks,
+                    use_ue8m0=True, gran_k=128, k_alignment=128, use_psum_layout=False,
+                    accumulate=True, out_dtype=torch.float32)
+                d = initial.clone()
+                gemm(a, b, d, host_ks, layout, d, recipe=(1, 1, 128))
+                diff = calc_diff(d, ref_d)
+                assert diff < 1e-3, f'square SF: {major=}, {m=}, {ks=}, {diff=}'
+                outputs[major] = d
+            diff = calc_diff(outputs[MajorTypeAB.KMajor], outputs[MajorTypeAB.MNMajor])
+            assert diff < 1e-5, f'square SF: NT and TN disagree, {m=}, {ks=}, {diff=}'
+    finally:
+        deep_gemm.set_num_sms(old_sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
 
     test_sm120_kgroup_descriptor_reuse_at_default_sms()
+    test_sm120_kgroup_square_sf_orientation()
     test_sm120_kgroup_zero_and_unequal_k()
     test_sm120_kgroup_unaligned_m_tail_tile_isolation()
     test_sm120_split_k_accumulation()
