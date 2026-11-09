@@ -169,6 +169,20 @@ def requantize_fp8_weights_for_sm90_mega_moe(weights: Tuple[torch.Tensor, torch.
     return torch.ldexp(w.float(), shifts).to(torch.float8_e4m3fn), sf.clone().copy_(uniform_sf)
 
 
+def transform_fp8_block_sf_for_sm90_mega_moe(w: torch.Tensor, sf: torch.Tensor, is_l1: bool) -> torch.Tensor:
+    # FP32 scales `[..., N / 128, K / 128]` of the 128x128 blocks of FP8 E4M3 weights `[..., N, K]` (L1 gate blocks before up blocks)
+    # to the SM90 kernel layout: the same shape, MN-major and TMA-aligned, with L1 block rows interleaved as gate 0, up 0, gate 1, up 1, ...
+    assert w.dtype == torch.float8_e4m3fn and sf.dtype == torch.float and w.dim() in (2, 3) and sf.dim() == w.dim()
+    assert sf.shape == (*w.shape[:-2], w.shape[-2] // 128, w.shape[-1] // 128)
+    if is_l1:
+        sf = _interleave_weights(sf, gran=1)
+    # MN-major with the MN stride aligned to 16 bytes (zero padding), groups contiguous
+    *dims, mn, num_k_sf = sf.shape
+    result = torch.zeros((*dims, num_k_sf, align(mn, 4)), dtype=sf.dtype, device=sf.device)[..., :mn]
+    result.copy_(sf.transpose(-1, -2))
+    return result.transpose(-1, -2)
+
+
 def relayout_fp4_weights_for_sm90_mega_moe(w: torch.Tensor) -> torch.Tensor:
     # Within each 64-byte K block of a row, 16-byte chunk `q` holds one word per 32-element group `g`: K `32g + 4q + i` with
     # the magnitude in bits `4i` and the sign in bit `8i + 7`, and K `32g + 16 + 4q + i` in bits `16 + 4i` and `8i + 3`
@@ -257,6 +271,10 @@ def transform_weights_for_mega_moe(
     _validate_activation(activation)
     if isinstance(l1_weights, tuple) and arch_major is None:
         arch_major = _get_weights_arch_major(l1_weights[0])
+    if isinstance(l1_weights, tuple) and arch_major == 9 and l1_weights[1].dtype == torch.float:
+        # FP8 with FP32 128x128 block scales: no requantization
+        return ((_interleave_weights(l1_weights[0]), transform_fp8_block_sf_for_sm90_mega_moe(*l1_weights, is_l1=True)),
+                (l2_weights[0], transform_fp8_block_sf_for_sm90_mega_moe(*l2_weights, is_l1=False)))
     if isinstance(l1_weights, tuple) and arch_major == 9:
         if l1_weights[0].dtype == torch.float8_e4m3fn:
             l1_weights, l2_weights = (requantize_fp8_weights_for_sm90_mega_moe(w) for w in (l1_weights, l2_weights))

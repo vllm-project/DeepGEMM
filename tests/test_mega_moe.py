@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 import deep_gemm
 from deep_gemm.utils import (
     align, ceil_div,
-    per_token_cast_to_fp4, per_token_cast_to_fp8,
+    per_block_cast_to_fp8, per_token_cast_to_fp4, per_token_cast_to_fp8,
     cast_back_from_fp4, cast_back_from_fp8
 )
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
@@ -71,7 +71,10 @@ def _exp2(exps: torch.Tensor, dtype: torch.dtype = torch.float) -> torch.Tensor:
 
 
 def _emu_weights(w: torch.Tensor, exps: torch.Tensor, gran_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    # MMA operand and per-(row, `gran_k`) promotion scale of weights with per-32 UE8M0 exponents
+    # MMA operand and per-(row, `gran_k`) promotion scale of weights with per-32 UE8M0 exponents,
+    # or of FP8 weights with FP32 scales per 128x128 block (`exps` is then float32 `[n / 128, k / 128]`)
+    if exps.dtype == torch.float:
+        return w.float(), exps.repeat_interleave(128, dim=0)
     n, num_sf = exps.shape
     exps = exps.int().view(n, -1, gran_k // 32)
     if w.dtype == torch.int8:
@@ -119,6 +122,9 @@ def _emu_expert(x: torch.Tensor, sx: torch.Tensor, l1_weights: Tuple, l2_weights
 
 
 def _hi_weights(w: torch.Tensor, exps: torch.Tensor) -> torch.Tensor:
+    if exps.dtype == torch.float:
+        # FP8 with FP32 128x128 block scales
+        return w.double() * exps.double().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
     cast_back = cast_back_from_fp4 if w.dtype == torch.int8 else cast_back_from_fp8
     return cast_back(w, _exp2(exps, torch.double), gran_k=32)
 
@@ -229,8 +235,30 @@ _SWEEP_CASES = (
 )
 
 
-def _get_sweep_args(args: argparse.Namespace, num_ranks: int):
-    cases = _SWEEP_CASES if num_ranks == 1 else \
+# GLM-5.3-Flash sweep (`--sweep-glm`, SM90): hidden 4096, intermediate 2048, top-8, 36 experts per rank are EP8 of the 288 experts
+# Small shapes cover L1 block rows that are not a multiple of 4 (TMA padding) and wide shared experts
+_GLM_BLOCK = dict(mma_type='fp8xfp8')
+_GLM_SWEEP_CASES = (
+    (1, 4096, 2048, 36, 8, 1, 10, 'random', dict(**_GLM_BLOCK, **_EXACT)),
+    (7, 4096, 2048, 36, 8, 1, 10, 'masked', _GLM_BLOCK),
+    (63, 4096, 2048, 36, 8, 0, 10, 'random', _GLM_BLOCK),
+    (129, 4096, 2048, 36, 8, 1, 10, 'random', dict(**_GLM_BLOCK, **_EXACT)),
+    (128, 4096, 2048, 36, 8, 1, 10, 'hot', _GLM_BLOCK),
+    (1000, 4096, 2048, 36, 8, 1, 10, 'masked', _GLM_BLOCK),
+    (4096, 4096, 2048, 36, 8, 1, 10, 'random', _GLM_BLOCK),
+    # More than 64 local experts: decode shapes, then BLOCK_M 128 with the middle register split
+    (129, 4096, 2048, 72, 8, 1, 10, 'random', _GLM_BLOCK),
+    (512, 4096, 2048, 72, 8, 1, 10, 'random', _GLM_BLOCK),
+    (1000, 4096, 2048, 72, 8, 0, 10, 'random', _GLM_BLOCK),
+    (4096, 4096, 2048, 72, 8, 1, 10, 'random', _GLM_BLOCK),
+    (63, 512, 384, 8, 6, 1, None, 'random', dict(**_GLM_BLOCK, **_EXACT)),
+    (129, 7168, 384, 8, 6, 2, 10, 'empty', _GLM_BLOCK),
+    (1000, 2048, 128, 48, 8, 2, 10, 'random', _GLM_BLOCK),
+)
+
+
+def _get_sweep_args(args: argparse.Namespace, num_ranks: int, is_glm: bool = False):
+    cases = _GLM_SWEEP_CASES if is_glm else _SWEEP_CASES if num_ranks == 1 else \
         sorted(_SWEEP_CASES, key=lambda case: case[0] * case[1] * case[2] * (case[4] + case[5]), reverse=True)[:20]
     for num_tokens, hidden, intermediate_hidden, num_experts_per_rank, num_topk, num_shared_experts, \
             activation_clamp, routing, extra in cases:
@@ -293,6 +321,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     assert not use_emu_reference or (not is_bf16xbf16 and args.activation in ('swiglu', 'swiglustep'))
     assert not is_exact_inputs or (use_emu_reference and not args.fast_math)
     assert not args.subnormal_probe or arch_major == 9
+    is_block_sf = arch_major == 9 and args.mma_type == 'fp8xfp8'
 
     # Allocate symmetric memory
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -313,8 +342,22 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     weight_generator = torch.Generator(device='cuda')
     weight_generator.manual_seed(0)
 
+    def make_block_weights(num_groups: int, n: int, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # FP8 values with one FP32 scale per 128x128 block, `[num_groups, n / 128, k / 128]`, with block magnitudes
+        # over 2^-3 to 2^3, so that the scales differ between blocks (and gate/up halves)
+        rand_kwargs = dict(generator=weight_generator, device='cuda')
+        w = torch.empty((num_groups, n, k), dtype=torch.float8_e4m3fn, device='cuda')
+        sf = torch.empty((num_groups, n // 128, k // 128), dtype=torch.float, device='cuda')
+        for i in range(num_groups):
+            block_scales = torch.exp2(torch.rand((n // 128, 1, k // 128, 1), **rand_kwargs) * 6 - 3)
+            x = (torch.randn((n // 128, 128, k // 128, 128), **rand_kwargs) * block_scales * k ** -0.5).view(n, k)
+            w[i], sf[i] = per_block_cast_to_fp8(x.bfloat16(), use_ue8m0=False)
+        return w, sf
+
     def make_weights(num_groups: int, n: int, k: int,
                      is_fp8: bool, is_l1: bool, is_routed: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        if is_block_sf and not is_exact_inputs:
+            return make_block_weights(num_groups, n, k)
         rand_kwargs = dict(generator=weight_generator, device='cuda')
         w = torch.empty((num_groups, n, k if is_fp8 else k // 2),
                         dtype=torch.float8_e4m3fn if is_fp8 else torch.int8, device='cuda')
@@ -356,7 +399,8 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 w[i] = torch.where(is_zero[:, :, None], zero_byte, w[i].view(torch.uint8).view(n, -1, 16)).view(n, -1).view(torch.int8)
                 e = torch.where(is_zero, 0, e)
             exps[i] = e
-        return w, exps
+        # Exact block-scale inputs take the power-of-two scale of the first row of each 128x128 block
+        return (w, _exp2(exps[:, ::128, ::4])) if is_block_sf else (w, exps)
 
     # Create inputs
     # noinspection PyGlobalUndefined
@@ -446,14 +490,16 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             all_l2_weights = make_weights(num_weight_experts, hidden, intermediate_hidden, is_fp8, False, True)
             local_experts = slice(rank_idx * num_experts_per_rank, (rank_idx + 1) * num_experts_per_rank) \
                 if use_emu_reference else slice(None)
-            l1_weights, l2_weights = ((w[local_experts], _to_mn_major_sf(e[local_experts].view(torch.int)))
+            # Block scales stay in the checkpoint layout: `transform_weights_for_mega_moe` keeps them compact
+            to_kernel_sf = (lambda e: e) if is_block_sf else (lambda e: _to_mn_major_sf(e.view(torch.int)))
+            l1_weights, l2_weights = ((w[local_experts], to_kernel_sf(e[local_experts]))
                                       for w, e in (all_l1_weights, all_l2_weights))
             if num_shared_experts > 0:
                 hi_shared_weights = ref_shared_weights = tuple((w[0], e[0]) for w, e in (
                     make_weights(1, shared_intermediate_hidden * 2, hidden, True, True, False),
                     make_weights(1, hidden, shared_intermediate_hidden, True, False, False)))
-                shared_l1_weights, shared_l2_weights = ((w, _to_mn_major_sf(e.view(torch.int))) for w, e in ref_shared_weights)
-                if arch_major == 9:
+                shared_l1_weights, shared_l2_weights = ((w, to_kernel_sf(e)) for w, e in ref_shared_weights)
+                if arch_major == 9 and not is_block_sf:
                     # The kernel takes the weights requantized by `transform_weights_for_mega_moe`
                     ref_shared_weights = tuple(
                         (w, sf.view(torch.uint8)) for w, sf in (deep_gemm.requantize_fp8_weights_for_sm90_mega_moe(
@@ -466,7 +512,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             transformed_shared_l1_weights, transformed_shared_l2_weights = (
                 deep_gemm.transform_weights_for_mega_moe(
                     shared_l1_weights, shared_l2_weights, activation=args.activation))
-            if arch_major == 9:
+            if arch_major == 9 and not is_block_sf:
                 # Requantizing in the kernel layout gives the same weights as before `transform_weights_for_mega_moe`
                 (l1_w, l1_sf), (l2_w, l2_sf) = shared_l1_weights, shared_l2_weights
                 for transformed, kernel_layout in (
@@ -874,6 +920,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert is_ring_wrapped.item(), 'No sweep case wraps the ring'
         if num_ranks == 1 and get_arch_major() == 9:
             assert {block_m for block_m, _ in results} == {16, 32, 64, 128}
+    elif args.sweep_glm:
+        assert get_arch_major() == 9, 'The GLM sweep covers the SM90 FP8 block-scale path'
+        results = [test_case(rank_idx, num_ranks, group, case_args) for case_args in _get_sweep_args(args, num_ranks, True)]
+        if num_ranks in (1, 8):
+            assert {block_m for block_m, _ in results} == {16, 32, 64, 128}
     else:
         test_case(rank_idx, num_ranks, group, argparse.Namespace(**_CASE_DEFAULTS, **vars(args)))
     dist.destroy_process_group()
@@ -914,6 +965,7 @@ if __name__ == '__main__':
     parser.add_argument('--empty-rank', type=int, default=-1)
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
     parser.add_argument('--sweep', action='store_true', help='Run the shape sweep (heaviest 20 cases with more than 1 rank)')
+    parser.add_argument('--sweep-glm', action='store_true', help='Run the GLM-5.3-Flash sweep (SM90)')
     parser.add_argument('--emu-reference', action='store_true', help='Check against the PyTorch reference (always on SM90)')
     parser.add_argument('--shared-gran-k', type=int, default=None, choices=(32, 128),
                         help='K granularity of the shared weight scales (default: 128 on SM90, 32 on SM100)')
