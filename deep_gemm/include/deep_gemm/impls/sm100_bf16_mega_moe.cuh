@@ -37,6 +37,7 @@ template <
     float kActivationBeta,
     bool kFastMath,
     bool kWithPostExpertNorm,
+    bool kWithSharedExpertWeights,
     bool kUseTrtllmWeights = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -58,6 +59,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_bf16_mega_moe_impl(void* y,
                          int* cumulative_local_expert_recv_stats,
                          const uint32_t num_tokens,
+                         const float* shared_expert_weights,
                          const float* post_expert_norm_gamma,
                          const float post_expert_norm_eps,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
@@ -141,6 +143,7 @@ sm100_bf16_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kUseTrtllmWeights or (not kHasShared and BLOCK_K == 64 and LOAD_BLOCK_N % 32 == 0),
                      "TRT-LLM BF16 weights require no shared experts, 64-element K blocks and 32-row aligned tiles");
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
+    DG_STATIC_ASSERT(not kWithSharedExpertWeights or kHasShared, "Shared expert weights require fused shared experts");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
 
     // Swizzle configs
@@ -942,6 +945,15 @@ sm100_bf16_mega_moe_impl(void* y,
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
                                 .template get_base_ptr<float>();
+                        }
+                        // Optional per-token shared-expert weight (e.g. Qwen's `sigmoid(shared_expert_gate(x))`),
+                        // applied where routed tokens apply their top-k weight. Shared rows are local token indices.
+                        if constexpr (kWithSharedExpertWeights) {
+                            if (task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                                (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                const uint32_t token_idx = pool_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx;
+                                stored_cached_weight = token_idx < num_tokens ? __ldg(shared_expert_weights + token_idx) : 0.0f;
+                            }
                         }
 
                         // Load weights from register cache
