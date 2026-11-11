@@ -154,19 +154,20 @@ void sm100_paged_mqa_logits_metadata(const uint32_t num_q_tokens_total,
             get_request_info(request_idx, q_token_idx, num_q_tokens, context_len);
             kv_split_idx = (target - cost_before) / (use_token_cost ? num_q_tokens : get_split_cost(num_q_tokens));
         }
-        reinterpret_cast<uint2*>(schedule_meta)[sm_idx] = make_uint2(q_token_idx, kv_split_idx);
+        reinterpret_cast<uint2*>(schedule_meta)[sm_idx] = make_uint2(q_token_idx, kv_split_idx * SPLIT_KV);
     }
 }
 
 // Visit requests chunk by chunk, reusing each chunk's KV across its Q blocks
-template <uint32_t kNumHeads, uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk>
+template <uint32_t kNumHeads, uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk,
+          bool kTracksRequestStart = false>
 struct SM100PagedMQALogitsScheduler {
     static constexpr bool kIsPaged = true;
     static constexpr uint32_t kPageKV = PAGE_KV;
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
     // Cache one page coordinate per lane
     static constexpr uint32_t kNumCachedPages = 32;
-    DG_STATIC_ASSERT(BLOCK_Q * kNumHeads <= 128, "Invalid Q block shape");
+    DG_STATIC_ASSERT(BLOCK_Q * kNumHeads <= 256, "Invalid Q block shape");
     DG_STATIC_ASSERT(SPLIT_KV % PAGE_KV == 0 and kNumPagesPerSplit <= kNumCachedPages, "Invalid split shape");
 
     using Info = RequestInfo<BLOCK_Q, SPLIT_KV, PAGE_KV>;
@@ -183,7 +184,9 @@ struct SM100PagedMQALogitsScheduler {
     uint32_t current_kv_split_base;
     uint32_t current_q_block_in_request;
 
-    // Preserve the emitted task's page lookup state as the request cursor advances
+    // Preserve the emitted task's page lookup state (and with `kTracksRequestStart`, its request's first row) as the
+    // request cursor advances
+    uint32_t task_request_q_token_start;
     const uint32_t* task_block_table_row;
     uint32_t task_num_kv_pages;
     uint32_t cached_page_base;
@@ -201,11 +204,13 @@ struct SM100PagedMQALogitsScheduler {
             block_table(block_table), block_table_stride(block_table_stride) {
         const auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
         const auto end = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx + 1];
+        // The metadata stores KV token offsets: both ends of every SM range round down to this kernel's splits the
+        // same way, so neighboring ranges still tile each request exactly
         end_q_token_idx = end.x;
-        end_kv_split_idx = end.y;
+        end_kv_split_idx = end.y / SPLIT_KV;
 
         current.q_token_start = start.x;
-        current_kv_split_base = start.y;
+        current_kv_split_base = start.y / SPLIT_KV;
         current_q_block_in_request = 0;
         if (has_work())
             current = Info::from_q_token(start.x, num_q_tokens_total, context_lens, indices);
@@ -231,6 +236,8 @@ struct SM100PagedMQALogitsScheduler {
         task.kv_token_base = current_kv_split_base * SPLIT_KV;
         task.num_kv_splits = (current.num_q_blocks == 1) ? remaining : cute::min(remaining, kSplitsPerChunk);
         task.kv_shared_with_prev = current_q_block_in_request > 0;
+        if constexpr (kTracksRequestStart)
+            task_request_q_token_start = current.q_token_start;
         task_block_table_row = block_table + current.q_token_start * static_cast<uint64_t>(block_table_stride);
         task_num_kv_pages = current.num_kv_pages;
         cached_page_base = cute::numeric_limits<uint32_t>::max();
@@ -263,6 +270,14 @@ struct SM100PagedMQALogitsScheduler {
             seq_k_end[token_idx] = ptx::exchange(lane_k_end, token_idx);
         }
         return true;
+    }
+
+    // KV entries the step's own tokens may write start at the emitted task's request's first-row context length
+    // minus one (the first row's own token)
+    CUTLASS_DEVICE uint32_t get_kv_before_grid_sync_end() const {
+        DG_STATIC_ASSERT(kTracksRequestStart, "The emitted task's request is not tracked");
+        const uint32_t context_len = context_lens[task_request_q_token_start];
+        return context_len > 0 ? context_len - 1 : 0;
     }
 
     // Warp-wide page lookup with a sliding cache; out-of-range pages map to zero
