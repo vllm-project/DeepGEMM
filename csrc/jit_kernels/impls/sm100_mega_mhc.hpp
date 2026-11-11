@@ -50,15 +50,24 @@ static void sm100_mega_mhc(
             static_cast<int>(tensor.stride(0)), swizzle_mode);
     };
 
-    const auto smem_size = static_cast<int>(sizeof(mhc_layout::SharedStorage));
+    // Grids with more tasks than SMs claim their tasks from a ticket ring instead of a static grid stride, which
+    // balances per-SM speed differences (the kernel's kUseTaskRing). The ticket counter is the last line of the
+    // zero-initialized split barriers (get_split_barriers), and the last claim of every launch resets it to zero.
+    // DG_MEGA_MHC_NO_TASK_RING=1 keeps the static grid stride.
+    const auto num_tasks = static_cast<uint64_t>(mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens))) *
+                           static_cast<uint64_t>(num_splits);
+    const bool use_task_ring = num_tasks > static_cast<uint64_t>(num_sms) and
+                               not deep_jit::get_env<int>("DG_MEGA_MHC_NO_TASK_RING");
+    const auto smem_size = static_cast<int>(use_task_ring ? sizeof(mhc_layout::SharedStorage<true>)
+                                                          : sizeof(mhc_layout::SharedStorage<false>));
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         printf("Mega %s mHC: T=%d, H=%d, splits=%d, IO/Fn/A stages=%u/%u/%u, "
-               "threads=%u, shared memory=%d\n",
+               "threads=%u, shared memory=%d, task ring=%d\n",
                is_shifted ? "shifted" : "normal", num_tokens, hidden, num_splits,
                mhc_layout::kNumIOStages, mhc_layout::kNumFnStages, mhc_layout::kNumAStages,
-               mhc_layout::kNumThreads, smem_size);
+               mhc_layout::kNumThreads, smem_size, static_cast<int>(use_task_ring));
     }
 
     // Tensor maps use fastest-moving dimensions first. Residual and Fn expose
@@ -104,6 +113,8 @@ static void sm100_mega_mhc(
         .y_primary_sf_stride_word = y_primary_sf.has_value() ? y_primary_sf->stride(1) : 0,
         .y_shared_sf = y_shared_sf.has_value() ? reinterpret_cast<uint32_t*>(y_shared_sf->mutable_data_ptr<int32_t>()) : nullptr,
         .y_shared_sf_stride_word = y_shared_sf.has_value() ? y_shared_sf->stride(1) : 0,
+        // MegaMoE SF pages are SF_BLOCK_M rows aligned to 128 (the stride the kernel hard-coded before)
+        .y_shared_sf_stride_page = shared_sf_block_m > 0 ? (static_cast<int64_t>(shared_sf_block_m) + 127) / 128 * 128 : 0,
     };
 
     // Compile
@@ -115,7 +126,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_mega_mhc_impl<
         {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -123,7 +134,8 @@ static void __instantiate_kernel() {{
         mix_args.new_prev_mix != nullptr,
         store_bf16,
         norm_args.y_fp8 != nullptr,
-        shared_sf_block_m));
+        shared_sf_block_m,
+        use_task_ring));
 
     // Launch
     jit->launch(

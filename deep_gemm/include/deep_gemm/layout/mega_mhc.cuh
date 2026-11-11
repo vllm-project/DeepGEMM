@@ -30,6 +30,11 @@ static constexpr uint32_t kNumAStages = 4;
 static constexpr uint32_t kNumAccumStages = 2;
 static constexpr uint32_t kNumCoeffStages = 2;
 static constexpr uint32_t kNumWarpsPerWG = 4;
+
+// Task-ring variant: tickets are broadcast to the Fn, MMA, store, Post and workspace-epilogue warps.
+static constexpr uint32_t kNumTaskSlots = 8;
+static constexpr uint32_t kNumTaskConsumerWarps = 3 + 2 * kNumWarpsPerWG + kNumWarpsPerWG;
+static constexpr uint32_t kInvalidTask = 0xffffffffu;
 static constexpr uint32_t kNumThreads = 6 * kNumWarpsPerWG * 32;
 
 // Split-K workspace geometry
@@ -70,6 +75,7 @@ struct NormArgs {
     int64_t y_primary_sf_stride_word;
     uint32_t* y_shared_sf;
     int64_t y_shared_sf_stride_word;
+    int64_t y_shared_sf_stride_page;
 };
 
 // View over global split partial scratch.
@@ -121,7 +127,7 @@ struct Workspace {
 
 };
 
-struct SharedStorage {
+struct SharedStorageBase {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // Route-major TMA layouts keep every 64 x 64 destination contiguous.
@@ -167,6 +173,19 @@ struct SharedStorage {
     alignas(uint32_t) uint32_t tmem_base;
     // Shifted Norm and fused Normal workers share this mutually exclusive task queue.
     alignas(uint32_t) uint32_t next_norm_task_ticket;
+    // Shifted Mix tokens are claimed by WG4 and, once its accumulators are drained, WG3.
+    alignas(uint32_t) uint32_t next_mix_ticket;
+};
+
+template <bool kUseTaskRing>
+struct SharedStorage: SharedStorageBase {};
+
+template <>
+struct SharedStorage<true>: SharedStorageBase {
+    // Task tickets: one producer (IO loader) and kNumTaskConsumerWarps consumer warps.
+    alignas(Barrier) Barrier full_task_barriers[kNumTaskSlots];
+    alignas(Barrier) Barrier empty_task_barriers[kNumTaskSlots];
+    alignas(uint32_t) uint32_t task_ring[kNumTaskSlots];
 };
 
 } // namespace deep_gemm::layout::mega_mhc
