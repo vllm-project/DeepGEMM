@@ -55,6 +55,9 @@ public:
     }
 
     static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) {
+        // NOTES: SM120 grouped layouts only take BLOCK_M 64 or 128 (`SM120ArchSpec::kMinBlockM`), so small per-group M stops at 64, not 32
+        if (jit->device.get_arch_major() == 12)
+            return expected_m.has_value() and expected_m.value() <= 64 ? 64 : 128;
         if (jit->device.get_arch_major() != 10)
             return kLegacyMKAlignmentForContiguousLayout;
 
