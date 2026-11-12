@@ -514,6 +514,7 @@ def fp8_fp4_mega_moe(
     activation_alpha,
     activation_beta,
     num_tokens_for_block_m=None,
+    shared_expert_weights_opt=None,
 ):
     return _torch_ops.fp8_fp4_mega_moe(
         y,
@@ -539,6 +540,7 @@ def fp8_fp4_mega_moe(
         activation_alpha,
         activation_beta,
         num_tokens_for_block_m,
+        shared_expert_weights_opt,
     )
 
 
@@ -562,6 +564,7 @@ def bf16_mega_moe(
     activation_beta,
     post_expert_norm_gamma_opt=None,
     post_expert_norm_eps=0.0,
+    shared_expert_weights_opt=None,
 ):
     return _torch_ops.bf16_mega_moe(
         y,
@@ -583,6 +586,7 @@ def bf16_mega_moe(
         activation_beta,
         post_expert_norm_gamma_opt,
         post_expert_norm_eps,
+        shared_expert_weights_opt,
     )
 
 
@@ -606,6 +610,7 @@ def bf16_mega_moe_trtllm(
     activation_beta,
     post_expert_norm_gamma_opt=None,
     post_expert_norm_eps=0.0,
+    shared_expert_weights_opt=None,
 ):
     return _torch_ops.bf16_mega_moe_trtllm(
         y,
@@ -627,6 +632,7 @@ def bf16_mega_moe_trtllm(
         activation_beta,
         post_expert_norm_gamma_opt,
         post_expert_norm_eps,
+        shared_expert_weights_opt,
     )
 
 

@@ -38,6 +38,7 @@ template <
     float kActivationAlpha,
     float kActivationBeta,
     bool kFastMath,
+    bool kWithSharedExpertWeights,
     typename weight_dtype_t,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -60,6 +61,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
+                            const float* shared_expert_weights,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
@@ -94,6 +96,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(not kWithSharedExpertWeights or kHasShared, "Shared expert weights require fused shared experts");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -1103,6 +1106,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
                                 .template get_base_ptr<float>();
+                        }
+                        // Optional per-token shared-expert weight (e.g. Qwen's `sigmoid(shared_expert_gate(x))`),
+                        // applied where routed tokens apply their top-k weight. Shared rows are local token indices.
+                        if constexpr (kWithSharedExpertWeights) {
+                            if (task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                                (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                const uint32_t token_idx = pool_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx;
+                                stored_cached_weight = token_idx < num_tokens ? __ldg(shared_expert_weights + token_idx) : 0.0f;
+                            }
                         }
 
                         // Load weights from register cache
