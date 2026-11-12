@@ -162,6 +162,21 @@ def _calc_token_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 _CASE_DEFAULTS = dict(exact_inputs=False, subnormal_probe=False, act_exp_range=0, weight_exp_span=None, weight_exp_shift=0,
                       zero_weight_groups=0)
 _EXACT = dict(exact_inputs=True, fast_math=0)
+_SM120_SWEEP_CASES = (
+    (0, 128, 128, 2, 2, 0, 10, 'random', {}),
+    (1, 128, 128, 1, 1, 0, None, 'random', _EXACT),
+    (7, 256, 384, 8, 6, 0, 10, 'masked', {}),
+    (16, 512, 128, 2, 2, 0, 0, 'random', {}),
+    (17, 256, 128, 2, 2, 0, 0.5, 'hot', _EXACT),
+    (33, 128, 256, 8, 6, 0, 10, 'empty', {}),
+    (65, 256, 384, 8, 6, 0, 10, 'random', dict(activation_alpha=1.25, activation_beta=0.125)),
+    (129, 128, 128, 2, 2, 0, None, 'masked', {}),
+    (7, 5120, 2304, 8, 6, 0, 10, 'random', {}),
+    (17, 5120, 2304, 8, 6, 0, 10, 'random', {}),
+    (65, 5120, 2304, 8, 6, 0, 10, 'random', dict(activation_alpha=1.25, activation_beta=0.125)),
+    (1601, 128, 128, 96, 1, 0, 10, 'hot', {}),
+    (16385, 128, 128, 2, 2, 0, 10, 'hot', {}),
+)
 _SWEEP_CASES = (
     (128, 2048, 256, 8, 6, 1, 10, 'random', dict(subnormal_probe=True, fast_math=0)),
     (1, 512, 128, 1, 1, 0, None, 'random', _EXACT),
@@ -230,11 +245,11 @@ _SWEEP_CASES = (
 
 
 def _get_sweep_args(args: argparse.Namespace, num_ranks: int):
-    cases = _SWEEP_CASES if num_ranks == 1 else \
+    cases = _SM120_SWEEP_CASES if get_arch_major() == 12 else _SWEEP_CASES if num_ranks == 1 else \
         sorted(_SWEEP_CASES, key=lambda case: case[0] * case[1] * case[2] * (case[4] + case[5]), reverse=True)[:20]
     for num_tokens, hidden, intermediate_hidden, num_experts_per_rank, num_topk, num_shared_experts, \
             activation_clamp, routing, extra in cases:
-        if get_arch_major() != 9 and (extra.get('subnormal_probe') or (extra.get('exact_inputs') and not args.emu_reference)):
+        if get_arch_major() not in (9, 12) and (extra.get('subnormal_probe') or (extra.get('exact_inputs') and not args.emu_reference)):
             continue
         yield argparse.Namespace(**{
             **_CASE_DEFAULTS, **vars(args),
@@ -255,6 +270,15 @@ def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
     dst[:num_tokens].copy_(src)
     if num_tokens < dst.shape[0]:
         dst[num_tokens:].copy_(src[-1:].expand(dst.shape[0] - num_tokens, -1))
+
+
+def _expect_sm120_rejection(call, message):
+    try:
+        call()
+    except RuntimeError as error:
+        assert message in str(error), str(error)
+    else:
+        raise AssertionError(f'SM120 MegaMoE must reject: {message}')
 
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
@@ -288,7 +312,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     arch_major = get_arch_major()
     gran_k = 128 if arch_major == 9 else 32
     shared_gran_k = args.shared_gran_k or gran_k
-    use_emu_reference = arch_major == 9 or args.emu_reference
+    use_emu_reference = arch_major in (9, 12) or args.emu_reference
     is_exact_inputs = args.exact_inputs or args.subnormal_probe
     assert not use_emu_reference or (not is_bf16xbf16 and args.activation in ('swiglu', 'swiglustep'))
     assert not is_exact_inputs or (use_emu_reference and not args.fast_math)
@@ -303,13 +327,12 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
         mma_type=args.mma_type,
         activation=args.activation
     )
-    # SM90 ranks choose one BLOCK_M from the mean tokens per rank
     num_tokens_for_block_m = ceil_div(sum(num_tokens_per_rank), num_ranks) \
-        if num_tokens_per_rank and arch_major == 9 else num_tokens
+        if num_tokens_per_rank and arch_major in (9, 12) and not args.local_tile_selection else num_tokens
+    assert not args.local_tile_selection or (arch_major == 12 and num_ranks > 1)
     block_m = deep_gemm.get_block_m_for_mega_moe(
         num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens_for_block_m, num_topk, args.mma_type)
 
-    # Weights as (FP4 or FP8 values, per-32 UE8M0 exponents), identical on every rank
     weight_generator = torch.Generator(device='cuda')
     weight_generator.manual_seed(0)
 
@@ -377,12 +400,19 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
         routing_bias = torch.zeros(num_experts, dtype=torch.float, device='cuda')
         if args.routing == 'hot':
             routing_bias[0] = float('inf')
+        elif args.routing == 'rank-hot':
+            assert num_topk <= num_ranks
+            routing_bias[torch.arange(num_topk, device='cuda') * num_experts_per_rank] = float('inf')
         elif args.routing == 'empty':
             routing_bias[1::2] = -float('inf')
         topk_idx = torch.topk(scores + routing_bias, num_topk, dim=-1, largest=True, sorted=False)[1]
         topk_weights = scores.gather(1, topk_idx)
         if is_exact_inputs:
             topk_weights = _exp2(torch.randint(126, 129, topk_weights.shape, device='cuda'))
+        if args.routing == 'empty':
+            empty_selections = topk_idx % 2 == 1
+            topk_idx.masked_fill_(empty_selections, -1)
+            topk_weights.masked_fill_(empty_selections, 0)
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
         cumulative_local_expert_recv_stats_baseline = cumulative_local_expert_recv_stats_fused.clone()
@@ -501,7 +531,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
-    def run_fused():
+    def run_fused(block_m_tokens: Optional[int] = None):
         cumulative_local_expert_recv_stats_fused.copy_(initial_cumulative_local_expert_recv_stats_fused)
         copy_inputs_to_buffer()
 
@@ -518,8 +548,8 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
         if args.post_expert_norm:
             kernel_kwargs.update(post_expert_norm_gamma=norm_gamma,
                                  post_expert_norm_eps=1e-8)
-        if arch_major == 9:
-            kernel_kwargs.update(num_tokens_for_block_m=num_tokens_for_block_m)
+        if arch_major in (9, 12) and (not args.local_tile_selection or block_m_tokens is not None):
+            kernel_kwargs.update(num_tokens_for_block_m=num_tokens_for_block_m if block_m_tokens is None else block_m_tokens)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -540,6 +570,8 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     dist_print(f' > Shared experts: {num_shared_experts}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
     dist_print(f' > Block M: {block_m}', once_in_node=True)
+    if args.local_tile_selection:
+        dist_print(f' > Rank {rank_idx}: local tile selection, {num_tokens} tokens, BLOCK_M={block_m}')
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
     dist_print(once_in_node=True)
 
@@ -739,6 +771,24 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             create_inputs()
             fused_y, fused_stats = run_fused()
             fused_stats = fused_stats.clone()
+            if arch_major == 12 and i == 0 and hidden == 128 and intermediate_hidden == 128:
+                kernel_args = dict(y=fused_y, l1_weights=l1_weights, l2_weights=l2_weights, sym_buffer=buffer)
+                for unsupported_activation in ('situ', 'swiglustep'):
+                    _expect_sm120_rejection(
+                        lambda: deep_gemm.fp8_fp4_mega_moe(**kernel_args, activation=unsupported_activation),
+                        'SM120 MegaMoE supports only SwiGLU')
+                fp8_l1 = (torch.zeros((num_experts_per_rank, intermediate_hidden * 2, hidden),
+                                     device='cuda', dtype=torch.float8_e4m3fn), l1_weights[1])
+                fp8_l2 = (torch.zeros((num_experts_per_rank, hidden, intermediate_hidden),
+                                     device='cuda', dtype=torch.float8_e4m3fn), l2_weights[1])
+                _expect_sm120_rejection(
+                    lambda: deep_gemm.fp8_fp4_mega_moe(y=fused_y, l1_weights=fp8_l1, l2_weights=fp8_l2, sym_buffer=buffer),
+                    'SM120 MegaMoE supports only FP8 x FP4')
+                _expect_sm120_rejection(
+                    lambda: deep_gemm.fp8_fp4_mega_moe(**kernel_args,
+                        shared_l1_weights=(fp8_l1[0][0], fp8_l1[1][0]),
+                        shared_l2_weights=(fp8_l2[0][0], fp8_l2[1][0])),
+                    'SM120 MegaMoE does not fuse shared experts')
             assert torch.equal(run_fused()[0], fused_y), 'Relaunch is not bit-identical'
             assert torch.equal(fused_stats, initial_cumulative_local_expert_recv_stats_fused + get_num_recv_tokens_per_expert())
             ref_y = _moe_reference(
@@ -756,6 +806,41 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             max_diff, max_token_diff_limit = (1e-4, 3e-3) if arch_major == 9 else (1e-5, 1e-4)
             assert diff < max_diff and max_token_diff < max_token_diff_limit and hi_diff < 2e-3, \
                 f'calc_diff={diff}, max_token_diff={max_token_diff}, hi_diff={hi_diff}'
+            if arch_major == 12:
+                expected = fused_y.clone()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_y, graph_stats = run_fused()
+                for replay_idx in range(2):
+                    graph_y.fill_(float('nan'))
+                    graph_stats.fill_(-1)
+                    graph.replay()
+                    assert torch.equal(graph_y, expected), f'CUDA graph replay {replay_idx} changes the output'
+                    assert torch.equal(graph_stats, fused_stats), f'CUDA graph replay {replay_idx} changes receive stats'
+                if num_ranks == 1 and num_tokens >= 65 and i == 0:
+                    tile_graphs = []
+                    for requested_block_m, expected_tokens in ((16, 0), (32, 16), (64, 32)):
+                        block_m_tokens = ceil_div(expected_tokens * num_experts, num_ranks * num_topk)
+                        selected_block_m = deep_gemm.get_block_m_for_mega_moe(
+                            num_ranks, num_experts, buffer.num_max_tokens_per_rank, block_m_tokens, num_topk, args.mma_type)
+                        assert selected_block_m == requested_block_m
+                        eager_y, eager_stats = run_fused(block_m_tokens)
+                        expected_y, expected_stats = eager_y.clone(), eager_stats.clone()
+                        tile_diff = calc_diff(eager_y, ref_y)
+                        tile_token_diff = max(_calc_token_diff(eager_y, ref_y).tolist(), default=0)
+                        assert tile_diff < max_diff and tile_token_diff < max_token_diff_limit and calc_diff(eager_y, hi_y) < 2e-3
+                        tile_graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(tile_graph):
+                            tile_y, tile_stats = run_fused(block_m_tokens)
+                        tile_graphs.append((tile_graph, tile_y, tile_stats, expected_y, expected_stats))
+                    for replay_idx, tile_idx in enumerate((0, 1, 2, 1, 0, 2) * 2):
+                        tile_graph, tile_y, tile_stats, expected_y, expected_stats = tile_graphs[tile_idx]
+                        tile_y.fill_(float('nan'))
+                        tile_stats.fill_(-1)
+                        tile_graph.replay()
+                        assert torch.equal(tile_y, expected_y), f'Shared-buffer tile graph replay {replay_idx} changes output'
+                        assert torch.equal(tile_stats, expected_stats), f'Shared-buffer tile graph replay {replay_idx} changes stats'
+                    dist_print(' > SM120 shared-buffer M16/M32/M64 graph replay passed', once_in_node=True)
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
 
@@ -792,8 +877,25 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
 
     # Count local received tokens, and whether the pool outlives the L1/L2 ring
     num_recv_tokens_per_expert = get_num_recv_tokens_per_expert()
+    if args.routing == 'empty':
+        empty_experts = (torch.arange(num_experts_per_rank, device='cuda') + rank_idx * num_experts_per_rank) % 2 == 1
+        assert not num_recv_tokens_per_expert[empty_experts].any().item(), 'Empty experts receive routed tokens'
     num_recv_tokens = num_recv_tokens_per_expert.sum().item()
-    is_ring_wrapped = ceil_div(num_recv_tokens_per_expert, block_m).sum().item() > buffer.l1_acts.size(0) // block_m
+    num_ring_slots = min(deep_gemm.get_num_sms() * {16: 4, 32: 3, 64: 2}[block_m],
+                         buffer.l1_acts.size(0) // block_m, buffer.l1_acts_sf.size(0) // 128) \
+        if arch_major == 12 else buffer.l1_acts.size(0) // block_m
+    if arch_major == 12:
+        num_ring_slots = min(num_ring_slots, buffer.l1_acts.size(0) // (block_m * (2 if num_ranks > 1 else 1)))
+    num_recv_tiles = ceil_div(num_recv_tokens_per_expert, block_m).sum().item()
+    is_ring_wrapped = num_recv_tiles > num_ring_slots
+    if arch_major == 12:
+        dist_print(f' > SM120 live ring: {num_ring_slots} slots; buffered peer output: {num_ranks > 1}; '
+                   f'rank {rank_idx}: {num_recv_tiles} tiles; wraps: {is_ring_wrapped}')
+    if args.correctness_only:
+        dist.barrier()
+        buffer.destroy()
+        ep_buffer.destroy() if is_legacy_loaded else None
+        return block_m, is_ring_wrapped
 
     # Benchmark
     barrier_kwargs = {'wait_comm_stream': False} if hasattr(deep_ep, 'EPBuffer') else {'use_comm_stream': False}
@@ -869,13 +971,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     if args.sweep:
         results = [test_case(rank_idx, num_ranks, group, case_args) for case_args in _get_sweep_args(args, num_ranks)]
+    else:
+        results = [test_case(rank_idx, num_ranks, group, argparse.Namespace(**_CASE_DEFAULTS, **vars(args)))]
+    if args.sweep or args.require_ring_wrap:
         is_ring_wrapped = torch.tensor([any(is_ring_wrapped for _, is_ring_wrapped in results)], dtype=torch.int, device='cuda')
         dist.all_reduce(is_ring_wrapped, op=dist.ReduceOp.MAX, group=group)
-        assert is_ring_wrapped.item(), 'No sweep case wraps the ring'
-        if num_ranks == 1 and get_arch_major() == 9:
-            assert {block_m for block_m, _ in results} == {16, 32, 64, 128}
-    else:
-        test_case(rank_idx, num_ranks, group, argparse.Namespace(**_CASE_DEFAULTS, **vars(args)))
+        case_label = 'sweep case' if args.sweep else 'test case'
+        assert is_ring_wrapped.item(), f'No {case_label} wraps the ring'
+    if args.sweep and num_ranks == 1 and get_arch_major() == 9:
+        assert {block_m for block_m, _ in results} == {16, 32, 64, 128}
+    if args.require_ring_wrap_tiles:
+        assert get_arch_major() == 12, 'Per-tile ring assertions require SM120'
+        wrapped_tiles = torch.tensor([
+            any(block_m == required_tile and is_ring_wrapped for block_m, is_ring_wrapped in results)
+            for required_tile in args.require_ring_wrap_tiles
+        ], dtype=torch.int, device='cuda')
+        dist.all_reduce(wrapped_tiles, op=dist.ReduceOp.MAX, group=group)
+        unwrapped_tiles = [tile for tile, wrapped in zip(args.require_ring_wrap_tiles, wrapped_tiles.tolist()) if not wrapped]
+        assert not unwrapped_tiles, f'No test case wraps the requested M tiles: {unwrapped_tiles}'
     dist.destroy_process_group()
 
 
@@ -884,6 +997,12 @@ if __name__ == '__main__':
 
     # Resource settings
     parser.add_argument('--ncu-profile-only', action='store_true', help='Only run profiling without correctness test')
+    parser.add_argument('--correctness-only', action='store_true', help='Skip timing and profiling after correctness checks')
+    parser.add_argument('--require-ring-wrap', action='store_true', help='Fail unless at least one rank exceeds its live ring slots')
+    parser.add_argument('--require-ring-wrap-tiles', type=int, nargs='+', choices=(16, 32, 64),
+                        help='SM120: require at least one rank to wrap each requested tile ring')
+    parser.add_argument('--local-tile-selection', action='store_true',
+                        help='SM120 multi-rank regression: choose each rank tile from its local token count')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
 
     # Model settings
@@ -903,8 +1022,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
-    parser.add_argument('--routing', type=str, default='random', choices=('random', 'hot', 'empty'),
-                        help='Every token picks expert 0 (hot), or odd experts get no tokens (empty)')
+    parser.add_argument('--routing', type=str, default='random', choices=('random', 'hot', 'rank-hot', 'empty'),
+                        help='hot pins one slot to expert 0; rank-hot hits the first top-k ranks; empty excludes odd experts')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
     parser.add_argument('--use-localization', action='store_true', help='Localize the weights into the locality domains (requires MLOPart)')
@@ -913,8 +1032,8 @@ if __name__ == '__main__':
     parser.add_argument('--post-expert-norm', action='store_true')
     parser.add_argument('--empty-rank', type=int, default=-1)
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
-    parser.add_argument('--sweep', action='store_true', help='Run the shape sweep (heaviest 20 cases with more than 1 rank)')
-    parser.add_argument('--emu-reference', action='store_true', help='Check against the PyTorch reference (always on SM90)')
+    parser.add_argument('--sweep', action='store_true', help='Run the architecture-specific shape sweep')
+    parser.add_argument('--emu-reference', action='store_true', help='Check against the PyTorch reference (always on SM90/SM120)')
     parser.add_argument('--shared-gran-k', type=int, default=None, choices=(32, 128),
                         help='K granularity of the shared weight scales (default: 128 on SM90, 32 on SM100)')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')

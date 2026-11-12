@@ -40,7 +40,8 @@ if __name__ == '__main__':
     else:
         # Get all test functions except those related to cuBLAS
         files = [f for f in os.listdir(script_dir) if f.endswith('.py')]
-        exclude_files = ['test_sanitizer.py', 'generators.py', 'test_mega_moe.py', 'test_locality_domain.py']
+        exclude_files = ['test_sanitizer.py', 'generators.py', 'test_mega_moe.py', 'test_locality_domain.py',
+                         'test_sm120_mega_moe_checkpoint.py', 'test_sm120_mega_moe_indexing.py']
         funcs = [
             (module_name, name)
             for module_name in [os.path.splitext(f)[0] for f in files if f not in exclude_files]
