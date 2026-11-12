@@ -293,7 +293,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_alpha: float = 1.0,
                      activation_beta: float = 0.0,
                      num_tokens_for_block_m: Optional[int] = None):
-    # SM90: `num_tokens_for_block_m` (default: this rank's tokens) picks BLOCK_M; pass one value on all ranks
+    """Pass mean tokens/rank to select a common BLOCK_M; SM120 also supports rank-local tile choices."""
     _validate_activation(activation)
     recipe = recipe or ((1, 1, 128) if torch.cuda.get_device_capability(y.device)[0] == 9 else (1, 1, 32))
     _C.fp8_fp4_mega_moe(
