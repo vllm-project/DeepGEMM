@@ -19,6 +19,7 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 #include "../jit_kernels/impls/sm100_fp4_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp4_mega_moe.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
@@ -135,11 +136,15 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
 
     // Iterate all block candidates to get the maximum ring size
     int num_ring_tokens = 0;
-    for (const auto& block_m: layout::kCandidateBlockM) {
-        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
-            num_pool_blocks, num_sms, hidden, intermediate_hidden);
-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+    if (jit->device.get_arch_major() == 12) {
+        num_ring_tokens = num_sms * kSM120MegaMoERingTokensPerSM;
+    } else {
+        for (const auto& block_m: layout::kCandidateBlockM) {
+            const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+            const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+                num_pool_blocks, num_sms, hidden, intermediate_hidden);
+            num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+        }
     }
     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
 
@@ -154,10 +159,14 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
     if (with_sf) {
-        for (auto block_m: layout::kCandidateBlockM) {
-            num_sf_ring_tokens = std::max(
-                num_sf_ring_tokens,
-                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+        if (jit->device.get_arch_major() == 12) {
+            num_sf_ring_tokens = num_sms * kSM120MegaMoECTAsPerSM * 128;
+        } else {
+            for (auto block_m: layout::kCandidateBlockM) {
+                num_sf_ring_tokens = std::max(
+                    num_sf_ring_tokens,
+                    layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+            }
         }
     }
 
@@ -326,6 +335,10 @@ static void fp8_fp4_mega_moe(
     // Config checks
     // On SM90, the recipe sets the activation SF granularity only, weight SF stay packed per 32
     const auto arch_major = jit->device.get_arch_major();
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(activation == "swiglu" and "SM120 MegaMoE supports only SwiGLU");
+        DG_HOST_ASSERT(not shared_l1_weights_tuple_opt.has_value() and "SM120 MegaMoE does not fuse shared experts");
+    }
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == (arch_major == 9 ? 128 : 32));
@@ -353,6 +366,10 @@ static void fp8_fp4_mega_moe(
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
     DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
     const auto weight_dtype = l1_weights.scalar_type();
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(weight_dtype == kPackedFP4 and "SM120 MegaMoE supports only FP8 x FP4");
+        DG_HOST_ASSERT(not is_localized(l1_weights) and "SM120 MegaMoE does not support localized weights");
+    }
     DG_HOST_ASSERT(weight_dtype == torch::headeronly::ScalarType::Float8_e4m3fn or weight_dtype == kPackedFP4);
     DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
@@ -447,6 +464,13 @@ static void fp8_fp4_mega_moe(
             launch(sm100_fp8_fp4_mega_moe,
                    activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
         }
+    } else if (arch_major == 12) {
+        sm120_fp8_fp4_mega_moe(y, l1_acts, l1_acts_sf,
+            l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
+            cumulative_local_expert_recv_stats, sym_buffer_ptrs,
+            rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
+            num_tokens, checked_int(num_tokens_for_block_m.value_or(num_tokens)), num_topk, hidden, intermediate_hidden,
+            activation_clamp, activation_alpha, activation_beta, fast_math);
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(activation != "situ");
         DG_HOST_ASSERT(weight_dtype == kPackedFP4);

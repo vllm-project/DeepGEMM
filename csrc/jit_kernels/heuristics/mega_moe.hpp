@@ -69,6 +69,14 @@ struct MegaMoEConfig {
 };
 
 // We need to distribute work across locality domains, so we must use the whole GPU
+static constexpr int kSM120MegaMoECTAsPerSM = 4;
+static constexpr int kSM120MegaMoERingTokensPerSM = 128;
+
+static int get_num_ctas_per_sm_for_sm120_mega_moe(const int block_m) {
+    DG_HOST_ASSERT(block_m == 16 or block_m == 32 or block_m == 64);
+    return block_m == 16 ? kSM120MegaMoECTAsPerSM : block_m == 32 ? 3 : 2;
+}
+
 static int get_num_sms_for_mega_moe() {
     const auto num_sms = runtime->get_num_sms();
     DG_HOST_ASSERT(num_sms == jit->device.get_num_sms());
@@ -114,6 +122,11 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
         if (num_expected_tokens > 24)
             block_m = (num_covered_tokens <= 96 or num_experts / num_ranks > 64) ? 64 : 128;
         return {2, block_m, block_m, std::min(block_m, 32), 128, 2 * 128};
+    }
+    if (jit->device.get_arch_major() == 12) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::MXFP8FP4);
+        const int block_m = num_expected_tokens <= 10 ? 16 : num_expected_tokens <= 24 ? 32 : 64;
+        return {1, block_m, block_m, block_m, 128, 64};
     }
 
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
