@@ -276,6 +276,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, peer_amax);
     DG_STATIC_ASSERT(not kRoutedFP8 or (offsetof(SharedStorage, smem_sfb) % 128 == 0 and sizeof(SharedStorage::smem_sfb[0]) % 128 == 0),
                      "Block weight SF TMA destinations must be 128-byte aligned");
+    DG_STATIC_ASSERT(sizeof(SharedStorage) <= 232448, "Shared storage exceeds the SM90 shared memory per block");
+    if (threadIdx.x == 0) {
+        uint32_t num_dynamic_smem_bytes;
+        asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(num_dynamic_smem_bytes));
+        DG_DEVICE_ASSERT(sizeof(SharedStorage) <= num_dynamic_smem_bytes);
+    }
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
     // Send buffers
