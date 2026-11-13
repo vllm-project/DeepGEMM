@@ -35,8 +35,14 @@ inline void init_jit(const std::string& library_root_path) {
 
         runtime->default_compiler_options.nvcc_flags->
             emplace_back("--diag-suppress=39,161,174,177,186,940");
+#if defined(_WIN32)
+        // Keep deprecation suppression in MSVC syntax
+        runtime->default_compiler_options.nvcc_flags->
+            emplace_back("--compiler-options=/wd4996");
+#else
         runtime->default_compiler_options.nvcc_flags->
             emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
+#endif
         return runtime;
     });
 }

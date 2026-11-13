@@ -1,6 +1,8 @@
 #pragma once
 
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 #include <initializer_list>
 #include <string>
@@ -98,14 +100,24 @@ static PyObject* get_device_uuid() {
 }
 
 static bool is_available() {
+#if defined(_WIN32)
+    // Windows CUDA does not support localization and reports one locality domain.
+    // CUDA Programming Guide 4.7.5.3, "Compatibility Notes":
+    // https://docs.nvidia.com/cuda/cuda-programming-guide/
+    return false;
+#else
     const GILGuard gil;
     const auto result = call("is_available", {get_device_uuid()});
     const auto available = PyObject_IsTrue(result.get());
     check_python_error();
     return available == 1;
+#endif
 }
 
 static CUmemGenericAllocationHandle create_memory(const size_t& num_bytes, const int& domain_idx) {
+#if defined(_WIN32)
+    DG_HOST_UNREACHABLE("Locality allocation is unavailable in Windows CUDA");
+#else
     int fd;
     {
         const GILGuard gil;
@@ -118,6 +130,7 @@ static CUmemGenericAllocationHandle create_memory(const size_t& num_bytes, const
         &handle, reinterpret_cast<void*>(static_cast<intptr_t>(fd)), CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
     close(fd);
     return handle;
+#endif
 }
 
 static void release() {
