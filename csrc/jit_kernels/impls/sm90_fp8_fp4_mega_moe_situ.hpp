@@ -127,7 +127,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}, {}, {},
         {}, {},
         {},
