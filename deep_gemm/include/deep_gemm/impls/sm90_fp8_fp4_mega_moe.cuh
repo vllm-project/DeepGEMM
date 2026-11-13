@@ -1592,8 +1592,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), math_thread_idx), peer_grid_idx);
 
         // Barrier with dispatch warps, so that they can do clean workspace
-        ordered_ptx::sync_unaligned(kNumDispatchThreads + kNumMathThreads, kDispatchWithMathBarrierIdx);
         ordered_ptx::fence_view_async_shared();
+        ordered_ptx::sync_unaligned(kNumDispatchThreads + kNumMathThreads, kDispatchWithMathBarrierIdx);
 
         // Iterate over all token chunks
         const auto grid_idx = ptx::get_grid_idx() + 1;
