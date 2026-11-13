@@ -19,6 +19,7 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 #include "../jit_kernels/impls/sm100_fp4_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe_situ.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
@@ -455,26 +456,34 @@ static void fp8_fp4_mega_moe(
                    activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
         }
     } else if (arch_major == 9) {
-        DG_HOST_ASSERT(activation != "situ");
-        // FP8 shared weights of FP4 kernels need one exponent per SF word, see `requantize_fp8_weights_for_sm90_mega_moe`
-        sm90_fp8_fp4_mega_moe(y,
-                              l1_acts, l1_acts_sf,
-                              l2_acts, l2_acts_sf,
-                              shared_l1_acts, shared_l1_acts_sf,
-                              shared_l2_acts, shared_l2_acts_sf,
-                              l1_weights, l2_weights,
-                              l1_weights_sf, l2_weights_sf,
-                              shared_l1_weights, shared_l2_weights,
-                              shared_l1_weights_sf, shared_l2_weights_sf,
-                              cumulative_local_expert_recv_stats,
-                              sym_buffer_ptrs,
-                              rank_idx, num_max_tokens_per_rank,
-                              num_experts_per_rank,
-                              num_shared_experts,
-                              num_tokens, checked_int(num_tokens_for_block_m.value_or(num_tokens)), num_topk,
-                              hidden, intermediate_hidden,
-                              activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math,
-                              routed_fp8);
+        DG_HOST_ASSERT(weight_dtype == kPackedFP4);
+        // FP8 shared weights need one exponent per SF word, see `requantize_fp8_weights_for_sm90_mega_moe`
+        const auto launch = [&](const auto kernel, const auto&... activation_args) {
+            kernel(y,
+                   l1_acts, l1_acts_sf,
+                   l2_acts, l2_acts_sf,
+                   shared_l1_acts, shared_l1_acts_sf,
+                   shared_l2_acts, shared_l2_acts_sf,
+                   l1_weights, l2_weights,
+                   l1_weights_sf, l2_weights_sf,
+                   shared_l1_weights, shared_l2_weights,
+                   shared_l1_weights_sf, shared_l2_weights_sf,
+                   cumulative_local_expert_recv_stats,
+                   sym_buffer_ptrs,
+                   rank_idx, num_max_tokens_per_rank,
+                   num_experts_per_rank,
+                   num_shared_experts,
+                   num_tokens, checked_int(num_tokens_for_block_m.value_or(num_tokens)), num_topk,
+                   hidden, intermediate_hidden,
+                   activation_args...);
+        }, routed_fp8);
+        if (activation == "situ") {
+            launch(sm90_fp8_fp4_mega_moe_situ,
+                   activation_alpha, activation_beta, fast_math);
+        } else {
+            launch(sm90_fp8_fp4_mega_moe,
+                   activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
