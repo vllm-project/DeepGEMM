@@ -23,12 +23,20 @@
 
 namespace deep_gemm {
 
+CUTLASS_DEVICE float2 situ_add_f32x2(const float2& a, const float2& b) {
+    return {__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y)};
+}
+
+CUTLASS_DEVICE float2 situ_mul_f32x2(const float2& a, const float2& b) {
+    return {__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)};
+}
+
 template <bool kFastMath>
 CUTLASS_DEVICE float2 situ_sigmoid_f32x2(const float2& values) {
     const auto exponentials = make_float2(
         kFastMath ? __expf(-values.x) : expf(-values.x),
         kFastMath ? __expf(-values.y) : expf(-values.y));
-    const auto denominators = __fadd2_rn({1.0f, 1.0f}, exponentials);
+    const auto denominators = situ_add_f32x2({1.0f, 1.0f}, exponentials);
     if constexpr (kFastMath) {
         return {math::fast_rcp(denominators.x), math::fast_rcp(denominators.y)};
     } else {
@@ -40,8 +48,8 @@ template <bool kFastMath>
 CUTLASS_DEVICE float2 situ_tanh_f32x2(const float2& values) {
     // Match FlashInfer: tanh(x) = 2 * sigmoid(2 * x) - 1.
     const auto sigmoid = situ_sigmoid_f32x2<kFastMath>(
-        __fmul2_rn(values, {2.0f, 2.0f}));
-    return __fadd2_rn(__fmul2_rn(sigmoid, {2.0f, 2.0f}), {-1.0f, -1.0f});
+        situ_mul_f32x2(values, {2.0f, 2.0f}));
+    return situ_add_f32x2(situ_mul_f32x2(sigmoid, {2.0f, 2.0f}), {-1.0f, -1.0f});
 }
 
 // `ptx` helpers with a `memory` clobber, so that plain memory accesses are not reordered across them
@@ -1101,22 +1109,22 @@ sm90_fp8_fp4_mega_moe_situ_impl(void* y,
                         const auto gate = __bfloat1622float2(bf16_gate);
                         auto up = __bfloat1622float2(bf16_up);
                         constexpr float kInvActivationAlpha = 1.0f / kActivationAlpha;
-                        const auto gated = __fmul2_rn(
-                            __fmul2_rn(
+                        const auto gated = situ_mul_f32x2(
+                            situ_mul_f32x2(
                                 situ_tanh_f32x2<kFastMath>(
-                                    __fmul2_rn(gate, {kInvActivationAlpha, kInvActivationAlpha})),
+                                    situ_mul_f32x2(gate, {kInvActivationAlpha, kInvActivationAlpha})),
                                 {kActivationAlpha, kActivationAlpha}),
                             situ_sigmoid_f32x2<kFastMath>(gate));
 
                         // A zero beta leaves FlashInfer's optional situ_linear_beta unset.
                         if constexpr (kActivationBeta > 0.0f) {
                             constexpr float kInvActivationBeta = 1.0f / kActivationBeta;
-                            up = __fmul2_rn(
+                            up = situ_mul_f32x2(
                                 situ_tanh_f32x2<kFastMath>(
-                                    __fmul2_rn(up, {kInvActivationBeta, kInvActivationBeta})),
+                                    situ_mul_f32x2(up, {kInvActivationBeta, kInvActivationBeta})),
                                 {kActivationBeta, kActivationBeta});
                         }
-                        activations[t][i] = __fmul2_rn(__fmul2_rn(gated, up), weights);
+                        activations[t][i] = situ_mul_f32x2(situ_mul_f32x2(gated, up), weights);
                     }
                 }
 
