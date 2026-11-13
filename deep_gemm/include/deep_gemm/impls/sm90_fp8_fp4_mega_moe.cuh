@@ -3,6 +3,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 // With tokens on M, the code after the `return` or `continue` of its branches is not reachable
+#pragma nv_diagnostic push
 #pragma nv_diag_suppress 128
 
 #include <cstdint>
@@ -1706,4 +1707,5 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
 } // namespace deep_gemm
 
+#pragma nv_diagnostic pop
 #pragma clang diagnostic pop
