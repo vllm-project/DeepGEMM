@@ -1251,7 +1251,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                     // Every warp sends the amax of its 16 tokens to the peer CTA, whose barrier takes all of them
                     // NOTES: only thread 0 sets the expected bytes, a transaction count may go negative until then
-                    // The complete-tx of `st.async` is a cluster-scope release, so it needs no fence
+                    // `st.async` is a weak write, so order the earlier shared memory accesses at cluster scope before it,
+                    // as the cooperative epilogue does
+                    ptx::fence_acq_rel_cluster();
                     if (epilogue_thread_idx == 0)
                         peer_amax_full_barrier.arrive_and_expect_tx(BLOCK_M * sizeof(float), peer_cta_idx);
                     if (quad_idx < 2) {
