@@ -12,6 +12,10 @@ namespace deep_gemm::layout {
 
 static constexpr int kNumCandidateBlockMs = 8;
 static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 240};
+
+// SM90 128x128 block weight SF: each pipeline stage loads a box of 4 FP32 block scales into storage padded to 128 bytes for TMA
+static constexpr uint32_t kNumBlockSFWords = 4;
+static constexpr uint32_t kNumBlockSFStageWords = 32;
 static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 1920;

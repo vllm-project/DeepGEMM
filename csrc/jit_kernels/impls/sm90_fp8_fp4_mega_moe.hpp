@@ -35,7 +35,8 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& clamp_after_silu,
     const float& activation_alpha,
     const float& activation_beta,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& routed_fp8
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -48,7 +49,7 @@ static void sm90_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens_for_block_m, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4, num_shared_experts);
+        MmaKind::MXFP8FP4, num_shared_experts, routed_fp8);
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -59,26 +60,34 @@ static void sm90_fp8_fp4_mega_moe(
     };
     const auto sf_desc = [&](const torch::stable::Tensor& sf, const int& shape_mn, const int& shape_k,
                              const int& block_mn, const int& num_groups) {
-        // FP32 activation SF hold one scale per 128 K, int32 weight SF one packed word per 128 K
+        // FP32 activation and FP8 weight SF hold one scale per 128 K, int32 weight SF one packed word per 128 K
         const bool is_fp32 = sf.scalar_type() == torch::headeronly::ScalarType::Float;
         return make_tma_sf_desc(cute::UMMA::Major::MN, sf, shape_mn, shape_k, block_mn, is_fp32 ? kGranK * 4 : kGranK, num_groups, 0, 0, false,
                                 sf_smem_outer_dim, static_cast<int>(sf.stride(-1)));
     };
-    // Packed FP4 weights are loaded as raw bytes, 64 per 128-element K block
-    const auto fp4_weights_desc = [&](const torch::stable::Tensor& w) {
+    // Weight SF: one word per row, `block_n` per box, or with `routed_fp8` one 128x128 block scale per 128 rows, 4 per box
+    const auto weights_sf_desc = [&](const torch::stable::Tensor& sf, const int& shape_n, const int& shape_k, const int& num_groups) {
+        if (routed_fp8)
+            return sf_desc(sf, shape_n / 128, shape_k, layout::kNumBlockSFWords, num_groups);
+        return sf_desc(sf, shape_n, shape_k, config.block_n, num_groups);
+    };
+    // Packed FP4 weights are loaded as raw bytes, 64 per 128-element K block, FP8 routed weights like the shared weights
+    const auto routed_weights_desc = [&](const torch::stable::Tensor& w) {
+        if (routed_fp8)
+            return make_tma_weights_3d_desc(w, config.block_k, config.load_block_n, config.swizzle_weights_mode);
         return make_tma_weights_3d_desc(torch::stable::view(w, torch::headeronly::ScalarType::Float8_e4m3fn),
                                         config.block_k / 2, config.load_block_n, config.swizzle_weights_mode);
     };
     // L1 output and L2 activations are the same tensor, the post-SwiGLU output and its swizzling are half as wide
     const auto tensor_map_l1_acts = acts_desc(l1_acts, hidden, config.num_ring_tokens, config.block_k, config.load_block_m, config.swizzle_acts_mode);
     const auto tensor_map_l1_acts_sf = sf_desc(l1_acts_sf, config.num_sf_ring_tokens, hidden, config.sf_block_m, 1);
-    const auto tensor_map_l1_weights = fp4_weights_desc(l1_weights);
-    const auto tensor_map_l1_weights_sf = sf_desc(l1_weights_sf, intermediate_hidden * 2, hidden, config.block_n, num_experts_per_rank);
+    const auto tensor_map_l1_weights = routed_weights_desc(l1_weights);
+    const auto tensor_map_l1_weights_sf = weights_sf_desc(l1_weights_sf, intermediate_hidden * 2, hidden, num_experts_per_rank);
     const auto tensor_map_l1_output = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_n / 2, config.block_m, config.swizzle_acts_mode / 2);
     const auto tensor_map_l2_acts = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_k, config.load_block_m, config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = sf_desc(l2_acts_sf, config.num_sf_ring_tokens, intermediate_hidden, config.sf_block_m, 1);
-    const auto tensor_map_l2_weights = fp4_weights_desc(l2_weights);
-    const auto tensor_map_l2_weights_sf = sf_desc(l2_weights_sf, hidden, intermediate_hidden, config.block_n, num_experts_per_rank);
+    const auto tensor_map_l2_weights = routed_weights_desc(l2_weights);
+    const auto tensor_map_l2_weights_sf = weights_sf_desc(l2_weights_sf, hidden, intermediate_hidden, num_experts_per_rank);
 
     // Without shared experts, the routed tensormaps stand in
     // FP8 shared weights use the 128B swizzling of the tokens
@@ -89,8 +98,8 @@ static void sm90_fp8_fp4_mega_moe(
         shared_l1_acts_sf, static_cast<int>(shared_l1_acts_sf.size(0)), hidden, config.sf_block_m, 1) : tensor_map_l1_acts_sf;
     const auto tensor_map_shared_l1_weights = with_shared ? make_tma_weights_2d_desc(
         shared_l1_weights, config.block_k, config.load_block_n, config.swizzle_acts_mode) : tensor_map_l1_weights;
-    const auto tensor_map_shared_l1_weights_sf = with_shared ? sf_desc(
-        shared_l1_weights_sf, shared_intermediate_hidden * 2, hidden, config.block_n, 1) : tensor_map_l1_weights_sf;
+    const auto tensor_map_shared_l1_weights_sf = with_shared ? weights_sf_desc(
+        shared_l1_weights_sf, shared_intermediate_hidden * 2, hidden, 1) : tensor_map_l1_weights_sf;
     const auto tensor_map_shared_l1_output = with_shared ? acts_desc(
         shared_l2_acts, shared_intermediate_hidden, num_max_tokens_per_rank, config.block_n / 2, config.block_m, config.swizzle_acts_mode / 2) : tensor_map_l1_output;
     const auto tensor_map_shared_l2_acts = with_shared ? acts_desc(
@@ -99,8 +108,8 @@ static void sm90_fp8_fp4_mega_moe(
         shared_l2_acts_sf, static_cast<int>(shared_l2_acts_sf.size(0)), shared_intermediate_hidden, config.sf_block_m, 1) : tensor_map_l2_acts_sf;
     const auto tensor_map_shared_l2_weights = with_shared ? make_tma_weights_2d_desc(
         shared_l2_weights, config.block_k, config.load_block_n, config.swizzle_acts_mode) : tensor_map_l2_weights;
-    const auto tensor_map_shared_l2_weights_sf = with_shared ? sf_desc(
-        shared_l2_weights_sf, hidden, shared_intermediate_hidden, config.block_n, 1) : tensor_map_l2_weights_sf;
+    const auto tensor_map_shared_l2_weights_sf = with_shared ? weights_sf_desc(
+        shared_l2_weights_sf, hidden, shared_intermediate_hidden, 1) : tensor_map_l2_weights_sf;
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
@@ -138,6 +147,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -159,7 +169,8 @@ static void __instantiate_kernel() {{
         to_string(activation_alpha),
         to_string(activation_beta),
         fast_math ? "true" : "false",
-        config.pingpong ? "true" : "false"));
+        config.pingpong ? "true" : "false",
+        routed_fp8 ? "true" : "false"));
 
     // Launch
     jit->launch(

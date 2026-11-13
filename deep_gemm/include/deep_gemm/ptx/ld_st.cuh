@@ -72,6 +72,19 @@ struct SM90_U32x2_STSM_T {
 };
 
 template <typename dtype_t>
+struct SM90_U32x4_STSM_N {
+    CUTLASS_DEVICE static void
+    copy(dtype_t src_0, dtype_t src_1, dtype_t src_2, dtype_t src_3, void* smem_dst) {
+        DG_STATIC_ASSERT(sizeof(dtype_t) == sizeof(uint32_t), "Invalid dtype");
+        const uint32_t src[4] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1),
+                                 *reinterpret_cast<uint32_t*>(&src_2), *reinterpret_cast<uint32_t*>(&src_3)};
+        asm volatile("stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
+                     :: "l"(__cvta_generic_to_shared(smem_dst)),
+                        "r"(src[0]), "r"(src[1]), "r"(src[2]), "r"(src[3]));
+    }
+};
+
+template <typename dtype_t>
 struct SM90_U32x4_STSM_T {
     CUTLASS_DEVICE static void
     copy(dtype_t src_0, dtype_t src_1, dtype_t src_2, dtype_t src_3, void* smem_dst) {
@@ -222,6 +235,14 @@ CUTLASS_DEVICE uint32_t mapa_shared(const uint32_t& ptr, const uint32_t& dst_cta
     uint32_t mapped;
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mapped) : "r"(ptr), "r"(dst_cta_idx));
     return mapped;
+}
+
+// One 32-bit word into the shared memory of a CTA of the cluster, completing bytes of its barrier
+template <typename Barrier>
+CUTLASS_DEVICE void st_async_cluster_u32(void* dst, const uint32_t& src, const uint32_t& dst_cta_idx, Barrier& barrier) {
+    const auto mapped_barrier_ptr = mapa_shared(static_cast<uint32_t>(__cvta_generic_to_shared(&barrier)), dst_cta_idx);
+    const auto mapped_dst_ptr = mapa_shared(static_cast<uint32_t>(__cvta_generic_to_shared(dst)), dst_cta_idx);
+    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.u32 [%0], %1, [%2];" :: "r"(mapped_dst_ptr), "r"(src), "r"(mapped_barrier_ptr) : "memory");
 }
 
 template <class T, class Barrier>
