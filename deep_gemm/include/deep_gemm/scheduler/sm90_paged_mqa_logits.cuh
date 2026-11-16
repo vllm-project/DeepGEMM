@@ -6,13 +6,14 @@
 
 namespace deep_gemm::sched {
 
-template <uint32_t kAlignedBatchSize, uint32_t SPLIT_KV, uint32_t kNumSMs, bool kIsVarlen = false>
+// NOTES: the batch size is a runtime argument, so one compile serves every batch.
+template <uint32_t SPLIT_KV, uint32_t kNumSMs, bool kIsVarlen = false>
 CUTLASS_GLOBAL __launch_bounds__(32, 1)
-void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n, const bool is_context_lens_2d,
+void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t aligned_batch_size,
+                                    const uint32_t next_n, const bool is_context_lens_2d,
                                     const uint32_t num_next_n_atoms,
                                     const uint32_t* context_lens, const uint32_t* indices,
                                     uint32_t* schedule_metadata) {
-    DG_STATIC_ASSERT(kAlignedBatchSize % 32 == 0, "Invalid aligned batch size");
     const uint32_t lane_idx = ptx::get_lane_idx();
 
     // Wait for primary kernel completion
@@ -20,9 +21,9 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
 
     extern __shared__ uint32_t smem_buffer[];
     const auto prefix_sum = smem_buffer;
-    const auto get_varlen_atom_token_start = [&]() { return prefix_sum + kAlignedBatchSize; };
-    const auto get_varlen_atom_context_len = [&]() { return prefix_sum + kAlignedBatchSize * 2; };
-    const auto get_varlen_num_atoms_shared = [&]() { return prefix_sum + kAlignedBatchSize * 3; };
+    const auto get_varlen_atom_token_start = [&]() { return prefix_sum + aligned_batch_size; };
+    const auto get_varlen_atom_context_len = [&]() { return prefix_sum + aligned_batch_size * 2; };
+    const auto get_varlen_num_atoms_shared = [&]() { return prefix_sum + aligned_batch_size * 3; };
     uint32_t num_items;
 
     if constexpr (kIsVarlen) {
@@ -49,7 +50,7 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
     // Compute num_segs and prefix sum
     uint32_t sum = 0;
     #pragma unroll 16
-    for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++ k) {
+    for (uint32_t k = 0; k < aligned_batch_size / 32; ++ k) {
         const uint32_t q_idx = k * 32 + lane_idx;
         uint32_t context_len;
         if constexpr (kIsVarlen) {

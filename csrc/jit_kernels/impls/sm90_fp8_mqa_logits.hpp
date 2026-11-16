@@ -115,10 +115,10 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sched::sm90_paged_mqa_logits_metadata<
-        {}, {}, {}, {}
+        {}, {}, {}
     >);
 }};
-)", aligned_batch_size, split_kv, num_clusters, is_varlen ? "true" : "false"));
+)", split_kv, num_clusters, is_varlen ? "true" : "false"));
 
     // Launch
     jit->launch(
@@ -128,6 +128,7 @@ static void __instantiate_kernel() {{
             .block_dim = dim3(num_threads, 1, 1),
         },
         batch_size,
+        aligned_batch_size,
         next_n,
         is_context_lens_2d,
         num_next_n_atoms,
