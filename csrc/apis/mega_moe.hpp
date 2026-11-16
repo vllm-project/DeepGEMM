@@ -19,7 +19,6 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 #include "../jit_kernels/impls/sm100_fp4_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
-#include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe_situ.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
