@@ -96,7 +96,8 @@ static torch::stable::Tensor transform_k_grouped_sf_into_required_layout(const t
                                                                  const torch::stable::Tensor& grouped_layout,
                                                                  const std::tuple<int, int, int>& recipe,
                                                                  const int& k_alignment,
-                                                                 const bool& use_psum_layout) {
+                                                                 const bool& use_psum_layout,
+                                                                 const bool& sf_is_k_major = false) {
     DG_HOST_ASSERT(sf.dim() == 2);
     DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1);
 
@@ -113,19 +114,15 @@ static torch::stable::Tensor transform_k_grouped_sf_into_required_layout(const t
     if (sf.scalar_type() == torch::headeronly::ScalarType::Float and (arch_major == 10 or arch_major == 12)) {
         auto sf_input = sf;
         // SM120 also accepts K-major operands. Their SF tensor is [mn, sf_k],
-        // while the common packer consumes [sf_k, mn].
+        // while the common packer consumes [sf_k, mn]. The caller states which
+        // one it passes (`sf_is_k_major`); the orientation must not be inferred
+        // from the shape, because a square SF tensor (mn == sf_k) looks the
+        // same either way and would be packed untransposed.
         // NOTES: this body cannot move into `sm120_dispatch.hpp` -- that header includes
         //        this one, so extracting it would be a circular include.
         if (arch_major == 12) {
             const auto sf_contiguous = sf.is_contiguous() ? sf : torch::stable::contiguous(sf);
-            if (ks_cpu.has_value() and not ks_cpu.value().empty()) {
-                int expected_sf_k = 0;
-                for (const auto k: ks_cpu.value())
-                    expected_sf_k += ceil_div(k, gran_k);
-                sf_input = sf_contiguous.size(0) == expected_sf_k ? sf_contiguous : torch::stable::contiguous(torch::stable::transpose(sf_contiguous, 0, 1));
-            } else {
-                sf_input = sf_contiguous;
-            }
+            sf_input = sf_is_k_major ? torch::stable::contiguous(torch::stable::transpose(sf_contiguous, 0, 1)) : sf_contiguous;
         }
         return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf_input, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
     }
