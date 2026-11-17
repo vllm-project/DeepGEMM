@@ -190,7 +190,18 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
         while (fetched_next_task) {
             // Prefetch next Q when current Q changes
-            bool prefetch_q = (q_idx != next_q_idx and scheduler.exist_q_atom_idx(next_q_idx + 1));
+            // Match the scheduler's zero-context skipping when selecting Q.
+            uint32_t prefetch_q_idx = next_q_idx + 1;
+            if (q_idx != next_q_idx) {
+                while (scheduler.exist_q_atom_idx(prefetch_q_idx)) {
+                    const uint32_t lens_idx = kIsContextLens2D
+                        ? prefetch_q_idx * kNextN + kNextN - 1 : prefetch_q_idx;
+                    if (context_lens[lens_idx] != 0)
+                        break;
+                    ++ prefetch_q_idx;
+                }
+            }
+            bool prefetch_q = (q_idx != next_q_idx and scheduler.exist_q_atom_idx(prefetch_q_idx));
             q_idx = next_q_idx;
             kv_idx = next_kv_idx;
             num_kv = next_num_kv;
@@ -199,7 +210,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             if (prefetch_q) {
                 CUTE_TIE_DECL(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
                 empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
-                issue_tma_q(q_stage_idx, q_idx + 1);
+                issue_tma_q(q_stage_idx, prefetch_q_idx);
             }
 
             // Read KV block index
