@@ -310,9 +310,25 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      fast_math: bool = True,
                      activation_alpha: float = 1.0,
                      activation_beta: float = 0.0,
+                     situ_beta: float = 1.0,
+                     situ_linear_beta: Optional[float] = None,
                      num_tokens_for_block_m: Optional[int] = None):
+    """Run FP8 x FP4 Mega MoE.
+
+    SiTU accepts both ``activation_alpha``/``activation_beta`` and vLLM's
+    ``situ_beta``/``situ_linear_beta`` names. Conflicting non-default values
+    are rejected rather than silently choosing one spelling.
+    """
     # SM90: `num_tokens_for_block_m` (default: this rank's tokens) picks BLOCK_M; pass one value on all ranks
     _validate_activation(activation)
+    if situ_beta != 1.0:
+        if activation_alpha != 1.0 and activation_alpha != situ_beta:
+            raise ValueError('Conflicting activation_alpha and situ_beta values')
+        activation_alpha = situ_beta
+    if situ_linear_beta is not None:
+        if activation_beta != 0.0 and activation_beta != situ_linear_beta:
+            raise ValueError('Conflicting activation_beta and situ_linear_beta values')
+        activation_beta = situ_linear_beta
     recipe = recipe or ((1, 1, 128) if torch.cuda.get_device_capability(y.device)[0] == 9 else (1, 1, 32))
     _C.fp8_fp4_mega_moe(
         y,

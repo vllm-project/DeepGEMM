@@ -156,6 +156,10 @@ In that mode, `activation_alpha` is the gate tanh scale, so the gate branch is
 branch unchanged, matching an unset `situ_linear_beta` in FlashInfer.
 `activation_alpha` must be positive, and `activation_clamp` applies only to
 SwiGLU.
+The aliases `situ_beta` (default `1.0`) and `situ_linear_beta` (default `None`,
+equivalent to `activation_beta=0.0`) are accepted for vLLM compatibility.
+Explicitly setting both spellings to different values is an error; matching
+values are accepted. These aliases only affect the SiTU path.
 
 On SM90, `fp8_fp4_mega_moe` takes FP4 or FP8 routed weights (`mma_type='fp8xfp4'` or `'fp8xfp8'`) and supports `swiglu` and `swiglustep`; `situ` is supported with FP4 routed weights.
 Its recipe is `(1, 1, 128)`, the default there: `buffer.x_sf` holds one FP32 scale `amax / 448` per 128 channels, as the bits of each word.
