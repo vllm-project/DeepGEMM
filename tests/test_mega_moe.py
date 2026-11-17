@@ -131,7 +131,7 @@ def _hi_expert(x: torch.Tensor, l1_weights: Tuple, l2_weights: Tuple, weights: t
 
 def _moe_reference(expert, xs: Tuple, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                    l1_weights: Tuple, l2_weights: Tuple, shared_weights: Optional[Tuple],
-                   dtype: torch.dtype) -> torch.Tensor:
+                   shared_expert_weights: Optional[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
     # Expert outputs per (token, slot) over all global experts, summed shared expert first, then in top-k order
     num_tokens, num_topk = topk_idx.shape
     slot_y = torch.zeros((num_tokens, num_topk, xs[0].size(1)), dtype=dtype, device='cuda')
@@ -143,7 +143,9 @@ def _moe_reference(expert, xs: Tuple, topk_idx: torch.Tensor, topk_weights: torc
                 topk_weights[tokens, slots].to(dtype)).to(dtype)
     y = torch.zeros((num_tokens, xs[0].size(1)), dtype=dtype, device='cuda')
     if shared_weights is not None:
-        y += expert(*xs, *shared_weights, torch.ones(num_tokens, dtype=dtype, device='cuda')).to(dtype)
+        if shared_expert_weights is None:
+            shared_expert_weights = torch.ones(num_tokens, device='cuda')
+        y += expert(*xs, *shared_weights, shared_expert_weights.to(dtype)).to(dtype)
     for i in range(num_topk):
         y += slot_y[:, i]
     return y
@@ -226,6 +228,12 @@ _SWEEP_CASES = (
     (7, 7168, 3072, 8, 8, 0, 1, 'hot', dict(activation='swiglustep')),
     (63, 4096, 256, 2, 1, 0, 0.5, 'random', dict(activation='swiglustep', **_EXACT)),
     (4096, 2048, 1536, 48, 6, 0, None, 'random', dict(activation='swiglustep')),
+    (0, 2048, 256, 8, 6, 1, 10, 'random', dict(shared_expert_weights=True)),
+    (1, 5120, 1536, 48, 8, 1, None, 'masked', dict(shared_expert_weights=True)),
+    (63, 4096, 256, 2, 1, 2, None, 'hot', dict(shared_expert_weights=True, **_EXACT)),
+    (129, 7168, 3072, 48, 8, 1, 10, 'empty', dict(shared_expert_weights=True)),
+    (1000, 2048, 2304, 8, 6, 2, 10, 'random', dict(shared_expert_weights=True)),
+    (8192, 7168, 3072, 48, 6, 1, 10, 'masked', dict(shared_expert_weights=True)),
 )
 
 
@@ -236,6 +244,8 @@ def _get_sweep_args(args: argparse.Namespace, num_ranks: int):
             activation_clamp, routing, extra in cases:
         if get_arch_major() != 9 and (extra.get('subnormal_probe') or (extra.get('exact_inputs') and not args.emu_reference)):
             continue
+        if get_arch_major() == 9 and extra.get('shared_expert_weights'):
+            continue
         yield argparse.Namespace(**{
             **_CASE_DEFAULTS, **vars(args),
             'num_tokens': num_tokens, 'num_max_tokens_per_rank': max(num_tokens, 1),
@@ -243,7 +253,7 @@ def _get_sweep_args(args: argparse.Namespace, num_ranks: int):
             'num_experts': num_experts_per_rank * num_ranks, 'num_topk': num_topk,
             'num_shared_experts': num_shared_experts, 'activation_clamp': activation_clamp,
             'routing': 'random' if routing == 'masked' else routing, 'masked_ratio': 0.3 if routing == 'masked' else 0,
-            **extra})
+            'shared_expert_weights': False, **extra})
 
 
 def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
@@ -293,6 +303,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     assert not use_emu_reference or (not is_bf16xbf16 and args.activation in ('swiglu', 'swiglustep'))
     assert not is_exact_inputs or (use_emu_reference and not args.fast_math)
     assert not args.subnormal_probe or arch_major == 9
+    assert not args.shared_expert_weights or (num_shared_experts > 0 and arch_major == 10 and args.activation != 'situ')
 
     # Allocate symmetric memory
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -367,6 +378,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
         global cumulative_local_expert_recv_stats_fused, cumulative_local_expert_recv_stats_baseline
         global initial_cumulative_local_expert_recv_stats_fused, initial_cumulative_local_expert_recv_stats_baseline
         global ref_x, ref_x_hi, all_l1_weights, all_l2_weights, ref_shared_weights, hi_shared_weights
+        global shared_expert_weights
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         if is_bf16xbf16:
             l1_weights = torch.randn(
@@ -383,6 +395,11 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
         topk_weights = scores.gather(1, topk_idx)
         if is_exact_inputs:
             topk_weights = _exp2(torch.randint(126, 129, topk_weights.shape, device='cuda'))
+        # Per-token shared expert weights in (0, 1), like Qwen's `sigmoid(shared_expert_gate(x))`
+        shared_expert_weights = None
+        if args.shared_expert_weights:
+            shared_expert_weights = _exp2(torch.randint(125, 127, (num_tokens, ), device='cuda')) if is_exact_inputs else \
+                torch.rand(num_tokens, dtype=torch.float, device='cuda')
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
         cumulative_local_expert_recv_stats_baseline = cumulative_local_expert_recv_stats_fused.clone()
@@ -525,6 +542,8 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 shared_l1_weights=transformed_shared_l1_weights,
                 shared_l2_weights=transformed_shared_l2_weights
             )
+        if shared_expert_weights is not None:
+            kernel_kwargs.update(shared_expert_weights=shared_expert_weights)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
@@ -537,7 +556,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
-    dist_print(f' > Shared experts: {num_shared_experts}', once_in_node=True)
+    dist_print(f' > Shared experts: {num_shared_experts}{" (per-token weights)" if args.shared_expert_weights else ""}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
     dist_print(f' > Block M: {block_m}', once_in_node=True)
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
@@ -668,7 +687,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 l1_out = torch.empty((num_tokens, shared_intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
                 deep_gemm.bf16_gemm_nt(x, shared_l1_weights, l1_out)
                 l2_in = tilelang_ops.swiglu_apply_weight_to_fp8(
-                    x=l1_out, topk_weights=None,
+                    x=l1_out, topk_weights=shared_expert_weights,
                     avail_tokens=None,
                     num_per_channels=128, use_col_major_scales=True,
                     clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
@@ -680,7 +699,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 l1_out = torch.empty((num_tokens, shared_intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
                 deep_gemm.fp8_gemm_nt(shared_x, shared_l1_weights, l1_out, recipe=(1, 1, 32), disable_ue8m0_cast=True)
                 l2_in = tilelang_ops.swiglu_apply_weight_to_fp8(
-                    x=l1_out, topk_weights=None,
+                    x=l1_out, topk_weights=shared_expert_weights,
                     avail_tokens=None,
                     num_per_channels=32, use_col_major_scales=True,
                     clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
@@ -743,10 +762,10 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             assert torch.equal(fused_stats, initial_cumulative_local_expert_recv_stats_fused + get_num_recv_tokens_per_expert())
             ref_y = _moe_reference(
                 functools.partial(_emu_expert, gran_k=gran_k, args=args), ref_x, topk_idx, topk_weights,
-                all_l1_weights, all_l2_weights, ref_shared_weights, torch.float).bfloat16()
+                all_l1_weights, all_l2_weights, ref_shared_weights, shared_expert_weights, torch.float).bfloat16()
             hi_y = _moe_reference(
                 functools.partial(_hi_expert, args=args), (ref_x_hi, ), topk_idx, topk_weights,
-                all_l1_weights, all_l2_weights, hi_shared_weights, torch.double)
+                all_l1_weights, all_l2_weights, hi_shared_weights, shared_expert_weights, torch.double)
             diff, hi_diff = calc_diff(fused_y, ref_y), calc_diff(fused_y, hi_y)
             max_token_diff = max(_calc_token_diff(fused_y, ref_y).tolist(), default=0)
             dist_print(f' > Accuracy (rank {rank_idx}): calc_diff={diff:.3e}, max_token_diff={max_token_diff:.3e}, hi_diff={hi_diff:.3e}')
@@ -760,8 +779,10 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
 
         # Replays of one CUDA graph alternate two input sets, and must match the eager launches bit for bit
-        graph_inputs = [*x, topk_weights]
-        input_sets = [[t.clone() for t in graph_inputs], [t.view(torch.uint8).roll(1, 0).view(t.dtype) for t in x] + [-topk_weights]]
+        weight_inputs = [topk_weights] + ([shared_expert_weights] if shared_expert_weights is not None else [])
+        graph_inputs = [*x, *weight_inputs]
+        input_sets = [[t.clone() for t in graph_inputs],
+                      [t.view(torch.uint8).roll(1, 0).view(t.dtype) for t in x] + [-t for t in weight_inputs]]
         eager_ys = []
         for input_set in input_sets:
             for t, s in zip(graph_inputs, input_set):
@@ -894,6 +915,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--num-shared-experts', type=int, default=1, help='Number of shared experts (use 0 to disable)')
+    parser.add_argument('--shared-expert-weights', action='store_true',
+                        help='Scale the shared experts per token, like Qwen\'s `sigmoid(shared_expert_gate(x))` (SM100 only)')
     parser.add_argument('--activation', type=str, default='swiglu', choices=('swiglu', 'swiglustep', 'situ'))
     parser.add_argument('--activation-clamp', type=float, default=10, help='SwiGLU clamp value')
     parser.add_argument('--activation-alpha', type=float, default=1.0,

@@ -292,8 +292,14 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      fast_math: bool = True,
                      activation_alpha: float = 1.0,
                      activation_beta: float = 0.0,
-                     num_tokens_for_block_m: Optional[int] = None):
+                     num_tokens_for_block_m: Optional[int] = None,
+                     shared_expert_weights: Optional[torch.Tensor] = None):
     # SM90: `num_tokens_for_block_m` (default: this rank's tokens) picks BLOCK_M; pass one value on all ranks
+    # `shared_expert_weights` is an optional FP32 `(num_tokens, )` per-token weight of the fused shared
+    # experts' output, e.g. Qwen's `sigmoid(shared_expert_gate(x))` (the caller computes it). The kernel
+    # applies it after the activation, the same place routed experts apply their top-k weights.
+    # `None` keeps the unweighted sum. Under CUDA graphs, it must have a stable address, like `y`.
+    # SM100 SwiGLU only (not SM90 or SiTU).
     _validate_activation(activation)
     recipe = recipe or ((1, 1, 128) if torch.cuda.get_device_capability(y.device)[0] == 9 else (1, 1, 32))
     _C.fp8_fp4_mega_moe(
@@ -309,7 +315,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         activation_alpha, activation_beta,
-        num_tokens_for_block_m
+        num_tokens_for_block_m,
+        shared_expert_weights
     )
 
 def fp4_fp4_mega_moe(y: torch.Tensor,
@@ -399,8 +406,12 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation_beta: float = 0.0,
                   post_expert_norm_gamma: Optional[torch.Tensor] = None,
                   post_expert_norm_eps: float = 0.0,
-                  weight_layout: str = "native"):
-    """``weight_layout="trtllm"`` takes TRT-LLM's BF16 MoE weights as is (no shared experts)."""
+                  weight_layout: str = "native",
+                  shared_expert_weights: Optional[torch.Tensor] = None):
+    """``weight_layout="trtllm"`` takes TRT-LLM's BF16 MoE weights as is (no shared experts).
+
+    ``shared_expert_weights`` is as in :func:`fp8_fp4_mega_moe`.
+    """
     assert activation in ('swiglu', 'swiglustep'), \
         f'BF16 Mega MoE supports `swiglu` or `swiglustep`, got `{activation}`'
     if weight_layout not in ("native", "trtllm"):
@@ -422,5 +433,6 @@ def bf16_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         activation_alpha, activation_beta,
-        post_expert_norm_gamma, post_expert_norm_eps
+        post_expert_norm_gamma, post_expert_norm_eps,
+        shared_expert_weights
     )

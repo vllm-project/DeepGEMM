@@ -36,7 +36,8 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& clamp_after_silu,
     const float& activation_alpha,
     const float& activation_beta,
-    const bool& fast_math
+    const bool& fast_math,
+    const float* shared_expert_weights
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -175,6 +176,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -196,6 +198,7 @@ static void __instantiate_kernel() {{
         to_string(activation_alpha),
         to_string(activation_beta),
         fast_math ? "true" : "false",
+        shared_expert_weights != nullptr ? "true" : "false",
         to_string(l1_weights.scalar_type())));
 
     // Launch
@@ -209,6 +212,7 @@ static void __instantiate_kernel() {{
         y.mutable_data_ptr(),
         cumulative_local_expert_recv_stats_ptr,
         num_tokens,
+        shared_expert_weights,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         tensor_map_l1_acts,
         tensor_map_l1_acts_sf,
