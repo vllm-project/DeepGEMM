@@ -17,6 +17,12 @@
 
 namespace deep_gemm::attention {
 
+// Thor (SM110) runs the SM100 MQA-logits kernels unchanged. Only the dense and paged
+// MQA-logits paths admit it; the GEMM and sparse-MQA paths are not validated on SM110.
+static bool is_sm100_indexer_arch(const int& arch_major) {
+    return arch_major == 10 or arch_major == 11;
+}
+
 // Checks shared by the contiguous and paged APIs
 static void check_mqa_logits_q_and_weights(const torch::stable::Tensor& q_fp, const std::optional<torch::stable::Tensor>& q_sf,
                                            const torch::stable::Tensor& weights,
@@ -33,7 +39,7 @@ static void check_mqa_logits_q_and_weights(const torch::stable::Tensor& q_fp, co
 
     // Check SF Q (SM100 uses MX scale factors, SM90 per-token float KV scales,
     // SM120 MX scale factors for FP4 and per-token float KV scales for FP8)
-    DG_HOST_ASSERT(is_mx_sf == (arch_major == 10 or (arch_major == 12 and is_fp4)));
+    DG_HOST_ASSERT(is_mx_sf == (is_sm100_indexer_arch(arch_major) or (arch_major == 12 and is_fp4)));
     if (is_mx_sf) {
         DG_HOST_ASSERT(q_sf->sizes().equals(q_fp.sizes().slice(0, q_fp.dim() - 1)));
         DG_HOST_ASSERT(q_sf->is_contiguous());
@@ -46,13 +52,13 @@ static void check_mqa_logits_q_and_weights(const torch::stable::Tensor& q_fp, co
     DG_HOST_ASSERT(num_q_tokens == _num_q_tokens and num_heads == _num_heads);
     DG_HOST_ASSERT(weights.stride(1) == 1 and (weights.stride(0) * weights.element_size()) % 16 == 0);
     DG_HOST_ASSERT(weights.scalar_type() == torch::headeronly::ScalarType::Float or
-                   (arch_major == 10 and weights.scalar_type() == torch::headeronly::ScalarType::BFloat16));
+                   (is_sm100_indexer_arch(arch_major) and weights.scalar_type() == torch::headeronly::ScalarType::BFloat16));
 }
 
 static torch::stable::Tensor get_mqa_logits_metadata(const torch::stable::Tensor& cu_seq_len_k_start,
                                              const torch::stable::Tensor& cu_seq_len_k_end,
                                              const int& num_kv_tokens, const int& num_heads) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    DG_HOST_ASSERT(is_sm100_indexer_arch(jit->device.get_arch_major()));
     const int num_q_tokens = static_cast<int>(cu_seq_len_k_start.size(0));
     DG_HOST_ASSERT(num_q_tokens > 0 and cu_seq_len_k_end.size(0) == num_q_tokens);
     DG_HOST_ASSERT(cu_seq_len_k_start.is_cuda() and cu_seq_len_k_end.is_cuda());
@@ -117,7 +123,7 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
     DG_HOST_ASSERT(max_seqlen_k > 0);
     const int block_q = get_mqa_logits_block_q(num_heads);
     // SM120: 2 groups x 64 KV rows = 128
-    const int block_kv = arch_major == 10 ? kMQALogitsSplitKV : (arch_major == 12 ? sm120::kMqaBlockKv : 256);
+    const int block_kv = is_sm100_indexer_arch(arch_major) ? kMQALogitsSplitKV : (arch_major == 12 ? sm120::kMqaBlockKv : 256);
     const int aligned_seq_len = align(seq_len, block_q);
     // Logits row stride must be 1024-byte aligned
     const int stride_logits_alignment = 1024 / static_cast<int>(torch_compat::element_size(logits_dtype));
@@ -126,7 +132,7 @@ static torch::stable::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::stable::
     logits = torch_compat::narrow(torch_compat::narrow(logits, 0, 0, seq_len), 1, 0, max_seqlen_k);
 
     // Dispatch implementation
-    if (arch_major == 10) {
+    if (is_sm100_indexer_arch(arch_major)) {
         const MQALogitsConfig config(num_heads, head_dim, qk_dtype, weights.scalar_type(), false);
         sm100_mqa_logits(config, q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
                          logits, seq_len, seq_len_kv, stride_logits, schedule_meta);
@@ -176,7 +182,7 @@ static torch::stable::Tensor get_paged_mqa_logits_metadata(const torch::stable::
         sm120_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv,
                                         num_sms, is_context_lens_2d, (next_n + next_n_atom - 1) / next_n_atom,
                                         is_varlen, is_varlen ? indices.value().mutable_data_ptr<int>() : nullptr);
-    } else if (arch_major == 10) {
+    } else if (is_sm100_indexer_arch(arch_major)) {
         DG_HOST_ASSERT(is_varlen and next_n == 1 and (block_kv == 32 or block_kv == 64 or block_kv == 128));
         const auto& indices_tensor = indices.value();
         DG_HOST_ASSERT(indices_tensor.dim() == 1 and indices_tensor.size(0) == batch_size);
@@ -229,7 +235,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
 
     // Check fused KV cache
     const auto [num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
-    DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
+    DG_HOST_ASSERT((is_sm100_indexer_arch(arch_major) and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
                    (arch_major == 9 and (block_kv == 32 or block_kv == 64)) or
                    (arch_major == 12 and (block_kv == 32 or block_kv == 64)));
     const int kv_head_dim = is_fp4 ? head_dim / 2 : head_dim;
@@ -262,7 +268,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
 
     // Check indices (SM100 supports varlen requests only, SM90 fixed-length only, SM120 both)
     const bool is_varlen = indices.has_value();
-    DG_HOST_ASSERT(arch_major == 12 or is_varlen == (arch_major == 10));
+    DG_HOST_ASSERT(arch_major == 12 or is_varlen == is_sm100_indexer_arch(arch_major));
     const auto indices_tensor = indices.value_or(torch::stable::Tensor());
     if (is_varlen) {
         DG_HOST_ASSERT(next_n == 1);
@@ -290,7 +296,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
 
     // Allocate output
     // SM120: 2 groups x 64 KV rows = 128
-    const int split_kv = arch_major == 10 ? kMQALogitsSplitKV : (arch_major == 12 ? sm120::kPagedSplitKv : 256);
+    const int split_kv = is_sm100_indexer_arch(arch_major) ? kMQALogitsSplitKV : (arch_major == 12 ? sm120::kPagedSplitKv : 256);
     // Logits row stride must be 1024-byte aligned and hold whole KV splits
     const int stride_logits_alignment = 1024 / static_cast<int>(torch_compat::element_size(logits_dtype));
     const int split_stride_alignment = split_kv / math::constexpr_gcd(split_kv, stride_logits_alignment) * stride_logits_alignment;
@@ -299,7 +305,7 @@ static torch::stable::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::st
     logits = torch_compat::slice(logits, -1, 0, max_context_len);
 
     // Dispatch implementation
-    if (arch_major == 10) {
+    if (is_sm100_indexer_arch(arch_major)) {
         const MQALogitsConfig config(num_heads, head_dim, qk_dtype, weights.scalar_type(), true);
         sm100_paged_mqa_logits(config, q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits,
                                block_table, indices_tensor, schedule_meta, batch_size, num_kv_blocks, block_kv,
