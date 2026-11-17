@@ -12,6 +12,9 @@
 // TODO: add MegaMoE namespace
 namespace deep_gemm::sched {
 
+// Maximum M blocks per task group of the SM90 kernel with tokens on M, see `MegaMoEScheduler::get_next_routed_task_idx`
+constexpr int kNumSM90TaskGroupMBlocks = 24;
+
 // Get minimal L1 warmup waves to ensure no L1 -> L2 deadlock
 // constexpr func, no runtime overhead in kernel
 CUTLASS_HOST_DEVICE constexpr
@@ -19,7 +22,8 @@ int get_num_l1_warmup_waves(
     const int& num_total_m_blocks,
     const int& num_clusters,
     const int& num_l1_n_clusters,
-    const int& num_l2_n_clusters) {
+    const int& num_l2_n_clusters,
+    const int& num_task_group_m_blocks = 1) {
     // The first L2 wave may touch multiple M blocks; all their L1 N tasks must be issued first.
     const int num_first_l2_wave_m_blocks = math::constexpr_ceil_div(num_clusters, num_l2_n_clusters);
     const int num_l1_warmup_clusters_for_first_l2_wave = math::constexpr_ceil_div(
@@ -41,7 +45,10 @@ int get_num_l1_warmup_waves(
         num_clusters) + 1;
 
     // TODO: may delay combine NVLink
-    return cute::max(num_l1_warmup_clusters_for_first_l2_wave, num_warmup_waves_for_interleave_schedule);
+    // With task groups, an L2 task needs the L1 tasks of its whole group: the L1 tasks claimed ahead must cover one L2 wave and one group
+    const int num_warmup_waves = cute::max(num_l1_warmup_clusters_for_first_l2_wave, num_warmup_waves_for_interleave_schedule);
+    return num_task_group_m_blocks > 1 ? cute::max(num_warmup_waves,
+        math::constexpr_ceil_div(num_clusters + num_task_group_m_blocks * num_l1_n_clusters, num_clusters) + 1) : num_warmup_waves;
 }
 
 // Host-side ring capacity helper for the MegaMoE schedule.
@@ -49,7 +56,8 @@ CUTLASS_HOST_DEVICE constexpr int get_num_max_live_pool_blocks(
     const int& num_total_m_blocks,
     const int& num_sms,
     const int& hidden,
-    const int& intermediate_hidden) {
+    const int& intermediate_hidden,
+    const int& num_task_group_m_blocks = 1) {
     constexpr int kMegaMoEBlockN = 128;
     constexpr int kNumCTAsPerCluster = 2;
 
@@ -61,7 +69,7 @@ CUTLASS_HOST_DEVICE constexpr int get_num_max_live_pool_blocks(
     const int num_l1_clusters = num_total_m_blocks * num_l1_n_clusters;
     const int num_l1_waves = math::constexpr_ceil_div(num_l1_clusters, num_clusters);
     const int num_min_l1_warmup_waves = get_num_l1_warmup_waves(
-        num_total_m_blocks, num_clusters, num_l1_n_clusters, num_l2_n_clusters);
+        num_total_m_blocks, num_clusters, num_l1_n_clusters, num_l2_n_clusters, num_task_group_m_blocks);
     const int num_l1_warmup_waves = cute::min(num_min_l1_warmup_waves, num_l1_waves);
     const int num_l1_warmup_clusters = cute::min(num_l1_warmup_waves * num_clusters, num_l1_clusters);
     const int num_live_blocks_after_warmup = math::constexpr_ceil_div(num_l1_warmup_clusters, num_l1_n_clusters);
@@ -76,7 +84,9 @@ CUTLASS_HOST_DEVICE constexpr int get_num_max_live_pool_blocks(
             num_total_m_blocks * (num_l2_n_clusters - num_l1_n_clusters), num_l2_n_clusters) : 0;
     const int wave_margin = math::constexpr_ceil_div(
         num_clusters, cute::min(num_l1_n_clusters, num_l2_n_clusters));
-    return cute::min(num_total_m_blocks, num_live_blocks_after_warmup + frontier_growth + wave_margin);
+    // With task groups, L1 touches a whole group at once and L2 finishes a whole group at once
+    const int task_group_margin = num_task_group_m_blocks > 1 ? 2 * num_task_group_m_blocks : 0;
+    return cute::min(num_total_m_blocks, num_live_blocks_after_warmup + frontier_growth + wave_margin + task_group_margin);
 }
 
 // Computation phase for the current block
@@ -174,6 +184,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumSharedExperts = 0,
           bool kDecodeShaped = false,
           bool kPingPong = false,
+          uint32_t kNumTaskGroupMBlocks = 1,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -329,7 +340,7 @@ struct MegaMoEScheduler {
         const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1Clusters;
         const uint32_t num_total_l1_waves = math::ceil_div(num_total_l1_tasks, kNumSMs / 2);
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
-            num_total_m_blocks, kNumSMs / 2, kNumL1Clusters, kNumL2Clusters);
+            num_total_m_blocks, kNumSMs / 2, kNumL1Clusters, kNumL2Clusters, kNumTaskGroupMBlocks);
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
     }
 
@@ -396,6 +407,49 @@ struct MegaMoEScheduler {
                get_next_task_idx<kNumClusters>(task_count_ptr, sm_locality_domain_idx ^ 1, num_m_blocks, m_block_idx, n_cluster_idx);
     }
 
+    // The task group of a pool block: blocks `[first_m_block_idx, first_m_block_idx + num_group_m_blocks)` of its expert
+    CUTLASS_DEVICE void get_routed_task_group(const uint32_t& m_block_idx, uint32_t& first_m_block_idx, uint32_t& num_group_m_blocks) const {
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        uint32_t block_offset = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const uint32_t num_m_blocks = math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+            const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
+            const uint32_t lane_pool_block_offset = block_offset + inclusive_num_m_blocks - num_m_blocks;
+            const uint32_t owner_mask = __ballot_sync(0xffffffff, i * 32 + lane_idx < kNumExpertsPerRank and
+                m_block_idx >= lane_pool_block_offset and m_block_idx < lane_pool_block_offset + num_m_blocks);
+            if (owner_mask) {
+                const uint32_t owner_lane_idx = static_cast<uint32_t>(__ffs(owner_mask) - 1);
+                const uint32_t expert_first_m_block_idx = ptx::exchange(lane_pool_block_offset, owner_lane_idx);
+                const uint32_t num_expert_m_blocks = ptx::exchange(num_m_blocks, owner_lane_idx);
+                // Groups of equal size: a small last group would read the expert's weights again for few tokens
+                const uint32_t group_size = math::ceil_div(num_expert_m_blocks, math::ceil_div(num_expert_m_blocks, kNumTaskGroupMBlocks));
+                const uint32_t group_idx = (m_block_idx - expert_first_m_block_idx) / group_size;
+                first_m_block_idx = expert_first_m_block_idx + group_idx * group_size;
+                num_group_m_blocks = cute::min(group_size, num_expert_m_blocks - group_idx * group_size);
+            }
+            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
+        }
+    }
+
+    // Claim a routed task: N-major within a group of M blocks of one expert, the tasks in flight then share weight tiles, which come from HBM once per group
+    template <uint32_t kNumClusters>
+    CUTLASS_DEVICE bool get_next_routed_task_idx(const uint32_t* task_count_ptr, uint32_t& m_block_idx, uint32_t& n_cluster_idx) const {
+        if constexpr (kNumTaskGroupMBlocks > 1) {
+            DG_STATIC_ASSERT(kNumLocalityDomains == 1, "Task groups need one queue");
+            const uint32_t task_idx = get_next_local_task_idx(task_count_ptr, 0);
+            if (task_idx >= num_total_m_blocks * kNumClusters)
+                return false;
+            uint32_t first_m_block_idx = 0, num_group_m_blocks = 1;
+            get_routed_task_group(task_idx / kNumClusters, first_m_block_idx, num_group_m_blocks);
+            const uint32_t idx_in_group = task_idx - first_m_block_idx * kNumClusters;
+            m_block_idx = first_m_block_idx + idx_in_group % num_group_m_blocks;
+            n_cluster_idx = idx_in_group / num_group_m_blocks;
+            return true;
+        }
+        return get_next_task_idx<kNumClusters>(task_count_ptr, num_total_m_blocks, m_block_idx, n_cluster_idx);
+    }
+
     CUTLASS_DEVICE task_info_t get_next_task() {
         uint32_t m_block_idx, n_cluster_idx;
         while (true) {
@@ -413,7 +467,7 @@ struct MegaMoEScheduler {
                 }
 
                 // No more L1 tasks
-                if (not get_next_task_idx<kNumL1Clusters>(workspace.get_l1_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx)) {
+                if (not get_next_routed_task_idx<kNumL1Clusters>(workspace.get_l1_task_count_ptr(), m_block_idx, n_cluster_idx)) {
                     num_sched_l1_waves = kNumSchedL1WavesDone;
                     continue;
                 }
@@ -421,7 +475,7 @@ struct MegaMoEScheduler {
                 // Create task
                 return create_task(BlockPhase::Linear1, m_block_idx, n_cluster_idx, L1_SHAPE_N, L1_SHAPE_K);
             } else {
-                if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx))
+                if (not get_next_routed_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), m_block_idx, n_cluster_idx))
                     break;
 
                 // The next task should be L1
@@ -432,7 +486,11 @@ struct MegaMoEScheduler {
                 auto task_info = create_task(BlockPhase::Linear2, m_block_idx, n_cluster_idx, L2_SHAPE_N, L2_SHAPE_K);
 
                 // Wait until all required L1 tasks are fetched from all scheduling queues
-                const auto num_required_l1_tasks = (task_info.pool_block_idx + 1) * (kNumL1Clusters / kNumLocalityDomains);
+                // With task groups, the L1 tasks of a block are only claimed with those of its whole group
+                uint32_t first_m_block_idx = task_info.pool_block_idx, num_group_m_blocks = 1;
+                if constexpr (kNumTaskGroupMBlocks > 1)
+                    get_routed_task_group(task_info.pool_block_idx, first_m_block_idx, num_group_m_blocks);
+                const auto num_required_l1_tasks = (first_m_block_idx + num_group_m_blocks) * (kNumL1Clusters / kNumLocalityDomains);
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumLocalityDomains; ++ i)
                     while (ptx::ld_volatile(workspace.get_l1_task_count_ptr() + i) < num_required_l1_tasks) {}

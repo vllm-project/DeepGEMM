@@ -114,9 +114,33 @@ def test_fp4_exponent_span_clamp():
     assert torch.equal(dequantize(new_w, new_sf), expected)
 
 
+def test_fp8_block_sf_layout():
+    # The compact layout of `transform_weights_for_mega_moe`, read the way the SM90 kernel reads it (tile `j` takes word `j & 2` for
+    # gate rows, `(j & 2) + 1` for up rows, `j & 3` for L2, of the box at `j & ~3`), gives every row the scale of its checkpoint block
+    generator = torch.Generator().manual_seed(2)
+    mega = deep_gemm.mega
+    def read_like_kernel(sf, n, is_l1):
+        rows = torch.arange(n)
+        tiles = rows // 128
+        words = torch.where(rows % 16 < 8, tiles & 2, (tiles & 2) + 1) if is_l1 else tiles & 3
+        memory = torch.as_strided(sf, (sf.shape[0], sf.shape[2], sf.stride(-1)), (sf.stride(0), sf.stride(-1), 1))
+        return memory[:, :, (tiles & ~3) + words].transpose(-1, -2)
+    for num_groups, hidden, intermediate_hidden in ((2, 512, 384), (3, 768, 256), (1, 4096, 2048)):
+        def make(n, k):
+            w = torch.randn((num_groups, n, k), generator=generator).to(torch.float8_e4m3fn)
+            return w, torch.rand((num_groups, n // 128, k // 128), generator=generator) + 0.5
+        l1, l2 = make(intermediate_hidden * 2, hidden), make(hidden, intermediate_hidden)
+        (l1_w, l1_sf), (l2_w, l2_sf) = deep_gemm.transform_weights_for_mega_moe(l1, l2, arch_major=9)
+        assert torch.equal(l1_w.view(torch.uint8), mega._interleave_weights(l1[0]).view(torch.uint8))
+        assert torch.equal(l2_w.view(torch.uint8), l2[0].view(torch.uint8))
+        assert torch.equal(read_like_kernel(l1_sf, intermediate_hidden * 2, True), mega._interleave_weights(l1[1].repeat_interleave(128, dim=-2)))
+        assert torch.equal(read_like_kernel(l2_sf, hidden, False), l2[1].repeat_interleave(128, dim=-2))
+
+
 if __name__ == '__main__':
     test_cpu_transform()
     test_weights_device()
     test_fp4_sf_zero_groups()
     test_fp4_exponent_span_clamp()
+    test_fp8_block_sf_layout()
     print('CUDA available:', torch.cuda.is_available(), '- all transform tests passed')

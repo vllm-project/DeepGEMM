@@ -41,7 +41,7 @@ static int get_block_m_for_mega_moe(
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind, mma_type == "fp8xfp8");
     return block_m;
 }
 
@@ -137,8 +137,10 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
     int num_ring_tokens = 0;
     for (const auto& block_m: layout::kCandidateBlockM) {
         const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+        // FP8 routed weights at BLOCK_M 128 run tokens on M with task groups on SM90
         const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
-            num_pool_blocks, num_sms, hidden, intermediate_hidden);
+            num_pool_blocks, num_sms, hidden, intermediate_hidden,
+            jit->device.get_arch_major() == 9 and mma_type == "fp8xfp8" and block_m == 128 ? sched::kNumSM90TaskGroupMBlocks : 1);
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
@@ -324,7 +326,7 @@ static void fp8_fp4_mega_moe(
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
     // Config checks
-    // On SM90, the recipe sets the activation SF granularity only, weight SF stay packed per 32
+    // On SM90, the recipe sets the activation SF granularity only, weight SF words are checked below
     const auto arch_major = jit->device.get_arch_major();
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
@@ -360,12 +362,17 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
 
-    // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
-    constexpr int kGranMN = 1, kGranK = 32;
-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::headeronly::ScalarType::Int);
-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::headeronly::ScalarType::Int);
+    // SM90 FP8 routed weights take FP32 128x128 block scales `[E, N / 128, K / 128]` for all FP8 weights of the call
+    const bool routed_fp8 = arch_major == 9 and weight_dtype == torch::headeronly::ScalarType::Float8_e4m3fn;
+
+    // Check weight SF layout for UE8M0 packing (or block scales), MN-major, and TMA alignment
+    constexpr int kGranMN = 1;
+    const int gran_k = routed_fp8 ? 128 : 32, sf_mn_div = routed_fp8 ? 128 : 1;
+    const auto sf_dtype = routed_fp8 ? torch::headeronly::ScalarType::Float : torch::headeronly::ScalarType::Int;
+    check_sf_layout(l1_weights_sf, intermediate_hidden * 2 / sf_mn_div, hidden, kGranMN, gran_k,
+                    num_experts_per_rank, true, false, sf_dtype);
+    check_sf_layout(l2_weights_sf, hidden / sf_mn_div, intermediate_hidden, kGranMN, gran_k,
+                    num_experts_per_rank, true, false, sf_dtype);
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::stable::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
@@ -385,10 +392,10 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(shared_l2_n == hidden);
         DG_HOST_ASSERT(shared_l1_weights.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn);
         DG_HOST_ASSERT(shared_l2_weights.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn);
-        check_sf_layout(shared_l1_weights_sf, shared_intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                        std::nullopt, true, false, torch::headeronly::ScalarType::Int);
-        check_sf_layout(shared_l2_weights_sf, hidden, shared_intermediate_hidden, kGranMN, kGranK,
-                        std::nullopt, true, false, torch::headeronly::ScalarType::Int);
+        check_sf_layout(shared_l1_weights_sf, shared_intermediate_hidden * 2 / sf_mn_div, hidden, kGranMN, gran_k,
+                        std::nullopt, true, false, sf_dtype);
+        check_sf_layout(shared_l2_weights_sf, hidden / sf_mn_div, shared_intermediate_hidden, kGranMN, gran_k,
+                        std::nullopt, true, false, sf_dtype);
     }
 
     // Check stats counter
@@ -449,8 +456,7 @@ static void fp8_fp4_mega_moe(
         }
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(activation != "situ");
-        DG_HOST_ASSERT(weight_dtype == kPackedFP4);
-        // FP8 shared weights need one exponent per SF word, see `requantize_fp8_weights_for_sm90_mega_moe`
+        // FP8 shared weights of FP4 kernels need one exponent per SF word, see `requantize_fp8_weights_for_sm90_mega_moe`
         sm90_fp8_fp4_mega_moe(y,
                               l1_acts, l1_acts_sf,
                               l2_acts, l2_acts_sf,
@@ -467,7 +473,8 @@ static void fp8_fp4_mega_moe(
                               num_shared_experts,
                               num_tokens, checked_int(num_tokens_for_block_m.value_or(num_tokens)), num_topk,
                               hidden, intermediate_hidden,
-                              activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
+                              activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math,
+                              routed_fp8);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

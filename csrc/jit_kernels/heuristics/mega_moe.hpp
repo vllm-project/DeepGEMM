@@ -102,17 +102,20 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const bool& routed_fp8) {
     // Expected tokens per expert, plus a one-sigma routing margin for the tile choice
     const float num_expected_tokens = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
 
-    // SM90: at most 128 rows per block, or 64 with more than 64 local experts
+    // SM90: at most 128 rows per block, or 64 with more than 64 local experts unless the routed weights are FP8
     if (jit->device.get_arch_major() == 9) {
         DG_HOST_ASSERT(mma_kind == MmaKind::MXFP8FP4);
         int block_m = num_expected_tokens <= 10 ? 16 : 32;
+        // BLOCK_M 128 with tokens on M pays off from about 56 tokens per expert
+        constexpr int kNumFP8BlockM128Tokens = 56;
         if (num_expected_tokens > 24)
-            block_m = (num_covered_tokens <= 96 or num_experts / num_ranks > 64) ? 64 : 128;
+            block_m = (num_covered_tokens <= (routed_fp8 ? kNumFP8BlockM128Tokens : 96) or (num_experts / num_ranks > 64 and not routed_fp8)) ? 64 : 128;
         return {2, block_m, block_m, std::min(block_m, 32), 128, 2 * 128};
     }
 
@@ -234,7 +237,7 @@ static std::pair<int, int> get_sm90_pipeline_config_for_mega_moe(
     const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n,
     const int& num_dispatch_warps, const int& num_math_warps,
-    const bool& with_shared, const bool& pingpong) {
+    const bool& with_shared, const bool& routed_fp8, const bool& pingpong) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumScheduleStages = 2;
     constexpr int kNumAmaxSlots = 2;
@@ -254,11 +257,12 @@ static std::pair<int, int> get_sm90_pipeline_config_for_mega_moe(
     const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(sched::TaskInfo<true>));
     const int smem_barriers = (num_dispatch_warps + num_pipelines * kNumAmaxSlots + num_math_warps * 2 + kNumScheduleStages * 2) * 8;
 
-    // Per stage: tokens, weights (packed FP4, or FP8 with shared experts), SFA, SFB, and the full/empty barriers
+    // Per stage: tokens, weights (packed FP4, or FP8 with shared experts or FP8 routed weights), SFA, SFB, and the full/empty barriers
     const int smem_a_size_per_stage = block_m * block_k;
-    const int smem_b_size_per_stage = block_n * block_k / (with_shared ? 1 : 2);
+    const int smem_b_size_per_stage = block_n * block_k / (with_shared or routed_fp8 ? 1 : 2);
+    const int smem_sfb_size_per_stage = routed_fp8 ? static_cast<int>(layout::kNumBlockSFStageWords) : sf_block_n;
     const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage +
-        (sf_block_m + sf_block_n) * static_cast<int>(sizeof(uint32_t)) + 2 * 8;
+        (sf_block_m + smem_sfb_size_per_stage) * static_cast<int>(sizeof(uint32_t)) + 2 * 8;
     const int smem_fixed = smem_expert_count_size + smem_send_buffers_size + smem_cd + smem_amax + smem_task_info + smem_barriers;
 
     // Select maximum number of stages
@@ -275,12 +279,13 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
     const MmaKind& mma_kind,
-    const int& num_shared_experts = 0) {
+    const int& num_shared_experts = 0,
+    const bool& routed_fp8 = false) {
     const bool is_sm90 = jit->device.get_arch_major() == 9;
 
     // Block config
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind, routed_fp8);
     DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
     const int block_n = 128;
     const int load_block_m = is_sm90 ? block_m : block_m / 2;
@@ -291,7 +296,7 @@ static MegaMoEConfig get_mega_moe_config(
     // or kept packed for NVFP4) all use 128B swizzle
     // SM90 keeps FP4 weights packed in smem, 64 bytes per 128-element row
     const int swizzle_acts_mode = 128;
-    const int swizzle_weights_mode = is_sm90 ? 64 : 128;
+    const int swizzle_weights_mode = is_sm90 and not routed_fp8 ? 64 : 128;
     const int gran_k = get_mma_sf_gran_k(mma_kind);
 
     // Thread layout
@@ -317,7 +322,7 @@ static MegaMoEConfig get_mega_moe_config(
             block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
             sf_block_m, sf_block_n,
             num_dispatch_threads / 32, num_epilogue_threads / 32,
-            num_shared_experts > 0, pingpong) :
+            num_shared_experts > 0, routed_fp8, pingpong) :
         get_pipeline_config_for_mega_moe(
             SM100ArchSpec::smem_capacity,
             num_experts, hidden,
