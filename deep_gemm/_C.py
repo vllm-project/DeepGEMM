@@ -29,11 +29,12 @@ def _unpack_epilogue(value):
 
 
 def _load_extension():
-    so_files = list(Path(__file__).parent.glob('_C_extension*.so'))
-    assert len(so_files) == 1, (
-        f'Expected one _C_extension*.so file, found {len(so_files)}: {so_files}'
+    suffix = 'pyd' if sys.platform == 'win32' else 'so'
+    lib_files = list(Path(__file__).parent.glob(f'_C_extension*.{suffix}'))
+    assert len(lib_files) == 1, (
+        f'Expected one _C_extension*.{suffix} file, found {len(lib_files)}: {lib_files}'
     )
-    torch.ops.load_library(str(so_files[0]))
+    torch.ops.load_library(str(lib_files[0]))
 
 
 _load_extension()
