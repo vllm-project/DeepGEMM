@@ -22,20 +22,45 @@ Masked tokens receive indices of -1 and weights of 0.
 Both architectures support image bias, fixed/random routing, physical expert mapping,
 strided rows in `unmapped_topk_idx`, and preallocated `out=(topk_idx, topk_weights)`.
 Warm up the intended variants on the capture stream before using CUDA Graphs.
-The SM90 fused kernel uses TMA/WGMMA and keeps logits in shared memory without global
-scratch or cross-CTA barriers. Batches of up to 16 tokens use a separate GEMV and routing
-kernel to expose more parallelism. Deterministic mode always uses the fused WGMMA path
-with the same accumulation order across batch sizes. See
-[`test_sm90_mega_gate.py`](../tests/test_sm90_mega_gate.py) for correctness checks and
-benchmarks. It reuses the API contract and reference helpers from the upstream
-[`test_mega_gate.py`](../tests/test_mega_gate.py).
+On SM90, batches of up to 16 tokens use GEMV plus routing by default. Larger
+batches use cuBLASLt plus routing when all device SMs are available. H100/H200 have
+no upper token threshold for this path. On H20 (78 SMs), batches of at least 32768
+tokens with more than 128 experts retain Split-N unless fixed routing is requested.
 
-Run the SM90 tests and benchmarks from the repository root:
+Deterministic mode uses TMA/WGMMA. With a reduced `set_num_sms()` budget, batches
+above 16 tokens also use this path. Each logit is accumulated over the complete
+hidden dimension in a fixed order. Expert tiles
+run on separate CTAs for deterministic routing with more than 128 experts, including
+small batches. The same Split-N path handles large batches with a reduced SM budget.
+Fixed routing uses an unsplit tile. Split-N selects each tile's local top-k, then
+merges those candidates into the global top-k. Invalid candidate indices are clamped
+before expert mapping, including rows whose logits are all NaN.
+
+Custom kernels use grid-stride scheduling when SMs are restricted. Neighboring
+Split-N tasks share the same input tile. Each call owns its candidate storage, so
+concurrent streams and CUDA Graph replay do not share mutable workspace.
+
+Launch choices live in `csrc/jit_kernels/heuristics/sm90_mega_gate.hpp` and can be
+inspected with `DG_PRINT_CONFIGS=1`. SM90 and SM100 share scoring, tie-breaking,
+expert mapping and output helpers in `epilogue/mega_gate.cuh`.
+
+Use an environment with PyTorch and the build dependencies installed. For a source
+checkout, build the local extension before running tests from the repository root:
 
 ```sh
+bash develop.sh
 PYTHONPATH=. python tests/test_sm90_mega_gate.py
 ```
 
-SM90 routing helpers live in `epilogue/sm90_mega_gate.cuh` to keep the upstream
-SM100 implementation unchanged. When upstream routing semantics change, compare
-its `epilogue/sm100_mega_gate.cuh` helpers with the SM90 counterparts.
+After installing a wheel with `install.sh`, run the tests against that installation
+without prepending the source checkout to `PYTHONPATH`:
+
+```sh
+python tests/test_sm90_mega_gate.py
+```
+
+[`test_mega_gate.py`](../tests/test_mega_gate.py) contains the shared API, boundary
+and CUDA Graph checks. [`test_sm90_mega_gate.py`](../tests/test_sm90_mega_gate.py)
+adds fallback-path checks, independent FP32/FP64 references, non-finite input
+regressions, SM budget checks and bitwise batch invariance. Its benchmark times the
+complete call with CUDA events and CUDA Graphs using warm L2.

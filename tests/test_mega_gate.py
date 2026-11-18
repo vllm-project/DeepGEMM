@@ -106,7 +106,8 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
                        mask: torch.Tensor | None = None,
                        force_random: torch.Tensor | None = None,
                        fix_routing_mask: torch.Tensor | None = None,
-                       num_topk: int = NUM_TOPK) -> float:
+                       num_topk: int = NUM_TOPK,
+                       allow_numerical_ties: bool = False) -> float:
     fused_idx, fused_weights = outputs['topk_idx'], outputs['topk_weights']
     num_tokens, num_routed_experts = logits.shape
     active = mask if mask is not None else torch.ones((num_tokens,), dtype=torch.bool, device='cuda')
@@ -156,10 +157,15 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
                 f'top-k selection beyond numerical ties: {crossing.max().item()=}'
 
             ref_weights = reference_weights(ranked, ranking[ranked].topk(num_topk, dim=1).indices)
-            ranked_diff = float(calc_diff(fused_weights[ranked, :num_topk].sort(dim=1).values,
-                                          ref_weights.sort(dim=1).values))
-            assert ranked_diff < 1e-11, f'{ranked_diff=}'
-            weight_diff = max(weight_diff, ranked_diff)
+            # Independent GEMMs may exchange experts whose biased scores differ
+            # only by rounding. Their unbiased weights need not be equal. Every
+            # selected expert's weight and the ranking bound were checked above.
+            stable = crossing < -tolerance if allow_numerical_ties else torch.ones_like(crossing, dtype=torch.bool)
+            if stable.any():
+                ranked_diff = float(calc_diff(fused_weights[ranked, :num_topk][stable].sort(dim=1).values,
+                                              ref_weights[stable].sort(dim=1).values))
+                assert ranked_diff < 1e-11, f'{ranked_diff=}'
+                weight_diff = max(weight_diff, ranked_diff)
 
         if fused_weights.shape[1] > num_topk:
             assert torch.all(fused_weights[score_based, num_topk:] == 1.0).item()
@@ -225,8 +231,8 @@ def test_mega_gate() -> None:
     print()
 
 
-def check_routing_controls() -> None:
-    num_tokens, hidden, num_routed_experts = 512, 4096, 384
+def check_routing_controls(num_tokens: int = 512) -> None:
+    hidden, num_routed_experts = 4096, 384
     inputs = make_inputs(num_tokens, hidden, num_routed_experts, use_shared_as_routed=True, with_image_bias=True)
     outputs = make_outputs(inputs, use_shared_as_routed=True, with_unmapped_topk_idx=True)
     logits = run_reference_gemm(inputs)
@@ -252,8 +258,15 @@ def check_routing_controls() -> None:
     assert torch.all(sorted_random_idx[:, 1:] != sorted_random_idx[:, :-1]).item()
     assert torch.all(unmapped_topk_idx[active_force_random] == -1).item()
 
+    # Omitting fixed routing exercises the split-N merge's random/masked paths.
+    run_mega_gate(inputs, outputs, True, mask=mask, force_random=force_random)
+    check_topk_weights(inputs, outputs, logits, mask, force_random)
+    assert torch.all(unmapped_topk_idx[active_force_random] == -1).item()
+    assert torch.equal(outputs['topk_idx'][active_force_random], random_idx)
+    assert torch.equal(outputs['topk_weights'][active_force_random], random_weights)
 
-@test_filter(lambda: get_arch_major() == 10)
+
+@test_filter(lambda: get_arch_major() in (9, 10))
 @torch.no_grad()
 def test_mega_gate_api_contract() -> None:
     torch.manual_seed(2)
@@ -275,6 +288,7 @@ def test_mega_gate_api_contract() -> None:
     check_correctness(inputs, make_outputs(inputs))
 
     check_routing_controls()
+    check_routing_controls(16)
 
     num_topk = 8
     inputs = make_inputs(8, 4096, 128, with_bias=False, with_physical_map=False)
@@ -313,6 +327,79 @@ def test_mega_gate_api_contract() -> None:
         deep_gemm.use_deterministic_algorithms(False)
 
 
+@test_filter(lambda: get_arch_major() in (9, 10))
+@torch.no_grad()
+def test_mega_gate_boundaries() -> None:
+    torch.manual_seed(3)
+    # Expert padding, partial token tiles, smallest hidden size and all top-k lanes.
+    for num_tokens, num_experts, num_topk in ((1, 4, 1), (3, 4, 4), (17, 132, 32),
+                                            (65, 260, 32), (129, 388, 32), (257, 512, 32)):
+        check_case(num_tokens, 256, num_experts, num_topk=num_topk,
+                   with_image_bias=True, with_mask=True, with_unmapped_topk_idx=True)
+    check_case(33, 256, 128, num_topk=32, with_bias=False, with_physical_map=False)
+    check_case(33, 256, 260, num_topk=6, with_bias=False, with_image_bias=True,
+               with_mask=True, with_physical_map=False)
+
+    for num_tokens in (3, 17):
+        inputs = make_inputs(num_tokens, 256, 132, with_image_bias=True)
+        for key in ('bias', 'image_bias'):
+            inputs[key] = torch.randn((133,), dtype=torch.float32, device='cuda')[1:]
+            assert inputs[key].is_contiguous() and inputs[key].data_ptr() % 16 != 0
+        check_correctness(inputs, make_outputs(inputs, with_unmapped_topk_idx=True))
+
+    # Exercise both shared slots and a nonzero EP rank, including duplicate selection.
+    inputs = make_inputs(33, 256, 256, use_shared_as_routed=True, num_shared_experts=2)
+    logical = torch.empty((33, 8), dtype=torch.int64, device='cuda')
+    idx, weights = deep_gemm.bf16_mega_gate(
+        **inputs, num_topk=8, use_shared_as_routed=True, num_shared_experts=2,
+        routed_scaling_factor=0.75, ep_rank=7, unmapped_topk_idx=logical)
+    all_logical = torch.cat((logical, torch.tensor([256, 257], device='cuda').expand(33, -1)), dim=1)
+    duplicates = (7 + torch.arange(33, device='cuda')[:, None] * 23333) % inputs['logical_count'][all_logical]
+    assert torch.equal(idx, inputs['to_physical_map'][all_logical, duplicates].long())
+    scores = F.softplus(run_reference_gemm(inputs)).sqrt().gather(1, logical)
+    torch.testing.assert_close(weights[:, :8], scores / (scores.sum(dim=1, keepdim=True) + 1e-20) * 0.75)
+    assert torch.all(weights[:, 8:] == 1).item()
+
+
+@test_filter(lambda: get_arch_major() in (9, 10))
+@torch.no_grad()
+def test_mega_gate_cuda_graph() -> None:
+    torch.manual_seed(4)
+    # Independent captures on multiple streams catch shared workspace/barrier reuse.
+    jobs = []
+    for num_tokens, num_experts in ((3, 132), (17, 132), (129, 388), (32769, 260), (32769, 384)):
+        inputs = make_inputs(num_tokens, 256, num_experts, with_image_bias=True, with_mask=True)
+        outputs = make_outputs(inputs, with_unmapped_topk_idx=True)
+        storage = torch.full((num_tokens, NUM_TOPK + 3), -123, dtype=torch.int64, device='cuda')
+        outputs['unmapped_topk_idx'] = storage[:, :NUM_TOPK]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run_mega_gate(inputs, outputs)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            result = run_mega_gate(inputs, outputs)
+        assert result[0].data_ptr() == outputs['topk_idx'].data_ptr()
+        assert result[1].data_ptr() == outputs['topk_weights'].data_ptr()
+        jobs.append((inputs, outputs, storage, stream, graph))
+
+    for _ in range(3):
+        for inputs, outputs, storage, stream, graph in jobs:
+            with torch.cuda.stream(stream):
+                inputs['x'].normal_()
+                inputs['weight'].normal_(std=256 ** -0.5)
+                inputs['mask'].logical_not_()
+                inputs['image_token_mask'].logical_not_()
+                graph.replay()
+        for inputs, outputs, storage, stream, graph in jobs:
+            torch.cuda.current_stream().wait_stream(stream)
+            check_topk_weights(inputs, outputs, run_reference_gemm(inputs), inputs['mask'])
+            assert torch.all(storage[:, NUM_TOPK:] == -123).item()
+
+
 if __name__ == '__main__':
     test_mega_gate_api_contract()
+    test_mega_gate_boundaries()
+    test_mega_gate_cuda_graph()
     test_mega_gate()

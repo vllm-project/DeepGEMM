@@ -2,9 +2,6 @@ import atexit
 import os
 import torch
 
-# Capability advertised to consumers that also support older SM100-only builds.
-bf16_mega_gate_supports_sm90 = True
-
 # Set some default environment provided at setup
 try:
     # noinspection PyUnresolvedReferences
