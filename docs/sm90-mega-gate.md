@@ -41,8 +41,9 @@ Split-N tasks share the same input tile. Each call owns its candidate storage, s
 concurrent streams and CUDA Graph replay do not share mutable workspace.
 
 Launch choices live in `csrc/jit_kernels/heuristics/sm90_mega_gate.hpp` and can be
-inspected with `DG_PRINT_CONFIGS=1`. SM90 and SM100 share scoring, tie-breaking,
-expert mapping and output helpers in `epilogue/mega_gate.cuh`.
+inspected with `DG_PRINT_CONFIGS=1`. SM90 scoring, tie-breaking, expert mapping
+and output helpers stay in `epilogue/sm90_mega_gate.cuh`. The SM100 implementation
+is unchanged to keep future upstream merges independent of the SM90 kernels.
 
 Use an environment with PyTorch and the build dependencies installed. For a source
 checkout, build the local extension before running tests from the repository root:
@@ -59,8 +60,9 @@ without prepending the source checkout to `PYTHONPATH`:
 python tests/test_sm90_mega_gate.py
 ```
 
-[`test_mega_gate.py`](../tests/test_mega_gate.py) contains the shared API, boundary
-and CUDA Graph checks. [`test_sm90_mega_gate.py`](../tests/test_sm90_mega_gate.py)
-adds fallback-path checks, independent FP32/FP64 references, non-finite input
-regressions, SM budget checks and bitwise batch invariance. Its benchmark times the
-complete call with CUDA events and CUDA Graphs using warm L2.
+[`test_sm90_mega_gate.py`](../tests/test_sm90_mega_gate.py) covers the SM90 API,
+boundaries, CUDA Graphs, fallback paths, independent FP32/FP64 references,
+non-finite input regressions, SM budgets and bitwise batch invariance. It reuses
+the existing input and reference utilities from `test_mega_gate.py` without
+changing that file. Its benchmark times the complete call with CUDA events and
+CUDA Graphs using warm L2.
