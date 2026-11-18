@@ -67,7 +67,7 @@ def mqa_logits_heads(is_mxfp4: bool):
     if get_arch_major() == 12:
         # SM120 FP4 MQA is head_dim=128 only (`DG_STATIC_ASSERT(kHeadDim == 128)` in the SM120 FP4 kernels)
         return (16, 32, 64), ((128, ) if is_mxfp4 else (32, 64, 128))
-    return (32, 64), (32, 64, 128)
+    return (16, 32, 64), (32, 64, 128)
 
 
 def quantize_mqa_q(q: torch.Tensor, fmt: str):
