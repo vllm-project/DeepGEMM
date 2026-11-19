@@ -474,8 +474,8 @@ static void fp8_fp4_mega_moe(
                    num_shared_experts,
                    num_tokens, checked_int(num_tokens_for_block_m.value_or(num_tokens)), num_topk,
                    hidden, intermediate_hidden,
-                   activation_args...);
-        }, routed_fp8);
+                   activation_args..., routed_fp8);
+        };
         if (activation == "situ") {
             launch(sm90_fp8_fp4_mega_moe_situ,
                    activation_alpha, activation_beta, fast_math);

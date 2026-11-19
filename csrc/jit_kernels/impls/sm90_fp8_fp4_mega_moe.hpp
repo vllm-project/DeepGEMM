@@ -235,7 +235,7 @@ static void sm90_fp8_fp4_mega_moe(
         num_max_tokens_per_rank, num_experts_per_rank, num_shared_experts,
         num_tokens, num_tokens_for_block_m, num_topk, hidden, intermediate_hidden,
         activation_clamp, clamp_after_silu, activation_alpha, activation_beta, fast_math,
-        MegaMoEActivation::kSwiGLU);
+        MegaMoEActivation::kSwiGLU, routed_fp8);
 }
 
 static void sm90_fp8_fp4_mega_moe_situ(
@@ -265,7 +265,7 @@ static void sm90_fp8_fp4_mega_moe_situ(
         num_max_tokens_per_rank, num_experts_per_rank, num_shared_experts,
         num_tokens, num_tokens_for_block_m, num_topk, hidden, intermediate_hidden,
         std::numeric_limits<float>::infinity(), false,
-        activation_alpha, activation_beta, fast_math, MegaMoEActivation::kSiTU);
+        activation_alpha, activation_beta, fast_math, MegaMoEActivation::kSiTU, routed_fp8);
 }
 
 } // namespace deep_gemm
