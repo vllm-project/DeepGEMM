@@ -55,35 +55,6 @@ CUTLASS_DEVICE float2 situ_tanh_f32x2(const float2& values) {
     return situ_add_f32x2(situ_mul_f32x2(sigmoid, {2.0f, 2.0f}), {-1.0f, -1.0f});
 }
 
-CUTLASS_DEVICE float2 situ_add_f32x2(const float2& a, const float2& b) {
-    return {__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y)};
-}
-
-CUTLASS_DEVICE float2 situ_mul_f32x2(const float2& a, const float2& b) {
-    return {__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)};
-}
-
-template <bool kFastMath>
-CUTLASS_DEVICE float2 situ_sigmoid_f32x2(const float2& values) {
-    const auto exponentials = make_float2(
-        kFastMath ? __expf(-values.x) : expf(-values.x),
-        kFastMath ? __expf(-values.y) : expf(-values.y));
-    const auto denominators = situ_add_f32x2({1.0f, 1.0f}, exponentials);
-    if constexpr (kFastMath) {
-        return {math::fast_rcp(denominators.x), math::fast_rcp(denominators.y)};
-    } else {
-        return {1.0f / denominators.x, 1.0f / denominators.y};
-    }
-}
-
-template <bool kFastMath>
-CUTLASS_DEVICE float2 situ_tanh_f32x2(const float2& values) {
-    // Match FlashInfer: tanh(x) = 2 * sigmoid(2 * x) - 1.
-    const auto sigmoid = situ_sigmoid_f32x2<kFastMath>(
-        situ_mul_f32x2(values, {2.0f, 2.0f}));
-    return situ_add_f32x2(situ_mul_f32x2(sigmoid, {2.0f, 2.0f}), {-1.0f, -1.0f});
-}
-
 // `ptx` helpers with a `memory` clobber, so that plain memory accesses are not reordered across them
 namespace ordered_ptx {
 
