@@ -101,6 +101,13 @@ def _emu_gemm(a: torch.Tensor, sa: torch.Tensor, b: torch.Tensor, sb: torch.Tens
 
 
 def _apply_activation(l1_y: torch.Tensor, weights: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    if args.activation == 'situ':
+        gate, up = l1_y.chunk(2, dim=-1)
+        gated = args.activation_alpha * torch.tanh(gate / args.activation_alpha) * torch.sigmoid(gate)
+        if args.activation_beta > 0:
+            up = args.activation_beta * torch.tanh(up / args.activation_beta)
+        return gated * up * weights[:, None]
+
     # SwiGLU clamps the gate before SiLU, SwiGLU-step the SiLU output (with alpha 1 and beta 0)
     gate, up = l1_y.chunk(2, dim=-1)
     is_step = args.activation == 'swiglustep'
@@ -232,6 +239,9 @@ _SWEEP_CASES = (
     (7, 7168, 3072, 8, 8, 0, 1, 'hot', dict(activation='swiglustep')),
     (63, 4096, 256, 2, 1, 0, 0.5, 'random', dict(activation='swiglustep', **_EXACT)),
     (4096, 2048, 1536, 48, 6, 0, None, 'random', dict(activation='swiglustep')),
+    (7, 512, 256, 2, 1, 1, None, 'random', dict(activation='situ', activation_alpha=1.5, **_EXACT)),
+    (63, 2048, 256, 8, 6, 0, None, 'masked',
+     dict(activation='situ', activation_alpha=0.5, activation_beta=2.0, fast_math=0)),
 )
 
 
@@ -318,7 +328,7 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
     shared_gran_k = args.shared_gran_k or gran_k
     use_emu_reference = arch_major == 9 or args.emu_reference
     is_exact_inputs = args.exact_inputs or args.subnormal_probe
-    assert not use_emu_reference or (not is_bf16xbf16 and args.activation in ('swiglu', 'swiglustep'))
+    assert not use_emu_reference or not is_bf16xbf16
     assert not is_exact_inputs or (use_emu_reference and not args.fast_math)
     assert not args.subnormal_probe or arch_major == 9
     is_block_sf = arch_major == 9 and args.mma_type == 'fp8xfp8'

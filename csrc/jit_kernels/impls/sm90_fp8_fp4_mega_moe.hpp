@@ -14,7 +14,7 @@
 
 namespace deep_gemm {
 
-static void sm90_fp8_fp4_mega_moe(
+static void sm90_fp8_fp4_mega_moe_impl(
     const torch::stable::Tensor& y,
     const torch::stable::Tensor& l1_acts, const torch::stable::Tensor& l1_acts_sf,
     const torch::stable::Tensor& l2_acts, const torch::stable::Tensor& l2_acts_sf,
@@ -36,6 +36,7 @@ static void sm90_fp8_fp4_mega_moe(
     const float& activation_alpha,
     const float& activation_beta,
     const bool& fast_math,
+    const MegaMoEActivation& activation,
     const bool& routed_fp8
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -119,7 +120,7 @@ static void sm90_fp8_fp4_mega_moe(
     const auto num_sms = get_num_sms_for_mega_moe();
 
     // Compile
-    const auto kernel = jit->compile("sm90_fp8_fp4_mega_moe", std::format(R"(
+    const auto kernel = jit->compile(activation == MegaMoEActivation::kSiTU ? "sm90_fp8_fp4_mega_moe_situ" : "sm90_fp8_fp4_mega_moe", std::format(R"(
 #define DG_NO_DEVICE_PRINTF
 // __builtin_unreachable tells ptxas the trap never returns, avoiding spills
 #define DG_DEVICE_ASSERT(cond) do {{ if (not (cond)) {{ asm("trap;"); __builtin_unreachable(); }} }} while (0)
@@ -129,6 +130,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_fp8_fp4_mega_moe_impl<
+        {},
         {},
         {}, {},
         {}, {},
@@ -164,6 +166,7 @@ static void __instantiate_kernel() {{
         config.num_bytes_per_pull,
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
+        activation == MegaMoEActivation::kSiTU ? "MegaMoEActivation::kSiTU" : "MegaMoEActivation::kSwiGLU",
         to_string(activation_clamp),
         clamp_after_silu ? "true" : "false",
         to_string(activation_alpha),
@@ -202,6 +205,69 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_acts_sf,
         tensor_map_shared_l2_weights,
         tensor_map_shared_l2_weights_sf);
+}
+
+static void sm90_fp8_fp4_mega_moe(
+    const torch::stable::Tensor& y,
+    const torch::stable::Tensor& l1_acts, const torch::stable::Tensor& l1_acts_sf,
+    const torch::stable::Tensor& l2_acts, const torch::stable::Tensor& l2_acts_sf,
+    const torch::stable::Tensor& shared_l1_acts, const torch::stable::Tensor& shared_l1_acts_sf,
+    const torch::stable::Tensor& shared_l2_acts, const torch::stable::Tensor& shared_l2_acts_sf,
+    const torch::stable::Tensor& l1_weights, const torch::stable::Tensor& l2_weights,
+    const torch::stable::Tensor& l1_weights_sf, const torch::stable::Tensor& l2_weights_sf,
+    const torch::stable::Tensor& shared_l1_weights, const torch::stable::Tensor& shared_l2_weights,
+    const torch::stable::Tensor& shared_l1_weights_sf, const torch::stable::Tensor& shared_l2_weights_sf,
+    const std::optional<torch::stable::Tensor> cumulative_local_expert_recv_stats,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts_per_rank, const int& num_shared_experts,
+    const int& num_tokens, const int& num_tokens_for_block_m, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const float& activation_clamp, const bool& clamp_after_silu,
+    const float& activation_alpha, const float& activation_beta, const bool& fast_math,
+    const bool& routed_fp8
+) {
+    sm90_fp8_fp4_mega_moe_impl(
+        y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+        shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+        l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
+        shared_l1_weights, shared_l2_weights, shared_l1_weights_sf, shared_l2_weights_sf,
+        cumulative_local_expert_recv_stats, sym_buffer_ptrs, rank_idx,
+        num_max_tokens_per_rank, num_experts_per_rank, num_shared_experts,
+        num_tokens, num_tokens_for_block_m, num_topk, hidden, intermediate_hidden,
+        activation_clamp, clamp_after_silu, activation_alpha, activation_beta, fast_math,
+        MegaMoEActivation::kSwiGLU, routed_fp8);
+}
+
+static void sm90_fp8_fp4_mega_moe_situ(
+    const torch::stable::Tensor& y,
+    const torch::stable::Tensor& l1_acts, const torch::stable::Tensor& l1_acts_sf,
+    const torch::stable::Tensor& l2_acts, const torch::stable::Tensor& l2_acts_sf,
+    const torch::stable::Tensor& shared_l1_acts, const torch::stable::Tensor& shared_l1_acts_sf,
+    const torch::stable::Tensor& shared_l2_acts, const torch::stable::Tensor& shared_l2_acts_sf,
+    const torch::stable::Tensor& l1_weights, const torch::stable::Tensor& l2_weights,
+    const torch::stable::Tensor& l1_weights_sf, const torch::stable::Tensor& l2_weights_sf,
+    const torch::stable::Tensor& shared_l1_weights, const torch::stable::Tensor& shared_l2_weights,
+    const torch::stable::Tensor& shared_l1_weights_sf, const torch::stable::Tensor& shared_l2_weights_sf,
+    const std::optional<torch::stable::Tensor> cumulative_local_expert_recv_stats,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts_per_rank, const int& num_shared_experts,
+    const int& num_tokens, const int& num_tokens_for_block_m, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const float& activation_alpha, const float& activation_beta, const bool& fast_math,
+    const bool& routed_fp8
+) {
+    sm90_fp8_fp4_mega_moe_impl(
+        y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+        shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+        l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
+        shared_l1_weights, shared_l2_weights, shared_l1_weights_sf, shared_l2_weights_sf,
+        cumulative_local_expert_recv_stats, sym_buffer_ptrs, rank_idx,
+        num_max_tokens_per_rank, num_experts_per_rank, num_shared_experts,
+        num_tokens, num_tokens_for_block_m, num_topk, hidden, intermediate_hidden,
+        std::numeric_limits<float>::infinity(), false,
+        activation_alpha, activation_beta, fast_math, MegaMoEActivation::kSiTU, routed_fp8);
 }
 
 } // namespace deep_gemm

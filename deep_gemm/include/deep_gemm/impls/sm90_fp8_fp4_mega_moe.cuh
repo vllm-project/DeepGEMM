@@ -26,6 +26,35 @@
 
 namespace deep_gemm {
 
+CUTLASS_DEVICE float2 situ_add_f32x2(const float2& a, const float2& b) {
+    return {__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y)};
+}
+
+CUTLASS_DEVICE float2 situ_mul_f32x2(const float2& a, const float2& b) {
+    return {__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)};
+}
+
+template <bool kFastMath>
+CUTLASS_DEVICE float2 situ_sigmoid_f32x2(const float2& values) {
+    const auto exponentials = make_float2(
+        kFastMath ? __expf(-values.x) : expf(-values.x),
+        kFastMath ? __expf(-values.y) : expf(-values.y));
+    const auto denominators = situ_add_f32x2({1.0f, 1.0f}, exponentials);
+    if constexpr (kFastMath) {
+        return {math::fast_rcp(denominators.x), math::fast_rcp(denominators.y)};
+    } else {
+        return {1.0f / denominators.x, 1.0f / denominators.y};
+    }
+}
+
+template <bool kFastMath>
+CUTLASS_DEVICE float2 situ_tanh_f32x2(const float2& values) {
+    // Match FlashInfer: tanh(x) = 2 * sigmoid(2 * x) - 1.
+    const auto sigmoid = situ_sigmoid_f32x2<kFastMath>(
+        situ_mul_f32x2(values, {2.0f, 2.0f}));
+    return situ_add_f32x2(situ_mul_f32x2(sigmoid, {2.0f, 2.0f}), {-1.0f, -1.0f});
+}
+
 // `ptx` helpers with a `memory` clobber, so that plain memory accesses are not reordered across them
 namespace ordered_ptx {
 
@@ -86,6 +115,7 @@ template <
     uint32_t kNumDispatchThreads, uint32_t kNumNonMathThreads,
     uint32_t kNumMathThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
+    MegaMoEActivation kActivation,
     float kActivationClamp,
     bool kClampAfterSilu,
     float kActivationAlpha,
@@ -140,6 +170,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonMathThreads == 128, "Invalid number of non-math threads");
     DG_STATIC_ASSERT(kNumMathThreads == 256, "Invalid number of math threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(kActivation != MegaMoEActivation::kSiTU or kActivationAlpha > 0.0f, "SiTU activation alpha must be positive");
+    DG_STATIC_ASSERT(kActivation != MegaMoEActivation::kSiTU or kActivationBeta >= 0.0f, "SiTU activation beta must be non-negative");
+    DG_STATIC_ASSERT(kActivation != MegaMoEActivation::kSiTU or kActivationClamp == cute::numeric_limits<float>::infinity(), "SiTU does not support activation clamping");
+    DG_STATIC_ASSERT(kActivation != MegaMoEActivation::kSiTU or not kClampAfterSilu, "SiTU does not support clamping after SiLU");
 
     // Thread indices
     const uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
@@ -1181,21 +1215,40 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     ptx::fence_proxy_async_global();
                 }
 
-                // Apply SwiGLU and top-k weights (1 for shared experts): gate * sigmoid(alpha * gate) * (up + beta) * weight
+                // Apply the compile-time activation and top-k weights (1 for shared experts)
                 const auto apply_swiglu = [&](const float2& gate_accum, const float2& up_accum, const float2& weights) {
                     auto bf16_gate = __float22bfloat162_rn(gate_accum);
                     auto bf16_up = __float22bfloat162_rn(up_accum);
 
-                    // Clamp
-                    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity() and kActivation != MegaMoEActivation::kSiTU) {
                         if constexpr (not kClampAfterSilu)
                             bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
                         bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
                         bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                     }
 
-                    // SwiGLU
                     const auto gate = __bfloat1622float2(bf16_gate);
+                    auto up = __bfloat1622float2(bf16_up);
+
+                    if constexpr (kActivation == MegaMoEActivation::kSiTU) {
+                        constexpr float kInvActivationAlpha = 1.0f / kActivationAlpha;
+                        const auto gated = situ_mul_f32x2(
+                            situ_mul_f32x2(
+                                situ_tanh_f32x2<kFastMath>(
+                                    situ_mul_f32x2(gate, {kInvActivationAlpha, kInvActivationAlpha})),
+                                {kActivationAlpha, kActivationAlpha}),
+                            situ_sigmoid_f32x2<kFastMath>(gate));
+                        if constexpr (kActivationBeta > 0.0f) {
+                            constexpr float kInvActivationBeta = 1.0f / kActivationBeta;
+                            up = situ_mul_f32x2(
+                                situ_tanh_f32x2<kFastMath>(
+                                    situ_mul_f32x2(up, {kInvActivationBeta, kInvActivationBeta})),
+                                {kActivationBeta, kActivationBeta});
+                        }
+                        return situ_mul_f32x2(situ_mul_f32x2(gated, up), weights);
+                    }
+
+                    // SwiGLU
                     auto sigmoid_input = gate;
                     if constexpr (kActivationAlpha != 1.0f)
                         sigmoid_input = {sigmoid_input.x * kActivationAlpha, sigmoid_input.y * kActivationAlpha};
@@ -1211,7 +1264,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                     if constexpr (kClampAfterSilu and kActivationClamp != cute::numeric_limits<float>::infinity())
                         gated = {fminf(gated.x, kActivationClamp), fminf(gated.y, kActivationClamp)};
-                    auto up = __bfloat1622float2(bf16_up);
                     if constexpr (kActivationBeta != 0.0f)
                         up = {up.x + kActivationBeta, up.y + kActivationBeta};
                     return float2{gated.x * up.x * weights.x, gated.y * up.y * weights.y};
