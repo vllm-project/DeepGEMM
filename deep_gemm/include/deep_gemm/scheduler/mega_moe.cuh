@@ -45,10 +45,10 @@ int get_num_l1_warmup_waves(
         num_clusters) + 1;
 
     // TODO: may delay combine NVLink
-    // With task groups, an L2 task needs the L1 tasks of its whole group: the L1 tasks claimed ahead must cover one L2 wave and one group
+    // With task groups, an L2 task needs the L1 tasks of its whole group: the L1 tasks claimed ahead must cover one group on top of the waves above
     const int num_warmup_waves = cute::max(num_l1_warmup_clusters_for_first_l2_wave, num_warmup_waves_for_interleave_schedule);
-    return num_task_group_m_blocks > 1 ? cute::max(num_warmup_waves,
-        math::constexpr_ceil_div(num_clusters + num_task_group_m_blocks * num_l1_n_clusters, num_clusters) + 1) : num_warmup_waves;
+    return num_task_group_m_blocks > 1 ?
+        num_warmup_waves + math::constexpr_ceil_div(num_task_group_m_blocks * num_l1_n_clusters, num_clusters) : num_warmup_waves;
 }
 
 // Host-side ring capacity helper for the MegaMoE schedule.
