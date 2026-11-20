@@ -1219,6 +1219,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 const auto apply_swiglu = [&](const float2& gate_accum, const float2& up_accum, const float2& weights) {
                     auto bf16_gate = __float22bfloat162_rn(gate_accum);
                     auto bf16_up = __float22bfloat162_rn(up_accum);
+
+                    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity() and kActivation != MegaMoEActivation::kSiTU) {
+                        if constexpr (not kClampAfterSilu)
+                            bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
+                        bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
+                        bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
+                    }
+
                     const auto gate = __bfloat1622float2(bf16_gate);
                     auto up = __bfloat1622float2(bf16_up);
 
@@ -1240,16 +1248,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         return situ_mul_f32x2(situ_mul_f32x2(gated, up), weights);
                     }
 
-                    // Clamp
-                    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
-                        if constexpr (not kClampAfterSilu)
-                            bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
-                        bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
-                        bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
-                    }
-
                     // SwiGLU
-                    const auto gate = __bfloat1622float2(bf16_gate);
                     auto sigmoid_input = gate;
                     if constexpr (kActivationAlpha != 1.0f)
                         sigmoid_input = {sigmoid_input.x * kActivationAlpha, sigmoid_input.y * kActivationAlpha};
@@ -1265,7 +1264,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                     if constexpr (kClampAfterSilu and kActivationClamp != cute::numeric_limits<float>::infinity())
                         gated = {fminf(gated.x, kActivationClamp), fminf(gated.y, kActivationClamp)};
-                    auto up = __bfloat1622float2(bf16_up);
                     if constexpr (kActivationBeta != 0.0f)
                         up = {up.x + kActivationBeta, up.y + kActivationBeta};
                     return float2{gated.x * up.x * weights.x, gated.y * up.y * weights.y};

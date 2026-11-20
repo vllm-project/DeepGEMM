@@ -224,7 +224,8 @@ static void sm90_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_tokens_for_block_m, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp, const bool& clamp_after_silu,
-    const float& activation_alpha, const float& activation_beta, const bool& fast_math
+    const float& activation_alpha, const float& activation_beta, const bool& fast_math,
+    const bool& routed_fp8
 ) {
     sm90_fp8_fp4_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
@@ -254,7 +255,8 @@ static void sm90_fp8_fp4_mega_moe_situ(
     const int& num_experts_per_rank, const int& num_shared_experts,
     const int& num_tokens, const int& num_tokens_for_block_m, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const float& activation_alpha, const float& activation_beta, const bool& fast_math
+    const float& activation_alpha, const float& activation_beta, const bool& fast_math,
+    const bool& routed_fp8
 ) {
     sm90_fp8_fp4_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
