@@ -527,13 +527,60 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         return __floats2bfloat162_rn(0.0f, 0.0f);
                 };
 
-                // Overlap loads and reduction by unrolling two splits, except in paged mode
-                #pragma unroll (kIsPaged ? 1 : 2)
+                // Same FMA chains as `reduce_pairs`, on heads already ReLU'd and packed to BF16x2
+                const auto reduce_packed_pairs = [&](const nv_bfloat162* chunk, const nv_bfloat162* chunk_weights,
+                                                     nv_bfloat162& sum_0, nv_bfloat162& sum_1) {
+                    #pragma unroll
+                    for (uint32_t pair_offset = 0; pair_offset < kNumHeads / 2; pair_offset += 2) {
+                        sum_0 = __hfma2(chunk[pair_offset], chunk_weights[pair_offset], sum_0);
+                        sum_1 = __hfma2(chunk[pair_offset + 1], chunk_weights[pair_offset + 1], sum_1);
+                    }
+                };
+
+                // Contiguous MXFP4 KV with >= 32 heads waits mostly on the MMA, which waits for the TMEM stage:
+                // release it before the FMA reduction (slower for MXFP8 and for fewer heads, i.e. more tokens per tile).
+                // The packed path is the BF16 reduction; FP32 weights keep the FP32 path below
+                constexpr bool kReleaseTmemEarly = kIsFP4 and kNumHeads >= 32 and not kIsPaged and not kIsFP32Reduce;
+                // Overlap loads and reduction by unrolling splits (4 with the early release, so one split's FMA chains
+                // overlap the next split's TMEM wait and loads), except in paged mode
+                constexpr uint32_t kSplitUnroll = kReleaseTmemEarly ? 4 : (kIsPaged ? 1 : 2);
+                #pragma unroll (kSplitUnroll)
                 for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
                     const auto kv_offset = task.kv_token_base + kv_split_idx * SPLIT_KV + math_thread_idx;
                     CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
                     ptx::tcgen05_after_thread_sync();
+
+                    if constexpr (kReleaseTmemEarly) {
+                        // TMEM is too full to double-buffer, so the MMA of the next split waits for this one's
+                        // release: ReLU-pack every token's heads first and release TMEM right after the last load
+                        nv_bfloat162 relu_packed[kNumValidTokens][kNumHeads / 2];
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                            const auto pack_head_chunk = [&](auto head_base_t, auto num_chunk_heads_t) {
+                                constexpr uint32_t kHeadBase = decltype(head_base_t)::value;
+                                constexpr uint32_t kNumChunkHeads = decltype(num_chunk_heads_t)::value;
+                                #pragma unroll
+                                for (uint32_t h = 0; h < kNumChunkHeads; h += 2) {
+                                    relu_packed[i][(kHeadBase + h) / 2] =
+                                        ptx::cvt_relu_bf16x2_f32(make_float2(accum[h], accum[h + 1]));
+                                }
+                            };
+                            visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum,
+                                                              pack_head_chunk);
+                        }
+                        ptx::tcgen05_before_thread_sync();
+                        smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                            auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
+                            auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
+                            reduce_packed_pairs(relu_packed[i], weights[i], sum_0, sum_1);
+                            store_token(i, kv_offset, sum_0, sum_1);
+                        }
+                        continue;
+                    }
 
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
