@@ -142,7 +142,7 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
         const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
             num_pool_blocks, num_sms, hidden, intermediate_hidden,
             jit->device.get_arch_major() == 9 and mma_type == "fp8xfp8" and block_m == 128 ? sched::kNumSM90TaskGroupMBlocks : 1,
-            get_block_n_for_mega_moe(mma_type == "bf16xnvfp4", block_m));
+            get_block_n_for_mega_moe(mma_type == "bf16xnvfp4", block_m, intermediate_hidden));
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
