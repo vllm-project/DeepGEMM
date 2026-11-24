@@ -36,12 +36,15 @@ static void sm90_fp8_fp4_mega_moe(
     const float& activation_alpha,
     const float& activation_beta,
     const bool& fast_math,
-    const bool& routed_fp8
+    const bool& routed_fp8,
+    const MegaMoEActivation& activation = MegaMoEActivation::kSwiGLU,
+    const std::optional<std::pair<torch::stable::Tensor, torch::stable::Tensor>>& nvfp4_global_scales = std::nullopt
 ) {
+    const bool routed_nvfp4 = nvfp4_global_scales.has_value();
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
-    const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const auto num_sf_ring_tokens = routed_nvfp4 ? 0 : static_cast<int>(l1_acts_sf.size(0));
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Heuristics
@@ -49,7 +52,7 @@ static void sm90_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens_for_block_m, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4, num_shared_experts, routed_fp8);
+        routed_nvfp4 ? MmaKind::BF16 : MmaKind::MXFP8FP4, num_shared_experts, routed_fp8, routed_nvfp4, num_tokens);
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -65,10 +68,13 @@ static void sm90_fp8_fp4_mega_moe(
         return make_tma_sf_desc(cute::UMMA::Major::MN, sf, shape_mn, shape_k, block_mn, is_fp32 ? kGranK * 4 : kGranK, num_groups, 0, 0, false,
                                 sf_smem_outer_dim, static_cast<int>(sf.stride(-1)));
     };
-    // Weight SF: one word per row, `block_n` per box, or with `routed_fp8` one 128x128 block scale per 128 rows, 4 per box
+    // Weight SF: one word per row, `block_n` per box, or with `routed_fp8` one 128x128 block scale per 128 rows, 4 per box,
+    // or with `routed_nvfp4` the contiguous 2 words per row of each K block, `2 * block_n` per box
     const auto weights_sf_desc = [&](const torch::stable::Tensor& sf, const int& shape_n, const int& shape_k, const int& num_groups) {
         if (routed_fp8)
             return sf_desc(sf, shape_n / 128, shape_k, layout::kNumBlockSFWords, num_groups);
+        if (routed_nvfp4)
+            return make_tma_2d_desc(sf, 2 * shape_n, num_groups * shape_k / config.block_k, 2 * config.block_n, 1, 2 * shape_n, 0);
         return sf_desc(sf, shape_n, shape_k, config.block_n, num_groups);
     };
     // Packed FP4 weights are loaded as raw bytes, 64 per 128-element K block, FP8 routed weights like the shared weights
@@ -78,14 +84,16 @@ static void sm90_fp8_fp4_mega_moe(
         return make_tma_weights_3d_desc(torch::stable::view(w, torch::headeronly::ScalarType::Float8_e4m3fn),
                                         config.block_k / 2, config.load_block_n, config.swizzle_weights_mode);
     };
-    // L1 output and L2 activations are the same tensor, the post-SwiGLU output and its swizzling are half as wide
+    // L1 output and L2 activations are the same tensor, the post-SwiGLU output is half as wide, and so is its swizzling with FP8
+    // BF16 tokens have no SF, the token tensormaps stand in
     const auto tensor_map_l1_acts = acts_desc(l1_acts, hidden, config.num_ring_tokens, config.block_k, config.load_block_m, config.swizzle_acts_mode);
-    const auto tensor_map_l1_acts_sf = sf_desc(l1_acts_sf, config.num_sf_ring_tokens, hidden, config.sf_block_m, 1);
+    const auto tensor_map_l1_acts_sf = routed_nvfp4 ? tensor_map_l1_acts : sf_desc(l1_acts_sf, config.num_sf_ring_tokens, hidden, config.sf_block_m, 1);
     const auto tensor_map_l1_weights = routed_weights_desc(l1_weights);
     const auto tensor_map_l1_weights_sf = weights_sf_desc(l1_weights_sf, intermediate_hidden * 2, hidden, num_experts_per_rank);
-    const auto tensor_map_l1_output = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_n / 2, config.block_m, config.swizzle_acts_mode / 2);
+    const auto tensor_map_l1_output = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_n / 2, config.block_m,
+                                                routed_nvfp4 ? config.block_n : config.swizzle_acts_mode / 2);
     const auto tensor_map_l2_acts = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_k, config.load_block_m, config.swizzle_acts_mode);
-    const auto tensor_map_l2_acts_sf = sf_desc(l2_acts_sf, config.num_sf_ring_tokens, intermediate_hidden, config.sf_block_m, 1);
+    const auto tensor_map_l2_acts_sf = routed_nvfp4 ? tensor_map_l2_acts : sf_desc(l2_acts_sf, config.num_sf_ring_tokens, intermediate_hidden, config.sf_block_m, 1);
     const auto tensor_map_l2_weights = routed_weights_desc(l2_weights);
     const auto tensor_map_l2_weights_sf = weights_sf_desc(l2_weights_sf, hidden, intermediate_hidden, num_experts_per_rank);
 
@@ -148,6 +156,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -164,13 +174,15 @@ static void __instantiate_kernel() {{
         config.num_bytes_per_pull,
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
+        activation == MegaMoEActivation::kSiTU ? "MegaMoEActivation::kSiTU" : "MegaMoEActivation::kSwiGLU",
         to_string(activation_clamp),
         clamp_after_silu ? "true" : "false",
         to_string(activation_alpha),
         to_string(activation_beta),
         fast_math ? "true" : "false",
         config.pingpong ? "true" : "false",
-        routed_fp8 ? "true" : "false"));
+        routed_fp8 ? "true" : "false",
+        routed_nvfp4 ? "true" : "false"));
 
     // Launch
     jit->launch(
@@ -201,7 +213,9 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_acts,
         tensor_map_shared_l2_acts_sf,
         tensor_map_shared_l2_weights,
-        tensor_map_shared_l2_weights_sf);
+        tensor_map_shared_l2_weights_sf,
+        routed_nvfp4 ? nvfp4_global_scales->first.const_data_ptr<float>() : nullptr,
+        routed_nvfp4 ? nvfp4_global_scales->second.const_data_ptr<float>() : nullptr);
 }
 
 } // namespace deep_gemm

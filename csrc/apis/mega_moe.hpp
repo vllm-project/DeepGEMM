@@ -41,7 +41,8 @@ static int get_block_m_for_mega_moe(
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind, mma_type == "fp8xfp8");
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind,
+                                      mma_type == "fp8xfp8", mma_type == "bf16xnvfp4");
     return block_m;
 }
 
@@ -140,7 +141,8 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
         // FP8 routed weights at BLOCK_M 128 run tokens on M with task groups on SM90
         const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
             num_pool_blocks, num_sms, hidden, intermediate_hidden,
-            jit->device.get_arch_major() == 9 and mma_type == "fp8xfp8" and block_m == 128 ? sched::kNumSM90TaskGroupMBlocks : 1);
+            jit->device.get_arch_major() == 9 and mma_type == "fp8xfp8" and block_m == 128 ? sched::kNumSM90TaskGroupMBlocks : 1,
+            get_block_n_for_mega_moe(mma_type == "bf16xnvfp4", block_m));
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
@@ -478,6 +480,100 @@ static void fp8_fp4_mega_moe(
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
+
+    // Zero the entire symmetric buffer for debug mode
+    // NOTES: caller must re-copy inputs into the buffer before each kernel call
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
+        torch_compat::zero_(sym_buffer);
+}
+
+static void bf16_nvfp4_mega_moe(
+    const torch::stable::Tensor& y,
+    const std::tuple<torch::stable::Tensor, torch::stable::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::stable::Tensor, torch::stable::Tensor>& l2_weights_tuple,
+    const torch::stable::Tensor& l1_global_scales,
+    const torch::stable::Tensor& l2_global_scales,
+    const std::optional<torch::stable::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::stable::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::string& activation,
+    const float& activation_alpha,
+    const float& activation_beta,
+    const std::optional<int64_t>& num_tokens_for_block_m
+) {
+    // SM90 NVFP4 routed experts with BF16 tokens: packed E2M1 weights, their E4M3 scales per 16 K in the layout of
+    // `transform_nvfp4_weights_for_sm90_mega_moe` (2 words per row and 128 K), and per-local-expert FP32 global scales
+    // With SiTU, `activation_alpha` and `activation_beta` are the gate and up softcaps (0 for none)
+    const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+    const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+    const auto num_tokens = static_cast<int>(y.size(0));
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
+    if (activation == "situ")
+        DG_HOST_ASSERT(activation_alpha >= 0 and activation_beta >= 0);
+
+    // Tensor checks
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_weights_layout_3d(l1_weights);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
+    DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4 and l2_weights.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(not is_localized(l1_weights) and not is_localized(l2_weights));
+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+    DG_HOST_ASSERT(hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    const auto check_sf = [&](const torch::stable::Tensor& sf, const int& shape_n, const int& shape_k) {
+        DG_HOST_ASSERT(sf.scalar_type() == torch::headeronly::ScalarType::Int and sf.is_contiguous());
+        DG_HOST_ASSERT(sf.numel() == static_cast<int64_t>(num_experts_per_rank) * (shape_k / 128) * shape_n * 2);
+    };
+    check_sf(l1_weights_sf, intermediate_hidden * 2, hidden);
+    check_sf(l2_weights_sf, hidden, intermediate_hidden);
+    for (const auto& global_scales: {l1_global_scales, l2_global_scales}) {
+        DG_HOST_ASSERT(global_scales.scalar_type() == torch::headeronly::ScalarType::Float and global_scales.is_contiguous());
+        DG_HOST_ASSERT(global_scales.dim() == 1 and global_scales.size(0) == num_experts_per_rank);
+    }
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::headeronly::ScalarType::Int);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+
+    // Check buffer bytes
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto layout_info = build_symm_buffer_layout(
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        "bf16xnvfp4", activation);
+    DG_HOST_ASSERT(torch_compat::nbytes(sym_buffer) >= static_cast<size_t>(layout_info.num_bytes));
+    DG_HOST_ASSERT(num_experts == num_experts_per_rank * num_ranks);
+
+    // Already registered tensors
+    const auto [x, x_sf, topk_idx, topk_weights,
+                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] =
+        slice_symm_buffer_from_layout(sym_buffer, layout_info);
+
+    const auto none = torch::stable::Tensor();
+    sm90_fp8_fp4_mega_moe(y,
+                          l1_acts, l1_acts_sf,
+                          l2_acts, l2_acts_sf,
+                          none, none, none, none,
+                          l1_weights, l2_weights,
+                          l1_weights_sf, l2_weights_sf,
+                          none, none, none, none,
+                          cumulative_local_expert_recv_stats,
+                          sym_buffer_ptrs,
+                          rank_idx, num_max_tokens_per_rank,
+                          num_experts_per_rank,
+                          0,
+                          num_tokens, checked_int(num_tokens_for_block_m.value_or(num_tokens)), num_topk,
+                          hidden, intermediate_hidden,
+                          std::numeric_limits<float>::infinity(), false, activation_alpha, activation_beta, false,
+                          false,
+                          activation == "situ" ? MegaMoEActivation::kSiTU : MegaMoEActivation::kSwiGLU,
+                          std::make_pair(l1_global_scales, l2_global_scales));
 
     // Zero the entire symmetric buffer for debug mode
     // NOTES: caller must re-copy inputs into the buffer before each kernel call
@@ -903,6 +999,33 @@ static void fp8_fp4_mega_moe(
         static_cast<float>(activation_alpha), static_cast<float>(activation_beta), num_tokens_for_block_m);
 }
 
+static void bf16_nvfp4_mega_moe(
+    const torch::stable::Tensor& y,
+    const torch::stable::Tensor& l1_weights,
+    const torch::stable::Tensor& l1_weights_sf,
+    const torch::stable::Tensor& l2_weights,
+    const torch::stable::Tensor& l2_weights_sf,
+    const torch::stable::Tensor& l1_global_scales,
+    const torch::stable::Tensor& l2_global_scales,
+    const std::optional<torch::stable::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::stable::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const int64_t& rank_idx,
+    const int64_t& num_max_tokens_per_rank,
+    const int64_t& num_experts,
+    const int64_t& num_topk,
+    const std::string& activation,
+    const double& activation_alpha,
+    const double& activation_beta,
+    const std::optional<int64_t>& num_tokens_for_block_m) {
+    mega::bf16_nvfp4_mega_moe(
+        y, {l1_weights, l1_weights_sf}, {l2_weights, l2_weights_sf}, l1_global_scales, l2_global_scales,
+        cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs,
+        mega::checked_int(rank_idx), mega::checked_int(num_max_tokens_per_rank),
+        mega::checked_int(num_experts), mega::checked_int(num_topk), activation,
+        static_cast<float>(activation_alpha), static_cast<float>(activation_beta), num_tokens_for_block_m);
+}
+
 template <bool use_trtllm_weights>
 static void bf16_mega_moe(
     const torch::stable::Tensor& y,
@@ -997,6 +1120,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("_slice_symm_buffer_for_mega_moe(Tensor(a) buffer, int[] layout_info) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
 
     m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, int? num_tokens_for_block_m) -> ()");
+    m.def("bf16_nvfp4_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l1_weights_sf, Tensor l2_weights, Tensor l2_weights_sf, Tensor l1_global_scales, Tensor l2_global_scales, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float activation_alpha, float activation_beta, int? num_tokens_for_block_m) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
     m.def("bf16_mega_moe_trtllm(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
     m.def("fp4_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
@@ -1012,6 +1136,7 @@ STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("_slice_symm_buffer_for_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::_slice_symm_buffer_for_mega_moe));
 
     m.impl("fp8_fp4_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::fp8_fp4_mega_moe));
+    m.impl("bf16_nvfp4_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::bf16_nvfp4_mega_moe));
     m.impl("bf16_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::bf16_mega_moe<false>));
     m.impl("bf16_mega_moe_trtllm", TORCH_BOX(&deep_gemm::torch_registration::bf16_mega_moe<true>));
     m.impl("fp4_fp4_mega_moe", TORCH_BOX(&deep_gemm::torch_registration::fp4_fp4_mega_moe<false>));
