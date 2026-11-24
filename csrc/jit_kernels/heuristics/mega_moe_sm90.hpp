@@ -314,6 +314,11 @@ static MegaMoEConfig get_mega_moe_config(
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
     }
+    // Smaller dispatch buffers leave more shared memory for the SM90 FP8
+    // pipeline. Only split pulls that consist of whole 2 KiB chunks.
+    constexpr int kSM90FP8PullBytes = 2048;
+    if (is_sm90 and routed_fp8 and num_bytes_per_pull % kSM90FP8PullBytes == 0)
+        num_bytes_per_pull = kSM90FP8PullBytes;
 
     // Pipeline
     // SM90 ping-pong: each math warpgroup computes whole tasks, so its epilogue overlaps the other's mainloop
