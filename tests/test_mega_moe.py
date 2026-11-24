@@ -3,6 +3,7 @@ import functools
 import os
 import random
 import sys
+import time
 import torch
 import torch.distributed as dist
 from typing import Optional, Tuple
@@ -254,6 +255,8 @@ _GLM_SWEEP_CASES = (
     (63, 512, 384, 8, 6, 1, None, 'random', dict(**_GLM_BLOCK, **_EXACT)),
     (129, 7168, 384, 8, 6, 2, 10, 'empty', _GLM_BLOCK),
     (1000, 2048, 128, 48, 8, 2, 10, 'random', _GLM_BLOCK),
+    # Task groups (BLOCK_M 128) with more L1 than L2 N clusters, every token on the same experts: used to deadlock
+    (2049, 1536, 1536, 64, 16, 0, 10, 'same', _GLM_BLOCK),
 )
 
 
@@ -423,6 +426,8 @@ def test_case(rank_idx: int, num_ranks: int, group: dist.ProcessGroup, args: arg
             routing_bias[0] = float('inf')
         elif args.routing == 'empty':
             routing_bias[1::2] = -float('inf')
+        elif args.routing == 'same':
+            scores = scores[:1].expand_as(scores).contiguous()
         topk_idx = torch.topk(scores + routing_bias, num_topk, dim=-1, largest=True, sorted=False)[1]
         topk_weights = scores.gather(1, topk_idx)
         if is_exact_inputs:
@@ -954,8 +959,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
-    parser.add_argument('--routing', type=str, default='random', choices=('random', 'hot', 'empty'),
-                        help='Every token picks expert 0 (hot), or odd experts get no tokens (empty)')
+    parser.add_argument('--routing', type=str, default='random', choices=('random', 'hot', 'empty', 'same'),
+                        help='Every token picks expert 0 (hot), odd experts get no tokens (empty), or all tokens pick the same experts (same)')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
     parser.add_argument('--use-localization', action='store_true', help='Localize the weights into the locality domains (requires MLOPart)')
@@ -970,6 +975,7 @@ if __name__ == '__main__':
     parser.add_argument('--shared-gran-k', type=int, default=None, choices=(32, 128),
                         help='K granularity of the shared weight scales (default: 128 on SM90, 32 on SM100)')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
+    parser.add_argument('--timeout', type=float, default=None, help='Kill the ranks and fail after this many seconds (e.g. a hang)')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()
 
@@ -983,4 +989,10 @@ if __name__ == '__main__':
     else:
         # Launch tests
         num_processes = args.num_processes
-        torch.multiprocessing.spawn(test, args=(num_processes, args), nprocs=num_processes)
+        context = torch.multiprocessing.spawn(test, args=(num_processes, args), nprocs=num_processes, join=False)
+        deadline = time.monotonic() + (args.timeout or float('inf'))
+        while not context.join(timeout=max(0., min(deadline - time.monotonic(), 60.))):
+            if time.monotonic() >= deadline:
+                for process in context.processes:
+                    process.kill()
+                sys.exit(f'Timed out after {args.timeout} s, the kernel may hang')
