@@ -9,6 +9,7 @@
 #include <map>
 
 #include "../utils/compatibility.hpp"
+#include "../jit_kernels/impls/sm90_bf16_mega_gate.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_gate.hpp"
 #include "../utils/layout.hpp"
 
@@ -159,7 +160,7 @@ bf16_mega_gate(const torch::stable::Tensor& x,
     DG_HOST_ASSERT(num_tokens <= static_cast<int>(mega_gate_layout::kNumMaxTokens));
 
     const auto arch_major = jit->device.get_arch_major();
-    DG_HOST_ASSERT(arch_major == 10);
+    DG_HOST_ASSERT(arch_major == 9 or arch_major == 10);
     const mega_gate_layout::RoutingArgs routing_args = {
         .to_physical_map = to_physical_map ? to_physical_map->mutable_data_ptr<int>() : nullptr,
         .logical_count = logical_count ? logical_count->mutable_data_ptr<int>() : nullptr,
@@ -173,6 +174,11 @@ bf16_mega_gate(const torch::stable::Tensor& x,
         .rank_idx = static_cast<uint32_t>(ep_rank),
         .routed_scaling_factor = routed_scaling_factor,
     };
+    if (arch_major == 9) {
+        sm90_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
+                            routing_args, num_tokens, hidden, num_routed_experts, num_topk);
+        return {topk_idx, topk_weights};
+    }
     sm100_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
                          routing_args, get_score_barriers(x), num_tokens, hidden, num_routed_experts, num_topk);
     return {topk_idx, topk_weights};
