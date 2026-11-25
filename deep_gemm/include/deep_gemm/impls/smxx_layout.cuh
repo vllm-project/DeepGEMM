@@ -77,7 +77,7 @@ template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K, uint32_t BLOCK
           uint32_t kNumPsumGroups = 1, bool kUsePsumLayout = false>
 CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out, const uint32_t mn,
                                                        const uint32_t* grouped_layout, const uint32_t m_alignment) {
-    extern __shared__ uint32_t smem_buffer[];
+    extern __shared__ uint32_t packed_smem_buffer[];
 
     // Shapes and strides
     constexpr auto kNumPackedSFK = math::constexpr_ceil_div(SF_K, 4u);
@@ -99,9 +99,9 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
     cudaGridDependencySynchronize();
 
     constexpr auto kNumPsumLayoutElems = kUsePsumLayout ? math::constexpr_align(kNumPsumGroups * 2, 4u) : 0;
-    const auto group_mn_start = smem_buffer;
-    const auto group_mn_end = smem_buffer + kNumPsumGroups;
-    const auto sf_smem_buffer = smem_buffer + kNumPsumLayoutElems;
+    const auto group_mn_start = packed_smem_buffer;
+    const auto group_mn_end = packed_smem_buffer + kNumPsumGroups;
+    const auto sf_smem_buffer = packed_smem_buffer + kNumPsumLayoutElems;
 
     // Precompute PSUM valid MN ranges into smem before the SF block.
     if constexpr (kUsePsumLayout) {

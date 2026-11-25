@@ -49,7 +49,8 @@ namespace deep_gemm::sm120 {
 // then only XOR + ADD per ldmatrix call (saves 2 instrs per K-step).
 
 template <int swizzle_bytes>
-using CuTeSwizzle = cute::Swizzle<__builtin_ctz(swizzle_bytes) - 4, 4, 3>;
+using CuTeSwizzle = cute::Swizzle<
+    cute::countr_zero(static_cast<uint32_t>(swizzle_bytes)) - 4, 4, 3>;
 
 template <int swizzle_bytes>
 struct SwizzleContext {
