@@ -69,12 +69,13 @@ static void sm90_fp8_fp4_mega_moe(
                                 sf_smem_outer_dim, static_cast<int>(sf.stride(-1)));
     };
     // Weight SF: one word per row, `block_n` per box, or with `routed_fp8` one 128x128 block scale per 128 rows, 4 per box,
-    // or with `routed_nvfp4` the contiguous 2 words per row of each K block, `2 * block_n` per box
+    // or with `routed_nvfp4` the contiguous 2 words per row of each K block, `2 * block_n` per box (in boxes of at most 256)
     const auto weights_sf_desc = [&](const torch::stable::Tensor& sf, const int& shape_n, const int& shape_k, const int& num_groups) {
         if (routed_fp8)
             return sf_desc(sf, shape_n / 128, shape_k, layout::kNumBlockSFWords, num_groups);
         if (routed_nvfp4)
-            return make_tma_2d_desc(sf, 2 * shape_n, num_groups * shape_k / config.block_k, 2 * config.block_n, 1, 2 * shape_n, 0);
+            return make_tma_2d_desc(sf, 2 * shape_n, num_groups * shape_k / config.block_k, 2 * config.block_n / ceil_div(2 * config.block_n, 256), 1,
+                                    2 * shape_n, 0);
         return sf_desc(sf, shape_n, shape_k, config.block_n, num_groups);
     };
     // Packed FP4 weights are loaded as raw bytes, 64 per 128-element K block, FP8 routed weights like the shared weights
@@ -85,13 +86,15 @@ static void sm90_fp8_fp4_mega_moe(
                                         config.block_k / 2, config.load_block_n, config.swizzle_weights_mode);
     };
     // L1 output and L2 activations are the same tensor, the post-SwiGLU output is half as wide, and so is its swizzling with FP8
+    // NVFP4 at BLOCK_N 192 stores the 32 channels of each 64-row tile
     // BF16 tokens have no SF, the token tensormaps stand in
     const auto tensor_map_l1_acts = acts_desc(l1_acts, hidden, config.num_ring_tokens, config.block_k, config.load_block_m, config.swizzle_acts_mode);
     const auto tensor_map_l1_acts_sf = routed_nvfp4 ? tensor_map_l1_acts : sf_desc(l1_acts_sf, config.num_sf_ring_tokens, hidden, config.sf_block_m, 1);
     const auto tensor_map_l1_weights = routed_weights_desc(l1_weights);
     const auto tensor_map_l1_weights_sf = weights_sf_desc(l1_weights_sf, intermediate_hidden * 2, hidden, num_experts_per_rank);
-    const auto tensor_map_l1_output = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_n / 2, config.block_m,
-                                                routed_nvfp4 ? config.block_n : config.swizzle_acts_mode / 2);
+    const int l1_store_block_n = routed_nvfp4 and config.block_n == 192 ? 32 : config.block_n / 2;
+    const auto tensor_map_l1_output = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, l1_store_block_n, config.block_m,
+                                                routed_nvfp4 ? 2 * l1_store_block_n : config.swizzle_acts_mode / 2);
     const auto tensor_map_l2_acts = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_k, config.load_block_m, config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = routed_nvfp4 ? tensor_map_l2_acts : sf_desc(l2_acts_sf, config.num_sf_ring_tokens, intermediate_hidden, config.sf_block_m, 1);
     const auto tensor_map_l2_weights = routed_weights_desc(l2_weights);

@@ -97,6 +97,32 @@ CUTLASS_DEVICE float situ(const float& gate, const float& up, const float& weigh
     return __fmul_rn(__fmul_rn(__fmul_rn(situ_softcap<kGateCap>(gate), sigmoid), situ_softcap<kUpCap>(up)), weight);
 }
 
+// `sched::L2KBlockDependency` for L1 output blocks that do not divide the L2 K blocks (NVFP4 at BLOCK_N 192): an L2 K block waits
+// for every L1 N block overlapping its channels
+template <uint32_t L1_SHAPE_N, uint32_t BLOCK_N, uint32_t BLOCK_K>
+struct NVFP4L2KBlockDependency {
+    static constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+    static constexpr uint64_t kFullMask = kNumL1BlockNs == 64 ? ~0ull : (1ull << kNumL1BlockNs) - 1;
+    DG_STATIC_ASSERT(kNumL1BlockNs <= 64, "Too many L1 N blocks for the L2 readiness mask");
+
+    const uint64_t* mask_ptr;
+    uint64_t expected_mask, pending_mask = kFullMask;
+
+    CUTLASS_DEVICE NVFP4L2KBlockDependency(const uint64_t* mask_ptr, const uint32_t& generation_idx):
+        mask_ptr(mask_ptr), expected_mask(generation_idx & 1 ? 0ull : kFullMask) {}
+
+    CUTLASS_DEVICE static void arrive(const uint64_t* mask_ptr, const uint32_t& n_block_idx) {
+        ptx::red_xor_rel(mask_ptr, 1ull << n_block_idx);
+    }
+
+    CUTLASS_DEVICE void wait(const uint32_t& k_block_idx) {
+        const uint32_t first = k_block_idx * BLOCK_K / (BLOCK_N / 2), last = ((k_block_idx + 1) * BLOCK_K - 1) / (BLOCK_N / 2);
+        const auto k_block_mask = ((2ull << (last - first)) - 1) << first;
+        while (pending_mask & k_block_mask)
+            pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
+    }
+};
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -168,9 +194,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads == 128, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumNonMathThreads == 128, "Invalid number of non-math threads");
-    // A 3rd math warpgroup only where its registers were measured: BLOCK_M 16 math, one rank and <= 128 local experts for dispatch
-    DG_STATIC_ASSERT(kNumMathThreads == 256 or (kNumMathThreads == 384 and kRoutedNVFP4 and kPingPong and BLOCK_M == 16 and
-                                                kNumRanks == 1 and kNumExpertsPerRank <= 128), "Invalid number of math threads");
+    // A 3rd math warpgroup only where its registers were measured: BLOCK_M 16 math with ping-pong, or BLOCK_M <= 32 cooperative at BLOCK_N 192,
+    // one rank and <= 128 local experts for dispatch
+    DG_STATIC_ASSERT(kNumMathThreads == 256 or (kNumMathThreads == 384 and kRoutedNVFP4 and kNumRanks == 1 and kNumExpertsPerRank <= 128 and
+                                                (kPingPong ? BLOCK_M == 16 : BLOCK_M <= 32 and BLOCK_N == 192)), "Invalid number of math threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(not kRoutedNVFP4 or (not kRoutedFP8 and not kHasShared), "NVFP4 routed weights have no FP8 or shared expert variant");
     DG_STATIC_ASSERT(kActivation == MegaMoEActivation::kSwiGLU or kRoutedNVFP4, "SiTU needs NVFP4 routed weights");
@@ -219,7 +246,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     );
     const auto workspace = buffer.workspace;
 
-    using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
+    using L2KBlockDependency = std::conditional_t<BLOCK_K % (BLOCK_N / 2) == 0, sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>,
+                                                  NVFP4L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>>;
+    DG_STATIC_ASSERT(BLOCK_K % (BLOCK_N / 2) == 0 or kRoutedNVFP4, "Invalid L1/L2 shape relationship");
 
     // SF configs
     // One MN-major SF word per 128 K: an FP32 activation scale, or packed routed weight exponents
@@ -278,6 +307,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // L1 stores a whole `[BLOCK_M, BLOCK_N / 2]` FP8 (or BF16 with NVFP4) tile with one TMA store, L2 stages `STORE_BLOCK_M_L2` tokens per 64-row tile
     using l1_out_dtype_t = std::conditional_t<kRoutedNVFP4, nv_bfloat16, cutlass::float_e4m3_t>;
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
+    // NOTES: 192-byte rows (NVFP4 at BLOCK_N 192) have no TMA swizzling, so each 64-row tile's 32 channels are stored as their own tile
+    constexpr uint32_t L1_STORE_BLOCK_N = kRoutedNVFP4 and BLOCK_N == 192 ? WGMMA::M / 2 : L1_OUT_BLOCK_N;
     constexpr uint32_t kNumL2StoreRowBytes = WGMMA::M * sizeof(nv_bfloat16);
     DG_STATIC_ASSERT(BLOCK_M % STORE_BLOCK_M_L2 == 0 and STORE_BLOCK_M_L2 % 16 == 0, "Invalid L2 store block M");
     constexpr uint32_t kNumBankGroupBytes = 16;
@@ -469,12 +500,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // Weight SF: with `kRoutedFP8`, the box of 4 block rows (128x128 block scales) starting at `n_block_idx & ~3`;
         // with `kRoutedNVFP4`, the 2 words per row at `n_idx` of the contiguous `[N, 2]` words of the K block;
         // otherwise the `BLOCK_N` per-row SF words at `n_idx`
-        constexpr uint32_t kNumSFBBoxWords = kRoutedFP8 ? layout::kNumBlockSFWords : kNumSFBWordsPerRow * BLOCK_N;
-        tma::copy<kNumSFBBoxWords, 1, 0>(
-            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx],
-            kRoutedFP8 ? n_block_idx & ~(layout::kNumBlockSFWords - 1) : kNumSFBWordsPerRow * n_idx, expert_idx * num_k_blocks + k_block_idx);
+        // NOTES: a TMA box holds at most 256 words, so the 384 words of NVFP4 at BLOCK_N 192 take 2 boxes
+        constexpr uint32_t kNumSFBWords = kRoutedFP8 ? layout::kNumBlockSFWords : kNumSFBWordsPerRow * BLOCK_N;
+        constexpr uint32_t kNumSFBBoxes = math::constexpr_ceil_div(kNumSFBWords, 256u);
+        constexpr uint32_t kNumSFBBoxWords = kNumSFBWords / kNumSFBBoxes;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumSFBBoxes; ++ i) {
+            tma::copy<kNumSFBBoxWords, 1, 0>(
+                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx] + i * kNumSFBBoxWords,
+                kRoutedFP8 ? n_block_idx & ~(layout::kNumBlockSFWords - 1) : kNumSFBWordsPerRow * n_idx + i * kNumSFBBoxWords,
+                expert_idx * num_k_blocks + k_block_idx);
+        }
         const uint32_t num_weight_bytes = BLOCK_N * (kRoutedFP8 or task_info.is_shared() ? kNumSharedWeightBytesPerRow : kNumWeightBytesPerRow);
-        return num_weight_bytes + kNumSFBBoxWords * static_cast<uint32_t>(sizeof(uint32_t));
+        return num_weight_bytes + kNumSFBWords * static_cast<uint32_t>(sizeof(uint32_t));
     };
 
     // Different warp roles
@@ -572,11 +610,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 
-        // 3 math warpgroups run only when the ring is not reused (host-checked). The schedule cannot deadlock then: (a) no L1 task waits
-        // for an L2 consumer, (b) each pipeline runs its tasks in claim order, and an L2 task is claimed only after the L1 tasks of its
+        // 3 ping-pong math warpgroups run only when the ring is not reused (host-checked). The schedule cannot deadlock then: (a) no L1 task
+        // waits for an L2 consumer, (b) each pipeline runs its tasks in claim order, and an L2 task is claimed only after the L1 tasks of its
         // block, which are published by then, as a scheduler claims only into an empty stage, (c) decode-shaped claiming takes every L1
         // task before any L2 task, so the L2 claim waits never spin
-        if constexpr (kNumMathWarpgroups == 3)
+        if constexpr (kPingPong and kNumMathWarpgroups == 3)
             DG_DEVICE_ASSERT(scheduler.num_total_m_blocks <= kNumRingBlocks);
 
         // Ensure the math barrier cannot run with the pull barrier
@@ -1481,7 +1519,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     sync_epilogue();
                     if (epilogue_thread_idx == 0) {
                         const auto tensor_map_l1_output_ptr = is_shared ? &tensor_map_shared_l1_output : &tensor_map_l1_output;
-                        cute::SM90_TMA_STORE_2D::copy(tensor_map_l1_output_ptr, shared_storage.smem_d[pipeline_idx].l1, n_block_idx * L1_OUT_BLOCK_N, m_idx);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < L1_OUT_BLOCK_N / L1_STORE_BLOCK_N; ++ i) {
+                            const auto smem_l1 = shared_storage.smem_d[pipeline_idx].l1 + i * BLOCK_M * L1_STORE_BLOCK_N;
+                            cute::SM90_TMA_STORE_2D::copy(tensor_map_l1_output_ptr, smem_l1, n_block_idx * L1_OUT_BLOCK_N + i * L1_STORE_BLOCK_N, m_idx);
+                        }
                         cute::tma_store_arrive();
                         ptx::tma_store_wait<0>();
                     }
@@ -1502,9 +1544,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // Cast into BF16 and store into shared memory, a thread writes one channel of 2 tokens
                     // The row swizzling of `kNumL1OutRowBytes` (64 or 128) bytes: 16-byte chunk `c` of token row `t` is at `c ^ (t * kNumL1OutRowBytes / 128)`,
                     // modulo the chunks per row
-                    constexpr uint32_t kNumL1OutRowBytes = L1_OUT_BLOCK_N * sizeof(nv_bfloat16);
-                    const uint32_t channel_idx = first_row_tile_idx * (WGMMA::M / 2) + warp_idx_in_wg * 8 + lane_idx / 4;
-                    const auto smem_l1 = reinterpret_cast<uint8_t*>(shared_storage.smem_d[pipeline_idx].l1);
+                    constexpr uint32_t kNumL1OutRowBytes = L1_STORE_BLOCK_N * sizeof(nv_bfloat16);
+                    // With split stores, a store tile is a row tile
+                    constexpr bool kSplitStores = L1_STORE_BLOCK_N != L1_OUT_BLOCK_N;
+                    const uint32_t channel_idx = (kSplitStores ? 0 : first_row_tile_idx * (WGMMA::M / 2)) + warp_idx_in_wg * 8 + lane_idx / 4;
+                    const auto smem_l1 = reinterpret_cast<uint8_t*>(shared_storage.smem_d[pipeline_idx].l1 +
+                                                                    (kSplitStores ? first_row_tile_idx * BLOCK_M * L1_STORE_BLOCK_N : 0));
                     #pragma unroll
                     for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                         const auto bf16x2 = __float22bfloat162_rn(activations[0][i]);
@@ -1721,9 +1766,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 
         // 3 slots of chunk is needed: 2 load stages and 1 store
-        // With NVFP4 ping-pong (decode), a warp loads all top-k slots of a chunk of one `uint4` per lane at once into `kNumTopk` slots
-        // instead: a token spreads over more warps, and its chunk waits for one load latency instead of one per slot
-        constexpr bool kIsParallelCombine = kRoutedNVFP4 and kPingPong;
+        // With NVFP4 ping-pong or 3 math warpgroups (decode), a warp loads all top-k slots of a chunk of one `uint4` per lane at once into
+        // `kNumTopk` slots instead: a token spreads over more warps, and its chunk waits for one load latency instead of one per slot
+        constexpr bool kIsParallelCombine = kRoutedNVFP4 and (kPingPong or kNumMathWarpgroups == 3);
         DG_STATIC_ASSERT(kNumMathWarpgroups < 3 or kIsParallelCombine, "3 math warpgroups have registers for the parallel combine only");
         constexpr uint32_t kNumChunkSlots = kIsParallelCombine ? kNumTopk + 1 : 3;
         constexpr uint32_t kNumMaxRegistersForBuffer = 128;
