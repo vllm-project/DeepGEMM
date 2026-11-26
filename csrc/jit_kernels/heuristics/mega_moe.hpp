@@ -333,7 +333,8 @@ static MegaMoEConfig get_mega_moe_config(
         num_tokens, hidden, intermediate_hidden) : 0;
     const int block_n = num_math_warpgroups == 3 and not pingpong ? 192 : block_n_2wg;
     const int num_epilogue_threads = is_sm90 ? 128 * num_math_warpgroups : num_block_epilogue_threads;
-    const int load_block_m = is_sm90 ? block_m : block_m / 2;
+    // SM90 NVFP4 loads only the 16-token row groups of a block that hold valid tokens
+    const int load_block_m = is_sm90 ? (routed_nvfp4 ? std::min(block_m, 16) : block_m) : block_m / 2;
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
         SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind) : std::pair(0, 0);

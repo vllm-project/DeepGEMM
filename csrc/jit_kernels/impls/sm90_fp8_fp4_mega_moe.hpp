@@ -93,7 +93,8 @@ static void sm90_fp8_fp4_mega_moe(
     const auto tensor_map_l1_weights = routed_weights_desc(l1_weights);
     const auto tensor_map_l1_weights_sf = weights_sf_desc(l1_weights_sf, intermediate_hidden * 2, hidden, num_experts_per_rank);
     const int l1_store_block_n = routed_nvfp4 and config.block_n == 192 ? 32 : config.block_n / 2;
-    const auto tensor_map_l1_output = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, l1_store_block_n, config.block_m,
+    const auto tensor_map_l1_output = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, l1_store_block_n,
+                                                routed_nvfp4 ? config.load_block_m : config.block_m,
                                                 routed_nvfp4 ? 2 * l1_store_block_n : config.swizzle_acts_mode / 2);
     const auto tensor_map_l2_acts = acts_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_k, config.load_block_m, config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = routed_nvfp4 ? tensor_map_l2_acts : sf_desc(l2_acts_sf, config.num_sf_ring_tokens, intermediate_hidden, config.sf_block_m, 1);
