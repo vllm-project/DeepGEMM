@@ -143,7 +143,7 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
         // BLOCK_M 128 with tokens on M pays off from about 56 tokens per expert
         constexpr int kNumFP8BlockM128Tokens = 56;
         if (num_expected_tokens > 24)
-            block_m = (num_covered_tokens <= (routed_fp8 ? kNumFP8BlockM128Tokens : 96) or
+            block_m = (num_covered_tokens <= (routed_fp8 ? kNumFP8BlockM128Tokens : routed_nvfp4 ? 64 : 96) or
                        (num_experts / num_ranks > 64 and not routed_fp8 and not routed_nvfp4)) ? 64 : 128;
         return {2, block_m, block_m, std::min(block_m, 32), 128, 2 * 128};
     }
