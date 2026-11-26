@@ -11,7 +11,7 @@ _E2M1_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -
 # Each thread decodes rows `r` and `r + 8` of a 64-row tile with `decode_k32` and stores its A fragments
 _DECODE_KERNEL = r'''
 #include <torch/extension.h>
-#include <deep_gemm/impls/sm90_nvfp4_dequant.cuh>
+#include <deep_gemm/common/sm90_nvfp4_dequant.cuh>
 
 using namespace deep_gemm::sm90_nvfp4;
 
