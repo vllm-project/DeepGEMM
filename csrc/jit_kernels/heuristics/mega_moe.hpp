@@ -106,9 +106,8 @@ static int get_block_n_for_mega_moe(const bool& routed_nvfp4, const int& block_m
 
 // SM90 NVFP4 decode at one rank runs 3 math warpgroups. With ping-pong, only when this launch cannot reuse the ring (see the kernel's
 // `kNumRingBlocks` assert): its pool has at most one partial block per expert next to the full ones. Cooperative, they take BLOCK_N 192,
-// whose fewer and longer tasks pay off from `kNumSM90MinCoopL1Waves` waves of L1 tasks for the experts `num_tile_tokens` (which picks the
+// whose fewer and longer tasks pay off from `kNumMinCoopL1Waves` waves of L1 tasks for the experts `num_tile_tokens` (which picks the
 // tiles) can route to, and the ring must hold the live pool blocks at BLOCK_N 192
-static constexpr int kNumSM90MinCoopL1Waves = 2;
 static int get_num_sm90_math_warpgroups(const int& num_ranks, const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
                                         const int& block_m, const int& num_ring_tokens, const bool& routed_nvfp4, const bool& pingpong,
                                         const int& num_tile_tokens, const int& hidden, const int& intermediate_hidden) {
@@ -120,10 +119,11 @@ static int get_num_sm90_math_warpgroups(const int& num_ranks, const int& num_exp
         return block_m == 16 and num_max_pool_blocks <= num_ring_tokens / block_m ? 3 : 2;
     if (block_m > 32 or hidden % 384 != 0 or intermediate_hidden % 192 != 0)
         return 2;
+    constexpr int kNumMinCoopL1Waves = 2;
     const int num_sms = get_num_sms_for_mega_moe();
     const int num_expected_l1_tasks = std::min(num_experts_per_rank, num_tile_tokens * num_topk) * (intermediate_hidden * 2 / 192);
     const int num_live_pool_blocks = sched::get_num_max_live_pool_blocks(num_max_pool_blocks, num_sms, hidden, intermediate_hidden, 1, 192);
-    return num_expected_l1_tasks >= kNumSM90MinCoopL1Waves * num_sms and num_live_pool_blocks <= num_ring_tokens / block_m ? 3 : 2;
+    return num_expected_l1_tasks >= kNumMinCoopL1Waves * num_sms and num_live_pool_blocks <= num_ring_tokens / block_m ? 3 : 2;
 }
 
 static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
