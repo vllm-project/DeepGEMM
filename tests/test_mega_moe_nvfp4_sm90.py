@@ -181,7 +181,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test the SM90 NVFP4 Mega MoE (BF16 tokens)')
     parser.add_argument('--num-processes', type=int, default=1, help='Number of ranks (one process and GPU each)')
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')
-    parser.add_argument('--num-tokens', type=str, default='1,8,128,160,1024,8192', help='Comma-separated token counts')
+    parser.add_argument('--num-tokens', type=str, default='1,8,128,160,1000,8192', help='Comma-separated token counts')
     parser.add_argument('--graph-tokens', type=str, default='1,128,8192', help='Comma-separated token counts for graph replays')
     parser.add_argument('--hidden', type=int, default=2304, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=1152, help='Intermediate hidden size')

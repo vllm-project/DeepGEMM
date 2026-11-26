@@ -303,8 +303,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumSharedWeightBytesPerRow = BLOCK_K;
     DG_STATIC_ASSERT(kNumWeightBytesPerRow == kSwizzleBMode and kNumSharedWeightBytesPerRow == kSwizzleSharedBMode, "Invalid weight swizzling");
 
-    // Token rows per TMA box: NVFP4 loads groups of 16 (the host's `load_block_m`)
-    constexpr uint32_t kNumLoadRows = kRoutedNVFP4 ? cute::min(BLOCK_M, 16u) : BLOCK_M;
+    // Token rows per TMA box
+    constexpr uint32_t kNumLoadRows = kRoutedNVFP4 ? cute::min(BLOCK_M, layout::kNumSM90NVFP4TokenGroupRows) : BLOCK_M;
 
     // Epilogue configs
     // L1 stores a whole `[BLOCK_M, BLOCK_N / 2]` FP8 (or BF16 with NVFP4) tile with one TMA store, L2 stages `STORE_BLOCK_M_L2` tokens per 64-row tile
@@ -936,6 +936,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     uint32_t num_a_bytes = sizeof(SharedStorage::smem_a[0]);
                     if constexpr (kRoutedNVFP4) {
                         // Only the row groups holding valid tokens, so that a block covering a whole expert loads its tokens alone
+                        // NOTES: a token row feeds only its own output column, so the stale rows past `valid_m` touch no valid output
                         constexpr uint32_t kNumAtomK = kSwizzleAMode / sizeof(a_dtype_t);
                         const uint32_t num_rows = math::align(task_info.valid_m, kNumLoadRows);
                         for (uint32_t i = 0; i < num_rows; i += kNumLoadRows) {
@@ -1326,7 +1327,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             shared_storage.full_barriers[stage_idx].wait(phase);
             scheduler.release_task_info();
             // At BLOCK_M 16, the quarter is also the half
+            // NVFP4 at BLOCK_M 128 also has an eighth: a block holds all tokens of its expert, mostly far fewer than BLOCK_M
             constexpr uint32_t kQuarterN = cute::max(BLOCK_M / 4, 8u);
+            constexpr uint32_t kEighthN = kRoutedNVFP4 and BLOCK_M == 128 ? BLOCK_M / 8 : kQuarterN;
             const auto task_mainloop = [&](const auto& n) {
                 if constexpr (kRoutedNVFP4) {
                     nvfp4_mainloop(n);
@@ -1337,18 +1340,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             if constexpr (kTokensOnM) {
                 // The tile shape does not depend on `valid_m`
                 task_mainloop(cute::Int<BLOCK_M>{});
-            } else if constexpr (kRoutedNVFP4 and BLOCK_M == 128) {
-                // A block holds all tokens of its expert, mostly far fewer than BLOCK_M
-                if (task_info.valid_m <= 16) {
-                    task_mainloop(cute::Int<16>{});
-                } else if (task_info.valid_m <= 32) {
-                    task_mainloop(cute::Int<32>{});
-                } else if (task_info.valid_m <= 64) {
-                    task_mainloop(cute::Int<64>{});
-                } else {
-                    task_mainloop(cute::Int<128>{});
-                }
-            } else if (task_info.valid_m <= kQuarterN) {
+            } else if (task_info.valid_m <= kEighthN) {
+                task_mainloop(cute::Int<kEighthN>{});
+            } else if (kEighthN < kQuarterN and task_info.valid_m <= kQuarterN) {
                 task_mainloop(cute::Int<kQuarterN>{});
             } else if (kQuarterN < BLOCK_M / 2 and task_info.valid_m <= BLOCK_M / 2) {
                 task_mainloop(cute::Int<BLOCK_M / 2>{});
