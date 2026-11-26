@@ -303,8 +303,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumSharedWeightBytesPerRow = BLOCK_K;
     DG_STATIC_ASSERT(kNumWeightBytesPerRow == kSwizzleBMode and kNumSharedWeightBytesPerRow == kSwizzleSharedBMode, "Invalid weight swizzling");
 
-    // Token rows per TMA box
+    // Token rows per TMA box: NVFP4 blocks of several row groups load and store only those holding valid tokens
     constexpr uint32_t kNumLoadRows = kRoutedNVFP4 ? cute::min(BLOCK_M, layout::kNumSM90NVFP4TokenGroupRows) : BLOCK_M;
+    constexpr bool kWithRowGroups = kNumLoadRows < BLOCK_M;
 
     // Epilogue configs
     // L1 stores a whole `[BLOCK_M, BLOCK_N / 2]` FP8 (or BF16 with NVFP4) tile with one TMA store, L2 stages `STORE_BLOCK_M_L2` tokens per 64-row tile
@@ -934,7 +935,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // TMA copy tokens and SFA (with ping-pong also weights with SFB), then arrive at full barrier
                 if (cute::elect_one_sync()) {
                     uint32_t num_a_bytes = sizeof(SharedStorage::smem_a[0]);
-                    if constexpr (kRoutedNVFP4) {
+                    if constexpr (kWithRowGroups) {
                         // Only the row groups holding valid tokens, so that a block covering a whole expert loads its tokens alone
                         // NOTES: a token row feeds only its own output column, so the stale rows past `valid_m` touch no valid output
                         constexpr uint32_t kNumAtomK = kSwizzleAMode / sizeof(a_dtype_t);
@@ -953,9 +954,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, a_dtype_t>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx],
                             k_block_idx * BLOCK_K, block_idx * BLOCK_M);
-                        tma::copy<SF_BLOCK_M, 1, 0>(
-                            tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx],
-                            block_idx * SF_BLOCK_M, k_block_idx);
+                        if constexpr (not kRoutedNVFP4) {
+                            tma::copy<SF_BLOCK_M, 1, 0>(
+                                tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx],
+                                block_idx * SF_BLOCK_M, k_block_idx);
+                        }
                     }
                     shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
                         num_a_bytes + sizeof(SharedStorage::smem_sfa[0]) + (kPingPong ? load_weights(task_info, k_block_idx) : 0));
@@ -1545,7 +1548,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t i = 0; i < L1_OUT_BLOCK_N / L1_STORE_BLOCK_N; ++ i) {
                             const auto smem_l1 = shared_storage.smem_d[pipeline_idx].l1 + i * BLOCK_M * L1_STORE_BLOCK_N;
-                            if constexpr (kRoutedNVFP4) {
+                            if constexpr (kWithRowGroups) {
                                 // Only the row groups holding valid tokens, as the token loads
                                 for (uint32_t r = 0; r < valid_m; r += kNumLoadRows) {
                                     cute::SM90_TMA_STORE_2D::copy(tensor_map_l1_output_ptr, smem_l1 + r * L1_STORE_BLOCK_N,
