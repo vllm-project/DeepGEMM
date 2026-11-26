@@ -116,7 +116,7 @@ static int get_num_sm90_math_warpgroups(const int& num_ranks, const int& num_exp
     const int num_routed_tokens = num_tokens * std::min(num_topk, num_experts_per_rank);
     const int num_max_pool_blocks = ceil_div(num_routed_tokens, block_m) + std::min(num_experts_per_rank, num_routed_tokens);
     if (pingpong)
-        return block_m == 16 and num_max_pool_blocks <= num_ring_tokens / block_m ? 3 : 2;
+        return num_max_pool_blocks <= num_ring_tokens / block_m ? 3 : 2;
     if (block_m > 32 or hidden % 384 != 0 or intermediate_hidden % 192 != 0)
         return 2;
     constexpr int kNumMinCoopL1Waves = 2;
@@ -139,6 +139,13 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // SM90: at most 128 rows per block, or 64 with more than 64 local experts unless the routed weights are FP8 or NVFP4
     if (jit->device.get_arch_major() == 9) {
         DG_HOST_ASSERT(routed_nvfp4 ? mma_kind == MmaKind::BF16 : mma_kind == MmaKind::MXFP8FP4);
+        // NVFP4 blocks load and multiply only their valid tokens, so they are sized for the hot experts, which hold most tokens of a
+        // decode batch: a block then covers a whole expert, whose weights are decoded once per K block
+        // NOTES: measured at one rank with 128 experts (Inkling-2-Mini); 96 local experts (Inkling-2-Small TP-local) lose at BLOCK_M 128
+        if (routed_nvfp4 and num_ranks == 1 and num_experts >= 128) {
+            const int block_m = num_expected_tokens <= 1 ? 16 : num_expected_tokens <= 12 ? 32 : num_expected_tokens <= 16 ? 64 : 128;
+            return {2, block_m, block_m, std::min(block_m, 32), 128, 2 * 128};
+        }
         int block_m = num_expected_tokens <= 10 ? 16 : 32;
         // BLOCK_M 128 with tokens on M pays off from about 56 tokens per expert
         constexpr int kNumFP8BlockM128Tokens = 56;
