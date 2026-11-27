@@ -98,26 +98,32 @@ static int get_mma_sf_gran_k(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::NVFP4 ? 16 : 32;
 }
 
-// SM90 NVFP4 runs ping-pong up to BLOCK_M 64 at any expert count, with one 64-row tile per math warpgroup task:
+// SM90 NVFP4 runs ping-pong up to BLOCK_M 32 at any expert count, with one 64-row tile per math warpgroup task:
 // this halves the task size for the load balance at decode, if the L1 N blocks still fit the 64-bit L2 readiness mask
+// BLOCK_M 64 runs cooperative, where 3 math warpgroups hold its accumulators at BLOCK_N 192
 static int get_block_n_for_mega_moe(const bool& routed_nvfp4, const int& block_m, const int& intermediate_hidden) {
-    return routed_nvfp4 and block_m <= 64 and intermediate_hidden * 2 / 64 <= 64 ? 64 : 128;
+    return routed_nvfp4 and block_m <= 32 and intermediate_hidden * 2 / 64 <= 64 ? 64 : 128;
+}
+
+// SM90 NVFP4 runs 3 math warpgroups only at one rank, with the dispatch registers of at most 128 local experts
+static bool is_sm90_nvfp4_3wg_possible(const int& num_ranks, const int& num_experts_per_rank) {
+    return num_ranks == 1 and num_experts_per_rank <= 128;
 }
 
 // SM90 NVFP4 decode at one rank runs 3 math warpgroups. With ping-pong, only when this launch cannot reuse the ring (see the kernel's
-// `kNumRingBlocks` assert): its pool has at most one partial block per expert next to the full ones. Cooperative, they take BLOCK_N 192,
+// `kNumRingBlocks` assert): its pool has at most one partial block per expert next to the full ones. Cooperative, they take BLOCK_N 192 up to BLOCK_M 64,
 // whose fewer and longer tasks pay off from `kNumMinCoopL1Waves` waves of L1 tasks for the experts `num_tile_tokens` (which picks the
 // tiles) can route to, and the ring must hold the live pool blocks at BLOCK_N 192
 static int get_num_sm90_math_warpgroups(const int& num_ranks, const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
                                         const int& block_m, const int& num_ring_tokens, const bool& routed_nvfp4, const bool& pingpong,
                                         const int& num_tile_tokens, const int& hidden, const int& intermediate_hidden) {
-    if (not routed_nvfp4 or num_ranks != 1 or num_experts_per_rank > 128)
+    if (not routed_nvfp4 or not is_sm90_nvfp4_3wg_possible(num_ranks, num_experts_per_rank))
         return 2;
     const int num_routed_tokens = num_tokens * std::min(num_topk, num_experts_per_rank);
     const int num_max_pool_blocks = ceil_div(num_routed_tokens, block_m) + std::min(num_experts_per_rank, num_routed_tokens);
     if (pingpong)
         return num_max_pool_blocks <= num_ring_tokens / block_m ? 3 : 2;
-    if (block_m > 32 or hidden % 384 != 0 or intermediate_hidden % 192 != 0)
+    if (block_m > 64 or hidden % 384 != 0 or intermediate_hidden % 192 != 0)
         return 2;
     constexpr int kNumMinCoopL1Waves = 2;
     const int num_sms = get_num_sms_for_mega_moe();
@@ -139,19 +145,23 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // SM90: at most 128 rows per block, or 64 with more than 64 local experts unless the routed weights are FP8 or NVFP4
     if (jit->device.get_arch_major() == 9) {
         DG_HOST_ASSERT(routed_nvfp4 ? mma_kind == MmaKind::BF16 : mma_kind == MmaKind::MXFP8FP4);
-        // NVFP4 blocks load and multiply only their valid tokens, so they are sized for the hot experts, which hold most tokens of a
-        // decode batch: a block then covers a whole expert, whose weights are decoded once per K block
-        // NOTES: measured at one rank with 128 experts (Inkling-2-Mini); 96 local experts (Inkling-2-Small TP-local) lose at BLOCK_M 128
-        if (routed_nvfp4 and num_ranks == 1 and num_experts >= 128) {
-            const int block_m = num_expected_tokens <= 1 ? 16 : num_expected_tokens <= 12 ? 32 : num_expected_tokens <= 16 ? 64 : 128;
+        // NVFP4 blocks load and multiply only their valid token rows, so a larger block costs the experts it does not fill only pipeline
+        // depth (its token tile takes BLOCK_M rows of every stage), and saves weight decodes for the hot experts, which hold several times
+        // the covered tokens: past one expected token per expert, a block takes 4 times the covered tokens. BLOCK_M 64 keeps 3 math
+        // warpgroups, which 128 gives up, so where they run it holds until the covered tokens alone fill it
+        if (routed_nvfp4) {
+            const float num_block_tokens = 4 * num_covered_tokens;
+            const bool with_3wg = is_sm90_nvfp4_3wg_possible(num_ranks, num_experts / num_ranks);
+            const int block_m = num_expected_tokens <= 1 ? 16 : num_block_tokens <= 32 ? 32 :
+                                num_block_tokens <= 64 or (with_3wg and num_covered_tokens <= 64) ? 64 : 128;
             return {2, block_m, block_m, std::min(block_m, 32), 128, 2 * 128};
         }
         int block_m = num_expected_tokens <= 10 ? 16 : 32;
         // BLOCK_M 128 with tokens on M pays off from about 56 tokens per expert
         constexpr int kNumFP8BlockM128Tokens = 56;
         if (num_expected_tokens > 24)
-            block_m = (num_covered_tokens <= (routed_fp8 ? kNumFP8BlockM128Tokens : routed_nvfp4 ? 64 : 96) or
-                       (num_experts / num_ranks > 64 and not routed_fp8 and not routed_nvfp4)) ? 64 : 128;
+            block_m = (num_covered_tokens <= (routed_fp8 ? kNumFP8BlockM128Tokens : 96) or
+                       (num_experts / num_ranks > 64 and not routed_fp8)) ? 64 : 128;
         return {2, block_m, block_m, std::min(block_m, 32), 128, 2 * 128};
     }
 

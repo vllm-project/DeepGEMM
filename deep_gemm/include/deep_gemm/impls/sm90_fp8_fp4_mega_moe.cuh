@@ -194,10 +194,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads == 128, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumNonMathThreads == 128, "Invalid number of non-math threads");
-    // A 3rd math warpgroup only where its registers were measured: BLOCK_M <= 64 math with ping-pong, or BLOCK_M <= 32 cooperative at BLOCK_N 192,
+    // A 3rd math warpgroup only where its registers were measured: BLOCK_M <= 32 math with ping-pong, or BLOCK_M <= 64 cooperative at BLOCK_N 192,
     // one rank and <= 128 local experts for dispatch
     DG_STATIC_ASSERT(kNumMathThreads == 256 or (kNumMathThreads == 384 and kRoutedNVFP4 and kNumRanks == 1 and kNumExpertsPerRank <= 128 and
-                                                (kPingPong ? BLOCK_M <= 64 : BLOCK_M <= 32 and BLOCK_N == 192)), "Invalid number of math threads");
+                                                (kPingPong ? BLOCK_M <= 32 : BLOCK_M <= 64 and BLOCK_N == 192)), "Invalid number of math threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(not kRoutedNVFP4 or (not kRoutedFP8 and not kHasShared), "NVFP4 routed weights have no FP8 or shared expert variant");
     DG_STATIC_ASSERT(kActivation == MegaMoEActivation::kSwiGLU or kRoutedNVFP4, "SiTU needs NVFP4 routed weights");
