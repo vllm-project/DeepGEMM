@@ -72,10 +72,8 @@ CUTLASS_DEVICE void dequant_fp4x8_to_fp8x8(const uint32_t& codes, const uint2& l
     second = prmt(selectors >> 16) | ((codes << 4) & 0x80808080u);
 }
 
-// Inkling's softcapped SwiGLU (vLLM `inkling2` `_situ`), bit for bit on the same BF16 gate and up:
-// `cap * tanh(x / cap)`, the division as the rounded reciprocal product with one FMA correction step (its residual is clamped
-// for infinite `x`), and `sigmoid` and `tanh` from the same hardware approximations
-// NOTES: the SM100 SiTU follows FlashInfer (`tanh` as `2 * sigmoid(2x) - 1`, reciprocal products) and rounds differently
+// Softcapped SwiGLU, bit for bit with vLLM's `inkling2` `_situ` on the same BF16 gate and up: `x / cap` as the reciprocal product
+// with one FMA correction step (its residual clamped for infinite `x`)
 template <float kCap>
 CUTLASS_DEVICE float situ_softcap(const float& x) {
     if constexpr (kCap > 0.0f) {
@@ -194,8 +192,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads == 128, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumNonMathThreads == 128, "Invalid number of non-math threads");
-    // A 3rd math warpgroup only where its registers were measured: BLOCK_M <= 32 math with ping-pong, or BLOCK_M <= 64 cooperative at BLOCK_N 192,
-    // one rank and <= 128 local experts for dispatch
+    // A 3rd math warpgroup only in the configs whose registers were measured to fit
     DG_STATIC_ASSERT(kNumMathThreads == 256 or (kNumMathThreads == 384 and kRoutedNVFP4 and kNumRanks == 1 and kNumExpertsPerRank <= 128 and
                                                 (kPingPong ? BLOCK_M <= 32 : BLOCK_M <= 64 and BLOCK_N == 192)), "Invalid number of math threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
@@ -258,7 +255,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         return (idx % 32) * 4 + idx / 32;
     };
 
-    // Weight SF words per row and K block: 2 for NVFP4 (8 E4M3 scales)
     constexpr uint32_t kNumSFBWordsPerRow = kRoutedNVFP4 ? 2 : 1;
 
     // Block weight SF (`kRoutedFP8`): tile `j` of 128 rows reads block row `j` for L2, and for L1 (64 gate and 64 up rows) block rows
@@ -303,7 +299,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumSharedWeightBytesPerRow = BLOCK_K;
     DG_STATIC_ASSERT(kNumWeightBytesPerRow == kSwizzleBMode and kNumSharedWeightBytesPerRow == kSwizzleSharedBMode, "Invalid weight swizzling");
 
-    // Token rows per TMA box: NVFP4 blocks of several row groups load and store only those holding valid tokens
     constexpr uint32_t kNumLoadRows = kRoutedNVFP4 ? cute::min(BLOCK_M, layout::kNumSM90NVFP4TokenGroupRows) : BLOCK_M;
     constexpr bool kWithRowGroups = kNumLoadRows < BLOCK_M;
 
@@ -453,8 +448,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 2;
 
-    // With one rank, the grid syncs and the kernel boundary order what the NVLink barriers and the combine readiness would: the pull's source
-    // indices and polled counts, the combine's L2 writes and the cleanup; NVFP4 only, so that the FP4 and FP8 instances keep their code
+    // With one rank, the grid syncs and the kernel boundary order what the NVLink barriers and the combine readiness would
+    // NVFP4 only, so that the FP4 and FP8 instances keep their code
     constexpr bool kSkipSingleRankSyncs = kRoutedNVFP4 and kNumRanks == 1;
 
     // Adjust registers
@@ -614,10 +609,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 
-        // 3 ping-pong math warpgroups run only when the ring is not reused (host-checked). The schedule cannot deadlock then: (a) no L1 task
-        // waits for an L2 consumer, (b) each pipeline runs its tasks in claim order, and an L2 task is claimed only after the L1 tasks of its
-        // block, which are published by then, as a scheduler claims only into an empty stage, (c) decode-shaped claiming takes every L1
-        // task before any L2 task, so the L2 claim waits never spin
+        // 3 ping-pong math warpgroups are deadlock-free only without ring reuse (host-checked): no L1 task then waits for an L2 consumer,
+        // and decode-shaped claiming takes every L1 task before any L2 task
         if constexpr (kPingPong and kNumMathWarpgroups == 3)
             DG_DEVICE_ASSERT(scheduler.num_total_m_blocks <= kNumRingBlocks);
 
@@ -638,7 +631,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
-            // Advance expert until within the range; NVFP4 jumps there with a warp-wide scan, FP4 and FP8 keep the walk
+            // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             if constexpr (kRoutedNVFP4) {
                 if (token_idx >= expert_end_idx)
@@ -936,7 +929,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 if (cute::elect_one_sync()) {
                     uint32_t num_a_bytes = sizeof(SharedStorage::smem_a[0]);
                     if constexpr (kWithRowGroups) {
-                        // Only the row groups holding valid tokens, so that a block covering a whole expert loads its tokens alone
                         // NOTES: a token row feeds only its own output column, so the stale rows past `valid_m` touch no valid output
                         constexpr uint32_t kNumAtomK = kSwizzleAMode / sizeof(a_dtype_t);
                         const uint32_t num_rows = math::align(task_info.valid_m, kNumLoadRows);
@@ -1274,7 +1266,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 using NWGMMA = typename mma::sm90::BF16MMARSSelector<std::decay_t<decltype(n)>::value>::type;
 
                 // Even K steps accumulate into `final_accum`, odd ones into `odd_accum`, so that consecutive WGMMAs do not wait for each
-                // other; the two are summed at the end. Every instance does the same, so that a token's K order does not depend on BLOCK_M
+                // other; in every instance, so that a token's sum order does not depend on BLOCK_M
                 float odd_accum[NWGMMA::kNumAccum] = {};
                 const auto fence_accum = [&]() {
                     #pragma unroll
@@ -1286,7 +1278,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     shared_storage.full_barriers[stage_idx].wait(phase);
 
-                    // Code word `w` of rows `row_idx` and `row_idx + 8` and its SF word hold k16 steps `2w` and `2w + 1`
                     const uint32_t weight_stage_addr = weight_smem_addr + stage_idx * static_cast<uint32_t>(sizeof(SharedStorage::smem_b[0]));
                     const uint4 codes[2] = {ptx::ld_shared_u32x4(weight_stage_addr), ptx::ld_shared_u32x4(weight_stage_addr + 8 * kNumWeightBytesPerRow)};
                     const uint4 sf = ptx::ld_shared_u32x4(sfb_smem_addr + stage_idx * static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0])));
@@ -1300,7 +1291,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             ptx::warpgroup_fence_operand(a[w][i / 4][i % 4]);
                     }
 
-                    // Issue WGMMAs: the 128 K of the tokens are 2 swizzling atoms of 64 elements
+                    // The 128 K of the tokens are 2 swizzling atoms of 64 elements
                     constexpr uint32_t kNumAtomK = kSwizzleAMode / sizeof(a_dtype_t);
                     const uint32_t b_desc_base_lo = b_desc_lo + stage_idx * (sizeof(SharedStorage::smem_a[0]) / 16);
                     fence_accum();
@@ -1539,8 +1530,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
 
-                // Issue TMA store, notify L2 and increment L1 empty count
                 const auto store_l1_output = [&]() {
+                    // Issue TMA store
                     ordered_ptx::fence_view_async_shared();
                     sync_epilogue();
                     if (epilogue_thread_idx == 0) {
@@ -1549,7 +1540,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t i = 0; i < L1_OUT_BLOCK_N / L1_STORE_BLOCK_N; ++ i) {
                             const auto smem_l1 = shared_storage.smem_d[pipeline_idx].l1 + i * BLOCK_M * L1_STORE_BLOCK_N;
                             if constexpr (kWithRowGroups) {
-                                // Only the row groups holding valid tokens, as the token loads
                                 for (uint32_t r = 0; r < valid_m; r += kNumLoadRows) {
                                     cute::SM90_TMA_STORE_2D::copy(tensor_map_l1_output_ptr, smem_l1 + r * L1_STORE_BLOCK_N,
                                                                   n_block_idx * L1_OUT_BLOCK_N + i * L1_STORE_BLOCK_N, m_idx + r);
@@ -1575,8 +1565,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 };
 
                 if constexpr (kRoutedNVFP4) {
-                    // Cast into BF16 and store into shared memory, a thread writes one channel of 2 tokens
-                    // The row swizzling of `kNumL1OutRowBytes` (64 or 128) bytes: 16-byte chunk `c` of token row `t` is at `c ^ (t * kNumL1OutRowBytes / 128)`,
+                    // A thread writes one BF16 channel of 2 tokens; 16-byte chunk `c` of token row `t` sits at `c ^ (t * kNumL1OutRowBytes / 128)`,
                     // modulo the chunks per row
                     constexpr uint32_t kNumL1OutRowBytes = L1_STORE_BLOCK_N * sizeof(nv_bfloat16);
                     // With split stores, a store tile is a row tile
@@ -1800,8 +1789,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 
         // 3 slots of chunk is needed: 2 load stages and 1 store
-        // With NVFP4 ping-pong or 3 math warpgroups (decode), a warp loads all top-k slots of a chunk of one `uint4` per lane at once into
-        // `kNumTopk` slots instead: a token spreads over more warps, and its chunk waits for one load latency instead of one per slot
+        // With NVFP4 ping-pong or 3 math warpgroups (decode), a warp loads all top-k slots of a chunk at once, waiting for one load
+        // latency instead of one per slot
         constexpr bool kIsParallelCombine = kRoutedNVFP4 and (kPingPong or kNumMathWarpgroups == 3);
         DG_STATIC_ASSERT(kNumMathWarpgroups < 3 or kIsParallelCombine, "3 math warpgroups have registers for the parallel combine only");
         constexpr uint32_t kNumChunkSlots = kIsParallelCombine ? kNumTopk + 1 : 3;

@@ -1,5 +1,4 @@
-"""NVFP4 (E2M1 codes, E4M3 scales per 16 K, FP32 global scale) weights for the SM90 Mega MoE, decoded in registers
-by `sm90_nvfp4_dequant.cuh`."""
+"""NVFP4 weights for the SM90 Mega MoE, decoded in registers by `sm90_nvfp4_dequant.cuh`."""
 from typing import Tuple
 
 import torch
@@ -9,7 +8,7 @@ GLOBAL_SCALE_LOG2 = 13
 
 # The `(rotation, mask)` pieces of the 4 BF16x2 outputs of a code word: `rotr(word, rotation) & mask`, ORed per output.
 # A code `s e1 e0 m` sits at BF16 bits 15 and 8..6 (+16 for the high half), which reads as `e2m1 * 2 ^ -126`
-# Rotations 26 and 30 wrap no masked bit, so they decode as left shifts, which run as IMAD on the FMA pipe instead of the ALU
+# Rotations 26 and 30 wrap no masked bit, so the kernel decodes them as left shifts
 _CODE_PIECES = (((0, 0x81c081c0), ), ((4, 0x81c081c0), ), ((26, 0x81c081c0), ), ((30, 0x00400040), (6, 0x81808180)))
 _CODE_BIT_OF_BF16_BIT = {15: 3, 8: 2, 7: 1, 6: 0}
 
@@ -80,8 +79,7 @@ def _transform(w: torch.Tensor, sf: torch.Tensor, global_scale: torch.Tensor,
         if bool(((sf_bytes[i] & 0x80) != 0).any()) or bool(((sf_bytes[i] & 0x7f) == 0x7f).any()):
             raise ValueError('NVFP4 scales must be non-negative and not NaN')
 
-    # Row chunks keep every temporary at a few MiB (the largest takes 8 bytes per weight byte), small enough for the
-    # caching allocator to reuse under a low `max_split_size_mb`
+    # Row chunks keep every temporary at a few MiB (the largest takes 8 bytes per weight byte)
     num_rows = max(16, (4 << 20) // (half_k * 8) // 16 * 16)
     out_w = torch.empty_like(w)
     out_sf = torch.empty((e, half_k // 64, n, 2), dtype=torch.int32, device=w.device)

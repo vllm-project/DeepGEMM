@@ -132,7 +132,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             for num_tokens in token_counts[:-1]:
                 assert torch.equal(outputs[num_tokens], outputs[max_tokens][:num_tokens]), \
                     f'{name}: {num_tokens} tokens differ from the prefix of {max_tokens}'
-            # Decode and prefill launches alternating on one buffer
             mid_tokens = token_counts[len(token_counts) // 2]
             for num_tokens in (mid_tokens, max_tokens, mid_tokens, token_counts[0], max_tokens, token_counts[0]):
                 assert torch.equal(run(num_tokens, topk_idx, kwargs), outputs[num_tokens]), f'{name}: {num_tokens} tokens differ after a switch'
@@ -153,7 +152,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert num_mismatches == 0, f'{num_tokens} tokens: {num_mismatches}/{args.num_repeats} launches differ'
         dist_print(f' > {num_tokens} tokens: {args.num_repeats} launches bitwise equal to BLOCK_M 32')
 
-    # CUDA graph replays with new routing and tokens before every replay, against eager launches
     variants = [(routings[kind], x.roll(i, 0)) for i, kind in enumerate(('random', 'same', 'padded', 'blocks'))]
     for num_tokens in (int(t) for t in args.graph_tokens.split(',')):
         expected = [run(num_tokens, topk_idx, situ, x=xv).clone() for topk_idx, xv in variants]

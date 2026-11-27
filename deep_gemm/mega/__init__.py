@@ -343,7 +343,7 @@ def bf16_nvfp4_mega_moe(y: torch.Tensor,
                         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                         num_tokens_for_block_m: Optional[int] = None):
     """SM90 NVFP4 routed experts with BF16 tokens (`mma_type='bf16xnvfp4'` buffer), weights and scales from
-    `transform_nvfp4_weights_for_sm90_mega_moe`. SiTU takes the gate and up softcaps as `activation_alpha` and `activation_beta`."""
+    `transform_nvfp4_weights_for_sm90_mega_moe`. SiTU takes the gate and up softcaps (0 for none) as `activation_alpha` and `activation_beta`."""
     _C.bf16_nvfp4_mega_moe(
         y,
         tuple(t.view(dtype) for t, dtype in zip(l1_weights, (torch.int8, torch.int32))),

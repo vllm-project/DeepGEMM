@@ -503,9 +503,6 @@ static void bf16_nvfp4_mega_moe(
     const float& activation_beta,
     const std::optional<int64_t>& num_tokens_for_block_m
 ) {
-    // SM90 NVFP4 routed experts with BF16 tokens: packed E2M1 weights, their E4M3 scales per 16 K in the layout of
-    // `transform_nvfp4_weights_for_sm90_mega_moe` (2 words per row and 128 K), and per-local-expert FP32 global scales
-    // With SiTU, `activation_alpha` and `activation_beta` are the gate and up softcaps (0 for none)
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
     const auto num_tokens = static_cast<int>(y.size(0));

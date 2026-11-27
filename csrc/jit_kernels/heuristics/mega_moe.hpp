@@ -98,22 +98,18 @@ static int get_mma_sf_gran_k(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::NVFP4 ? 16 : 32;
 }
 
-// SM90 NVFP4 runs ping-pong up to BLOCK_M 32 at any expert count, with one 64-row tile per math warpgroup task:
-// this halves the task size for the load balance at decode, if the L1 N blocks still fit the 64-bit L2 readiness mask
-// BLOCK_M 64 runs cooperative, where 3 math warpgroups hold its accumulators at BLOCK_N 192
+// SM90 NVFP4 up to BLOCK_M 32: one 64-row tile per task balances decode, if the L1 N blocks fit the 64-bit L2 readiness mask
 static int get_block_n_for_mega_moe(const bool& routed_nvfp4, const int& block_m, const int& intermediate_hidden) {
     return routed_nvfp4 and block_m <= 32 and intermediate_hidden * 2 / 64 <= 64 ? 64 : 128;
 }
 
-// SM90 NVFP4 runs 3 math warpgroups only at one rank, with the dispatch registers of at most 128 local experts
+// 3 math warpgroups leave dispatch registers for only one rank and at most 128 local experts
 static bool is_sm90_nvfp4_3wg_possible(const int& num_ranks, const int& num_experts_per_rank) {
     return num_ranks == 1 and num_experts_per_rank <= 128;
 }
 
-// SM90 NVFP4 decode at one rank runs 3 math warpgroups. With ping-pong, only when this launch cannot reuse the ring (see the kernel's
-// `kNumRingBlocks` assert): its pool has at most one partial block per expert next to the full ones. Cooperative, they take BLOCK_N 192 up to BLOCK_M 64,
-// whose fewer and longer tasks pay off from `kNumMinCoopL1Waves` waves of L1 tasks for the experts `num_tile_tokens` (which picks the
-// tiles) can route to, and the ring must hold the live pool blocks at BLOCK_N 192
+// With ping-pong, 3 math warpgroups need a launch that cannot reuse the ring (see the kernel's `kNumRingBlocks` assert)
+// Cooperative at BLOCK_N 192, their longer tasks pay off from `kNumMinCoopL1Waves` waves of L1 tasks, and the ring must hold the live pool blocks
 static int get_num_sm90_math_warpgroups(const int& num_ranks, const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
                                         const int& block_m, const int& num_ring_tokens, const bool& routed_nvfp4, const bool& pingpong,
                                         const int& num_tile_tokens, const int& hidden, const int& intermediate_hidden) {
@@ -145,10 +141,8 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // SM90: at most 128 rows per block, or 64 with more than 64 local experts unless the routed weights are FP8 or NVFP4
     if (jit->device.get_arch_major() == 9) {
         DG_HOST_ASSERT(routed_nvfp4 ? mma_kind == MmaKind::BF16 : mma_kind == MmaKind::MXFP8FP4);
-        // NVFP4 blocks load and multiply only their valid token rows, so a larger block costs the experts it does not fill only pipeline
-        // depth (its token tile takes BLOCK_M rows of every stage), and saves weight decodes for the hot experts, which hold several times
-        // the covered tokens: past one expected token per expert, a block takes 4 times the covered tokens. BLOCK_M 64 keeps 3 math
-        // warpgroups, which 128 gives up, so where they run it holds until the covered tokens alone fill it
+        // NVFP4 blocks load and multiply only their valid token rows, so 4 times the covered tokens saves weight decodes for the hot experts
+        // BLOCK_M 64 keeps the 3 math warpgroups that 128 gives up, so where they run it holds until the covered tokens alone fill it
         if (routed_nvfp4) {
             const float num_block_tokens = 4 * num_covered_tokens;
             const bool with_3wg = is_sm90_nvfp4_3wg_possible(num_ranks, num_experts / num_ranks);
@@ -341,8 +335,8 @@ static MegaMoEConfig get_mega_moe_config(
     DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
 
     // SM90 ping-pong: each math warpgroup computes whole tasks, so its epilogue overlaps the other's mainloop
-    // The 128-row accumulators fit only with at most 64 tokens per block and the registers of at most 64 local experts; NVFP4 tasks are
-    // one 64-row tile
+    // The 128-row accumulators fit only with at most 64 tokens per block and the registers of at most 64 local experts
+    // NVFP4 tasks are one 64-row tile
     const int block_n_2wg = get_block_n_for_mega_moe(routed_nvfp4, block_m, intermediate_hidden);
     const bool pingpong = is_sm90 and block_m <= 64 and (routed_nvfp4 ? block_n_2wg == 64 : num_experts_per_rank <= 64);
     const int num_math_warpgroups = is_sm90 ? get_num_sm90_math_warpgroups(
@@ -350,7 +344,6 @@ static MegaMoEConfig get_mega_moe_config(
         num_tokens, hidden, intermediate_hidden) : 0;
     const int block_n = num_math_warpgroups == 3 and not pingpong ? 192 : block_n_2wg;
     const int num_epilogue_threads = is_sm90 ? 128 * num_math_warpgroups : num_block_epilogue_threads;
-    // SM90 NVFP4 loads only the row groups of a block that hold valid tokens
     const int load_block_m = is_sm90 ? (routed_nvfp4 ? std::min(block_m, static_cast<int>(layout::kNumSM90NVFP4TokenGroupRows)) : block_m) : block_m / 2;
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
