@@ -27,8 +27,8 @@ CUTLASS_DEVICE void decode_codes(const uint32_t& word, uint32_t (&codes)[4]) {
     constexpr uint32_t kMask = 0x81c081c0u;
     codes[0] = word & kMask;
     codes[1] = rotr(word, 4) & kMask;
-    codes[2] = rotr(word, 10) & kMask;
-    codes[3] = (rotr(word, 14) & 0x00400040u) | (rotr(word, 6) & 0x81808180u);
+    codes[2] = (word << 6) & kMask;
+    codes[3] = ((word << 2) & 0x00400040u) | (rotr(word, 6) & 0x81808180u);
 }
 
 // The BF16 scales `e4m3 * 2 ^ 113` of rows `r` (low half) and `r + 8` (high half): `(e + 16) << 3 | m` at bits 11..4

@@ -9,7 +9,8 @@ GLOBAL_SCALE_LOG2 = 13
 
 # The `(rotation, mask)` pieces of the 4 BF16x2 outputs of a code word: `rotr(word, rotation) & mask`, ORed per output.
 # A code `s e1 e0 m` sits at BF16 bits 15 and 8..6 (+16 for the high half), which reads as `e2m1 * 2 ^ -126`
-_CODE_PIECES = (((0, 0x81c081c0), ), ((4, 0x81c081c0), ), ((10, 0x81c081c0), ), ((14, 0x00400040), (6, 0x81808180)))
+# Rotations 26 and 30 wrap no masked bit, so they decode as left shifts, which run as IMAD on the FMA pipe instead of the ALU
+_CODE_PIECES = (((0, 0x81c081c0), ), ((4, 0x81c081c0), ), ((26, 0x81c081c0), ), ((30, 0x00400040), (6, 0x81808180)))
 _CODE_BIT_OF_BF16_BIT = {15: 3, 8: 2, 7: 1, 6: 0}
 
 
