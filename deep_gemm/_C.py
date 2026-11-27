@@ -13,19 +13,21 @@ from pathlib import Path
 
 
 class _EpilogueSpec:
-    __slots__ = ('kind', 'alpha', 'sfd')
+    # `alpha` also carries the FP8 clamp value and `aux` the clamped count (see `csrc/apis/epilogue_class.hpp`)
+    __slots__ = ('kind', 'alpha', 'sfd', 'aux')
 
-    def __init__(self, kind, alpha=None, sfd=None):
+    def __init__(self, kind, alpha=None, sfd=None, aux=None):
         self.kind = kind
         self.alpha = alpha
         self.sfd = sfd
+        self.aux = aux
 
 
 def _unpack_epilogue(value):
     if value is None:
-        return 0, None, None
+        return 0, None, None, None
     assert isinstance(value, _EpilogueSpec), f'Unsupported epilogue value: {type(value)!r}'
-    return value.kind, value.alpha, value.sfd
+    return value.kind, value.alpha, value.sfd, value.aux
 
 
 def _load_extension():
@@ -494,7 +496,7 @@ def nvfp4_mega_moe(
     )
 
 
-def fp8_fp4_mega_moe(
+def fp8_fp4_mega_moe_inference(
     y,
     l1_weights_tuple,
     l2_weights_tuple,
@@ -511,8 +513,10 @@ def fp8_fp4_mega_moe(
     activation,
     activation_clamp_opt,
     fast_math,
-    activation_alpha,
-    activation_beta,
+    rms_weights=None,
+    rms_eps=None,
+    activation_alpha=1.0,
+    activation_beta=0.0,
     num_tokens_for_block_m=None,
 ):
     return _torch_ops.fp8_fp4_mega_moe(
@@ -539,6 +543,40 @@ def fp8_fp4_mega_moe(
         activation_alpha,
         activation_beta,
         num_tokens_for_block_m,
+        rms_weights,
+        rms_eps,
+    )
+
+
+def fp8_fp4_mega_moe(
+    y,
+    l1_weights_tuple,
+    l2_weights_tuple,
+    shared_l1_weights_tuple_opt,
+    shared_l2_weights_tuple_opt,
+    cumulative_local_expert_recv_stats,
+    sym_buffer,
+    sym_buffer_ptrs,
+    rank_idx,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    recipe,
+    activation,
+    activation_clamp_opt,
+    fast_math,
+    activation_alpha=1.0,
+    activation_beta=0.0,
+    num_tokens_for_block_m=None,
+):
+    """The pre-``_inference`` argument order: SwiGLU alpha/beta follow ``fast_math``."""
+    return fp8_fp4_mega_moe_inference(
+        y, l1_weights_tuple, l2_weights_tuple,
+        shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
+        cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs, rank_idx,
+        num_max_tokens_per_rank, num_experts, num_topk, recipe, activation, activation_clamp_opt, fast_math,
+        activation_alpha=activation_alpha, activation_beta=activation_beta,
+        num_tokens_for_block_m=num_tokens_for_block_m,
     )
 
 
@@ -558,8 +596,8 @@ def bf16_mega_moe(
     activation,
     activation_clamp_opt,
     fast_math,
-    activation_alpha,
-    activation_beta,
+    activation_alpha=1.0,
+    activation_beta=0.0,
     post_expert_norm_gamma_opt=None,
     post_expert_norm_eps=0.0,
 ):
@@ -818,6 +856,13 @@ def get_symm_buffer_size_for_mega_moe(
     return num_bytes, slice_input_buffers
 
 
+# Upstream's `_inference` names; the pre-rename names above stay for existing callers
+get_token_alignment_for_mega_moe_inference = get_token_alignment_for_mega_moe
+get_block_m_for_mega_moe_inference = get_block_m_for_mega_moe
+get_symm_buffer_size_for_mega_moe_inference = get_symm_buffer_size_for_mega_moe
+bf16_mega_moe_inference = bf16_mega_moe
+
+
 def get_symm_buffer_size_for_nvfp4_mega_moe(
     num_ranks,
     num_experts,
@@ -856,12 +901,24 @@ def get_jit() -> Runtime:
 
 
 # GEMM epilogue classes for the `epilogue` argument, as `deep_gemm.epilogue.X`
-# NOTES: `alpha` and the FP8 `(d, sfd)` output pair are the shorthand for `Alpha` and `FP8Quantization`
+# NOTES: `alpha` and the FP8 `(d, sfd)` output pair are the shorthand for `Alpha` and unclamped `FP8CastWithClamp`
 epilogue = types.ModuleType(f'{__package__}.epilogue', 'GEMM epilogue classes')
 epilogue.Identity = lambda: _EpilogueSpec(1)
 epilogue.Alpha = lambda alpha: _EpilogueSpec(2, alpha=float(alpha))
-epilogue.FP8Quantization = lambda sfd: _EpilogueSpec(3, sfd=sfd)
+
+
+def _fp8_cast_with_clamp(sfd, clamp_value=None, clamped_count=None):
+    """Cast BF16-rounded GEMM output to FP8, optionally clamping before scaling.
+    `clamped_count` is an optional single-element CUDA uint32 tensor; the kernel writes the total asynchronously
+    when provided."""
+    return _EpilogueSpec(3, alpha=None if clamp_value is None else float(clamp_value), sfd=sfd, aux=clamped_count)
+
+
+epilogue.FP8CastWithClamp = _fp8_cast_with_clamp
+# NOTES: the name before upstream's 26/11/26 release
+epilogue.FP8Quantization = lambda sfd: _fp8_cast_with_clamp(sfd)
 epilogue.BF16StochasticRounding = lambda: _EpilogueSpec(4)
+epilogue.FP8StochasticRounding = lambda sfd: _EpilogueSpec(5, sfd=sfd)
 
 
 # Memory homed in the GPU's locality domains, re-exported by `deep_gemm.locality_domain`
@@ -876,6 +933,63 @@ locality_domain.get_sm_locality_domains = _torch_ops.locality_domain_get_sm_loca
 locality_domain.get_balanced_sm_locality_domains = _torch_ops.locality_domain_get_balanced_sm_locality_domains
 locality_domain.release_mlopart = _torch_ops.locality_domain_release_mlopart
 
+
+# Experimental kernels without stability guarantees, as `deep_gemm.experimental.X`
+# NOTES: the ops are registered as `experimental_X`; the wrappers keep the former pybind submodule's signatures
+experimental = types.ModuleType(f'{__name__}.experimental', 'Experimental kernels without stability guarantees')
+
+
+def _register_experimental_kernels():
+    # FP8 GEMM with segmented A [M, S, 256] and prepacked per-32 UE8M0 scales.
+    def fp8_gemm_nt_segmented_k256(a, b, d):
+        a_tensor, sfa, b_tensor, sfb = _unpack_ab_pair(a, b)
+        return _torch_ops.experimental_fp8_gemm_nt_segmented_k256(a_tensor, sfa, b_tensor, sfb, d)
+
+    # torch: d = (F.silu(a @ b[:2816].T) * (a @ b[2816:].T)).bfloat16()
+    def bf16_gemm_nt_with_swiglu_n5632_k1024(a, b, d):
+        return _torch_ops.experimental_bf16_gemm_nt_with_swiglu_n5632_k1024(a, b, d)
+
+    # torch: residual += a @ b.T (bf16); d = (residual.float() * rsqrt(residual.float().pow(2).mean(-1, keepdim=True) + 1e-6) * gamma).bfloat16()
+    def bf16_gemm_nt_with_add_norm_n1024_k2816(a, b, gamma, residual, d):
+        return _torch_ops.experimental_bf16_gemm_nt_with_add_norm_n1024_k2816(a, b, gamma, residual, d)
+
+    # torch: residual += a @ b.T + bias (bf16); d = (residual.float() * rsqrt(residual.float().pow(2).mean(-1, keepdim=True) + 1e-6) * gamma).bfloat16()
+    def bf16_gemm_nt_with_bias_add_norm_n1024_k1024(a, b, bias, gamma, residual, d):
+        return _torch_ops.experimental_bf16_gemm_nt_with_bias_add_norm_n1024_k1024(a, b, bias, gamma, residual, d)
+
+    def batched_bf16_newton_schulz(x, out, a, b, c):
+        return _torch_ops.experimental_batched_bf16_newton_schulz(x, out, a, b, c)
+
+    def v41f_qkv_lora(x, qkv_weight, q_b_weight, q_norm_weight, kv_norm_weight,
+                      positions, cos_sin, slots, q, cache, eps):
+        x_tensor, x_sf = x
+        qkv_weight_tensor, qkv_weight_sf = qkv_weight
+        q_b_weight_tensor, q_b_weight_sf = q_b_weight
+        return _torch_ops.experimental_v41f_qkv_lora(
+            x_tensor, x_sf, qkv_weight_tensor, qkv_weight_sf, q_b_weight_tensor, q_b_weight_sf,
+            q_norm_weight, kv_norm_weight, positions, cos_sin, slots, q, cache, eps,
+        )
+
+    def v41f_wv_o_proj(x, wv_weight, o_weight, y):
+        x_tensor, x_sf = x
+        wv_weight_tensor, wv_weight_sf = wv_weight
+        o_weight_tensor, o_weight_sf = o_weight
+        return _torch_ops.experimental_v41f_wv_o_proj(
+            x_tensor, x_sf, wv_weight_tensor, wv_weight_sf, o_weight_tensor, o_weight_sf, y,
+        )
+
+    for func in (fp8_gemm_nt_segmented_k256,
+                 bf16_gemm_nt_with_swiglu_n5632_k1024,
+                 bf16_gemm_nt_with_add_norm_n1024_k2816,
+                 bf16_gemm_nt_with_bias_add_norm_n1024_k1024,
+                 batched_bf16_newton_schulz,
+                 v41f_qkv_lora, v41f_wv_o_proj):
+        func.__module__, func.__qualname__ = experimental.__name__, func.__name__
+        setattr(experimental, func.__name__, func)
+
+
+_register_experimental_kernels()
+
 _cpp_init = init
 
 
@@ -886,12 +1000,13 @@ def init(library_root_path):
 # NOTES: registered so that `from ._C.locality_domain import ...` resolves as with the former pybind submodule,
 #        named after this module so the import also resolves when the package is vendored under another name
 sys.modules[locality_domain.__name__] = locality_domain
+sys.modules[experimental.__name__] = experimental
 
 
 _PUBLIC_API = [
     # Runtime and configuration
     'Runtime', 'get_jit', 'init', 'shutdown',
-    'epilogue', 'locality_domain',
+    'epilogue', 'locality_domain', 'experimental',
     'set_num_sms', 'get_num_sms',
     'set_tc_util', 'get_tc_util',
     'set_pdl', 'get_pdl',
@@ -908,10 +1023,12 @@ _PUBLIC_API = [
     'batched_syrk', 'batched_symm',
     # Mega kernels
     'mega_mhc',
-    'get_token_alignment_for_mega_moe',
-    'get_block_m_for_mega_moe',
-    'get_symm_buffer_size_for_mega_moe',
-    'fp8_fp4_mega_moe', 'bf16_mega_moe', 'bf16_mega_moe_trtllm', 'fp4_fp4_mega_moe',
+    'get_token_alignment_for_mega_moe', 'get_token_alignment_for_mega_moe_inference',
+    'get_block_m_for_mega_moe', 'get_block_m_for_mega_moe_inference',
+    'get_symm_buffer_size_for_mega_moe', 'get_symm_buffer_size_for_mega_moe_inference',
+    'fp8_fp4_mega_moe', 'fp8_fp4_mega_moe_inference',
+    'bf16_mega_moe', 'bf16_mega_moe_inference', 'bf16_mega_moe_trtllm',
+    'fp4_fp4_mega_moe', 'fp4_fp4_mega_moe_trtllm',
     'get_token_alignment_for_nvfp4_mega_moe',
     'get_block_m_for_nvfp4_mega_moe',
     'get_symm_buffer_size_for_nvfp4_mega_moe',

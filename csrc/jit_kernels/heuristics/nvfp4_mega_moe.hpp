@@ -9,8 +9,9 @@
 #include <unordered_set>
 #include <utility>
 
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/scheduler/mega_moe/inference.cuh>
 #include <deep_jit/utils/env.hpp>
 
 #include "../../utils/exception.hpp"
@@ -115,7 +116,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_nvfp4_mega_moe(
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
-        layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
+        layout::inference::kCandidateBlockM, layout::inference::kCandidateBlockM + layout::inference::kNumCandidateBlockMs,
         [=](const auto& candidate) { return candidate == block_m; })
     );
 
@@ -134,11 +135,9 @@ static std::tuple<bool, bool, bool> get_launch_variants_for_nvfp4_mega_moe(
     const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
     bool decode_shaped = num_covered_tokens <= block_m;
 
-    // The compact count exchange maps one rank and one local expert to each lane of a warp. It only removes dispatch
-    // work (zero-count atomics, remote count sums, uncoalesced count loads), so it is used at every token count.
-    const int num_experts_per_rank = num_experts / num_ranks;
-    const bool fits_one_warp = num_ranks <= 32 and num_experts_per_rank <= 32;
-    bool compact_dispatch = fits_one_warp;
+    // The compact count exchange only lets the SMs that own input tokens issue the per-expert count atomics. It never
+    // adds dispatch work (once every SM owns tokens, it is the full exchange), so it is used at every token count.
+    bool compact_dispatch = true;
 
     // Batched scale-factor pulls shorten each token pull: they help small launches, and large launches whose L1 GEMM
     // per M block is short enough (`intermediate_hidden` up to 2048 measured on GB300) to keep the pulls on the
@@ -147,10 +146,8 @@ static std::tuple<bool, bool, bool> get_launch_variants_for_nvfp4_mega_moe(
 
     // Overrides for tuning: unset or negative values keep the heuristics
     const auto override_compact_dispatch = deep_jit::get_env<int>("DG_NVFP4_MOE_COMPACT_DISPATCH", -1);
-    if (override_compact_dispatch >= 0) {
-        DG_HOST_ASSERT(override_compact_dispatch == 0 or fits_one_warp);
+    if (override_compact_dispatch >= 0)
         compact_dispatch = override_compact_dispatch != 0;
-    }
     const auto override_batched_sf_pulls = deep_jit::get_env<int>("DG_NVFP4_MOE_BATCHED_SF_PULLS", -1);
     if (override_batched_sf_pulls >= 0)
         batched_sf_pulls = override_batched_sf_pulls != 0;
@@ -180,7 +177,7 @@ static std::pair<int, int> get_pipeline_config_for_nvfp4_mega_moe(
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
+        static_cast<int>(layout::inference::Buffer(layout::inference::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
@@ -192,7 +189,7 @@ static std::pair<int, int> get_pipeline_config_for_nvfp4_mega_moe(
 
     // Schedule task payloads
     constexpr int kNumScheduleStages = 2;
-    const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(sched::TaskInfo<true>));
+    const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(mega_moe::inference::TaskInfo<true>));
 
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
     // + schedule task publish full/empty barriers.

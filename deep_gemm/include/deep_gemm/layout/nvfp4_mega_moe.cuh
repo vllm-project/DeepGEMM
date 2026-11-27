@@ -1,9 +1,10 @@
 #pragma once
 
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 
-namespace deep_gemm::layout {
+namespace deep_gemm::layout::inference {
 
+// NOTES: the buffer starts with the shared `Workspace`, so that it can alias the other inference MegaMoE buffers
 struct NVFP4MegaMoEBuffer {
     Workspace workspace;
 
@@ -13,8 +14,8 @@ struct NVFP4MegaMoEBuffer {
            input_topk_idx_buffer,
            input_topk_weights_buffer;
 
-    // Routed expert ring buffers
-    // Shared inputs have independent storage and precision.
+    // Shared expert buffers
+    // NOTES: shared inputs have independent storage and precision (MXFP8 or BF16)
     Buffer shared_l1_token_buffer, shared_l1_sf_buffer,
            shared_l2_token_buffer, shared_l2_sf_buffer;
 
@@ -31,16 +32,16 @@ struct NVFP4MegaMoEBuffer {
 
     CUTLASS_HOST_DEVICE
     NVFP4MegaMoEBuffer(void* base,
-                  const uint32_t& hidden,
-                  const uint32_t& intermediate_hidden,
-                  const uint32_t& num_ranks,
-                  const uint32_t& num_experts,
-                  const uint32_t& num_max_tokens_per_rank,
-                  const uint32_t& num_topk,
-                  const uint32_t& num_ring_tokens,
-                  const uint32_t& num_sf_ring_tokens,
-                  const uint32_t& num_shared_experts = 0,
-                  const bool& shared_bf16 = false) {
+                       const uint32_t& hidden,
+                       const uint32_t& intermediate_hidden,
+                       const uint32_t& num_ranks,
+                       const uint32_t& num_experts,
+                       const uint32_t& num_max_tokens_per_rank,
+                       const uint32_t& num_topk,
+                       const uint32_t& num_ring_tokens,
+                       const uint32_t& num_sf_ring_tokens,
+                       const uint32_t& num_shared_experts = 0,
+                       const bool& shared_bf16 = false) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -51,19 +52,20 @@ struct NVFP4MegaMoEBuffer {
         const auto num_max_shared_sf_tokens = shared_with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
 
         // Layouts
+        // NOTES: routed tokens are packed E2M1 with one E4M3 scale byte per 16 elements
         const uint32_t shared_elem_bytes = shared_with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(hidden / 2);
-        const auto shared_input_token_layout = layout::Data(hidden * shared_elem_bytes);
-        const auto bf16_token_layout = layout::Data(hidden * 2);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden / 2);
-        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * shared_elem_bytes);
-        const auto input_sf_layout = layout::Data(hidden / 16, false);
-        const auto shared_input_sf_layout = layout::Data(shared_with_sf ? hidden / 32 : 0, false);
-        const auto intermediate_sf_layout = layout::Data(intermediate_hidden / 16, false);
-        const auto shared_intermediate_sf_layout = layout::Data(shared_with_sf ? shared_intermediate_hidden / 32 : 0, false);
-        const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
-        const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
-        const auto x_scales_layout = layout::Data(sizeof(float), false);
+        const auto input_token_layout = Data(hidden / 2);
+        const auto shared_input_token_layout = Data(hidden * shared_elem_bytes);
+        const auto bf16_token_layout = Data(hidden * 2);
+        const auto intermediate_token_layout = Data(intermediate_hidden / 2);
+        const auto shared_intermediate_token_layout = Data(shared_intermediate_hidden * shared_elem_bytes);
+        const auto input_sf_layout = Data(hidden / 16, false);
+        const auto shared_input_sf_layout = Data(shared_with_sf ? hidden / 32 : 0, false);
+        const auto intermediate_sf_layout = Data(intermediate_hidden / 16, false);
+        const auto shared_intermediate_sf_layout = Data(shared_with_sf ? shared_intermediate_hidden / 32 : 0, false);
+        const auto input_topk_idx_layout = Data(num_topk * sizeof(int64_t), false);
+        const auto input_topk_weights_layout = Data(num_topk * sizeof(float), false);
+        const auto x_scales_layout = Data(sizeof(float), false);
 
         // Input buffers
         input_token_buffer = Buffer(
@@ -132,4 +134,4 @@ struct NVFP4MegaMoEBuffer {
     }
 };
 
-} // namespace deep_gemm::layout
+} // namespace deep_gemm::layout::inference

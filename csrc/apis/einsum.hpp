@@ -225,7 +225,7 @@ static void fp8_bmm(const torch::stable::Tensor& a, const torch::stable::Tensor&
                     const std::string& compiled_dims,
                     const std::shared_ptr<EpilogueClass>& epilogue_class,
                     const bool& use_128x4_sfd_layout) {
-    // The FP8 output pair and a user `FP8Quantization` are two spellings of the same epilogue
+    // The FP8 output pair is shorthand for `FP8CastWithClamp` without clamping
     const auto d_fp8 = std::get_if<std::pair<torch::stable::Tensor, torch::stable::Tensor>>(&d);
     const auto d_tensor = d_fp8 != nullptr ? d_fp8->first : std::get<torch::stable::Tensor>(d);
     auto merged_epilogue_class = epilogue_class;
@@ -233,7 +233,7 @@ static void fp8_bmm(const torch::stable::Tensor& a, const torch::stable::Tensor&
     if (d_fp8 != nullptr) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "The FP8 output pair supports no other epilogue");
         sfd = d_fp8->second;
-        merged_epilogue_class = std::make_shared<FP8QuantizationEpilogue>(d_fp8->second, use_128x4_sfd_layout);
+        merged_epilogue_class = std::make_shared<FP8CastWithClampEpilogue>(d_fp8->second, std::nullopt, std::nullopt, use_128x4_sfd_layout);
     } else {
         DG_HOST_ASSERT(not use_128x4_sfd_layout and "The 128x4 SFD layout requires the FP8 output pair");
         sfd = merged_epilogue_class != nullptr ? merged_epilogue_class->output_sfd() : std::nullopt;
@@ -373,8 +373,9 @@ static void einsum(const std::string& expr,
                    const torch::stable::Tensor& d, const std::optional<torch::stable::Tensor>& c,
                    const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
-    einsum::einsum(expr, a, b, d, c, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
+    einsum::einsum(expr, a, b, d, c, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void fp8_einsum(const std::string& expr,
@@ -386,19 +387,20 @@ static void fp8_einsum(const std::string& expr,
                        const bool& use_128x4_sfd_layout,
                        const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     std::variant<torch::stable::Tensor, std::pair<torch::stable::Tensor, torch::stable::Tensor>> output = d;
     if (sfd.has_value()) output = std::make_pair(d, *sfd);
     einsum::fp8_einsum(expr, {a, sfa}, {b, sfb}, output, c, list_to_tuple3(recipe),
-                       epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd), use_128x4_sfd_layout);
+                       epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux), use_128x4_sfd_layout);
 }
 } // namespace deep_gemm::torch_registration
 
 STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def(
-        "einsum(str expr, Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "einsum(str expr, Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "fp8_einsum(str expr, Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3] recipe, Tensor(sfd!)? sfd=None, bool use_128x4_sfd_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "fp8_einsum(str expr, Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3] recipe, Tensor(sfd!)? sfd=None, bool use_128x4_sfd_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {

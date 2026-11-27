@@ -6,8 +6,9 @@ from typing import Tuple, List
 
 import deep_gemm
 from deep_gemm.testing import (
+    JIT_DRY_RUN,
     bench_kineto,
-    assert_bitwise_equal, calc_diff, count_bytes,
+    assert_bitwise_equal, assert_check, calc_diff, count_bytes,
     get_arch_major,
     test_filter
 )
@@ -91,6 +92,11 @@ def mqa_logits_tolerances(fmt: str, has_bf16: bool):
 
 def ref_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
                    cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor):
+    if JIT_DRY_RUN:
+        logits = torch.zeros((q.shape[0], kv.shape[0]), dtype=torch.float, device=q.device)
+        cost = torch.zeros((), dtype=torch.long, device=q.device)
+        return logits, cost
+
     seq_len_kv = kv.shape[0]
 
     seq_len = q.shape[0]
@@ -128,10 +134,10 @@ def test_mqa_logits():
         # Select an arbitrary CP rank
         cp_id = cp_size // 3
         ks = torch.zeros(seq_len, dtype=torch.int, device='cuda')
-        ke = torch.zeros(seq_len, dtype=torch.int,  device='cuda')
-        for i in range(chunk_size):
-            ke[i] = cp_id * chunk_size + i
-            ke[i + chunk_size] = (cp_size * 2 - 1 - cp_id) * chunk_size + i
+        ke = torch.empty(seq_len, dtype=torch.int, device='cuda')
+        offsets = torch.arange(chunk_size, dtype=torch.int, device='cuda')
+        ke[:chunk_size] = cp_id * chunk_size + offsets
+        ke[chunk_size:] = (cp_size * 2 - 1 - cp_id) * chunk_size + offsets
         return ks, ke
 
     def enumerate_mqa_logits():
@@ -199,14 +205,14 @@ def test_mqa_logits():
         # Expand the compressed result for comparison with the dense reference.
         assert logits.size() == (seq_len, max_seqlen_k)
         tmp = torch.full((seq_len, seq_len_kv), float('-inf'), device='cuda')
-        for i in range(seq_len):
-            tmp[i, ks[i] : ke[i]] = logits[i, : ke[i] - ks[i]]
+        # All ks are zero, so each row occupies a prefix of the dense output.
+        tmp[:, :max_seqlen_k] = logits.masked_fill(~self_mask, float('-inf'))
         logits = tmp
 
         # Validation
         ref_neginf_mask = (ref_logits == float('-inf'))
         neginf_mask = (logits == float('-inf'))
-        assert torch.equal(neginf_mask, ref_neginf_mask)
+        assert_check(torch.equal(neginf_mask, ref_neginf_mask))
 
         ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
         simulated_logits = simulated_logits.masked_fill(ref_neginf_mask, 0)
@@ -214,8 +220,8 @@ def test_mqa_logits():
         diff = calc_diff(logits, ref_logits)
         simulated_diff = calc_diff(logits, simulated_logits)
         diff_tol, simulated_diff_tol = mqa_logits_tolerances(fmt, torch.bfloat16 in (weights_dtype, logits_dtype))
-        assert diff < diff_tol, f"Diff: {diff}"
-        assert simulated_diff < simulated_diff_tol, f"Simulated Diff: {simulated_diff}"
+        assert_check(diff < diff_tol, f"Diff: {diff}")
+        assert_check(simulated_diff < simulated_diff_tol, f"Simulated Diff: {simulated_diff}")
 
         # Profiling
         tflops = 2 * ref_cost * num_heads * head_dim / 1e12
@@ -240,6 +246,9 @@ def test_mqa_logits():
 def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
                          weights: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor,
                          max_model_len: int):
+    if JIT_DRY_RUN:
+        return torch.zeros((q.size(0) * q.size(1), max_model_len), dtype=torch.float, device=q.device)
+
     # `q` is `[batch_size, next_n, num_heads, dim]`, `context_lens` `[batch_size, next_n]`: token `j` of query `i`
     # attends to `[0, context_lens[i, j])` of the query's block table
     batch_size, next_n, num_heads, dim = q.size()
@@ -443,8 +452,8 @@ def test_paged_mqa_logits():
         diff = calc_diff(logits_masked, ref_masked)
         simulated_diff = calc_diff(logits_masked, simulated_masked)
         diff_tol, simulated_diff_tol = mqa_logits_tolerances(fmt, torch.bfloat16 in (weights_dtype, logits_dtype))
-        assert diff < diff_tol, f"Diff: {diff}"
-        assert simulated_diff < simulated_diff_tol, f"Simulated Diff: {simulated_diff}"
+        assert_check(diff < diff_tol, f"Diff: {diff}")
+        assert_check(simulated_diff < simulated_diff_tol, f"Simulated Diff: {simulated_diff}")
 
         # Profiling
         sum_lens = context_lens_nextn.sum().item()
@@ -475,6 +484,11 @@ def test_paged_mqa_logits():
 def make_sparse_kv_block_indices(context_lens: List[int], request_indices: List[int] | None,
                                  sparse_block_kv: int, num_max_sparse_blocks: int,
                                  seed: int, context_starts: List[int] | None = None) -> Tuple[torch.Tensor, List[int]]:
+    if JIT_DRY_RUN:
+        indices = torch.zeros(
+            (len(context_lens), num_max_sparse_blocks), device='cuda', dtype=torch.int32)
+        return indices, [0] * len(context_lens)
+
     rng = random.Random(seed)
     request_indices = [0] * len(context_lens) if request_indices is None else request_indices
     context_starts = [0] * len(context_lens) if context_starts is None else context_starts
@@ -669,7 +683,7 @@ def test_sparse_mqa_logits() -> None:
             num_pages_per_request = [ceil_div(context_len, page_kv) for context_len in max_context_lens]
             max_num_pages, num_pages = max(num_pages_per_request), sum(num_pages_per_request)
             page_bytes = page_kv * (elem_dim + 4)
-            page_stride_bytes = ceil_div(page_bytes, 256) * 256
+            page_stride_bytes = ceil_div(page_bytes, 128) * 128
             kv_storage = torch.empty((num_pages, page_stride_bytes), device='cuda', dtype=torch.uint8)
             kv_cache = kv_storage.as_strided((num_pages, page_kv, 1, elem_dim + 4),
                                              (page_stride_bytes, elem_dim + 4, elem_dim + 4, 1))

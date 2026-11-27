@@ -11,17 +11,24 @@
 #include <string>
 
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/scheduler/mega_moe/inference.cuh>
+// SM90 keeps the layout and scheduler from before the inference rework
 #include <deep_gemm/scheduler/mega_moe.cuh>
 
 #include "../runtime/runtime.hpp"
-#include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
-#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
-#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
+#include "../jit_kernels/heuristics/mega_moe_inference.hpp"
+#include "../jit_kernels/impls/sm100_bf16_mega_moe_inference.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_inference.hpp"
 #include "../jit_kernels/impls/sm100_fp4_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
 #include "locality_domain.hpp"
 
-namespace deep_gemm::mega {
+namespace deep_gemm::mega_moe::inference {
+
+// SM90 Mega MoE runs on the legacy layout (`layout::`, `sched::`); SM100 on `layout::inference`
+static bool is_legacy_layout() {
+    return jit->device.get_arch_major() == 9;
+}
 
 static int checked_int(const int64_t value) {
     // Preserve pybind behavior by rejecting values that do not fit exactly in a C++ int.
@@ -31,7 +38,7 @@ static int checked_int(const int64_t value) {
 }
 
 static int get_token_alignment_for_mega_moe() {
-    return layout::kLCMCandidateBlockM;
+    return is_legacy_layout() ? layout::kLCMCandidateBlockM : layout::inference::kLCMCandidateBlockM;
 }
 
 static int get_block_m_for_mega_moe(
@@ -40,8 +47,13 @@ static int get_block_m_for_mega_moe(
     const std::string& mma_type) {
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
-    const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind, mma_type == "fp8xfp8");
+    if (is_legacy_layout()) {
+        const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
+            get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind, mma_type == "fp8xfp8");
+        return block_m;
+    }
+    const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
+        get_block_config_for_mega_moe_inference(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
     return block_m;
 }
 
@@ -119,31 +131,10 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
     const int& num_shared_experts = 0) {
+    DG_HOST_ASSERT(num_ranks > 0 and num_ranks <= layout::kNumMaxRanks);
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swiglustep" or activation == "situ");
     DG_HOST_ASSERT(num_shared_experts >= 0);
-
-    // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
-    // TODO: we temporarily assume the SM count is consistent with the runtime value
-    const auto num_sms = get_num_sms_for_mega_moe();
-    const auto num_experts_per_rank = num_experts / num_ranks;
-    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
-    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
-
-    // Shared
-    const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
-
-    // Iterate all block candidates to get the maximum ring size
-    int num_ring_tokens = 0;
-    for (const auto& block_m: layout::kCandidateBlockM) {
-        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
-        // FP8 routed weights at BLOCK_M 128 run tokens on M with task groups on SM90
-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
-            num_pool_blocks, num_sms, hidden, intermediate_hidden,
-            jit->device.get_arch_major() == 9 and mma_type == "fp8xfp8" and block_m == 128 ? sched::kNumSM90TaskGroupMBlocks : 1);
-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
-    }
-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
 
     // Parse MMA type
     const auto mma_kind = parse_mma_kind(mma_type);
@@ -153,24 +144,77 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
     // NOTES: NVFP4 shared experts run in BF16 (16-bit, SF-free)
     const auto shared_num_mma_elem_bits = mma_kind == MmaKind::NVFP4 ? 16 : 0;
 
-    // Compute num_sf_ring_tokens (max across all candidate block sizes)
-    int num_sf_ring_tokens = 0;
-    if (with_sf) {
-        for (auto block_m: layout::kCandidateBlockM) {
-            num_sf_ring_tokens = std::max(
-                num_sf_ring_tokens,
-                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+    const auto num_experts_per_rank = num_experts / num_ranks;
+    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
+    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
+
+    // Shared
+    const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
+
+    // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
+    // TODO: we temporarily assume the SM count is consistent with the runtime value
+    int num_ring_tokens = 0, num_sf_ring_tokens = 0;
+    if (is_legacy_layout()) {
+        const auto num_sms = get_num_sms_for_mega_moe();
+        for (const auto& block_m: layout::kCandidateBlockM) {
+            const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+            // FP8 routed weights at BLOCK_M 128 run tokens on M with task groups on SM90
+            const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+                num_pool_blocks, num_sms, hidden, intermediate_hidden,
+                mma_type == "fp8xfp8" and block_m == 128 ? sched::kNumSM90TaskGroupMBlocks : 1);
+            num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+        }
+        num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+        if (with_sf) {
+            for (auto block_m: layout::kCandidateBlockM)
+                num_sf_ring_tokens = std::max(num_sf_ring_tokens, layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+        }
+    } else {
+        DG_HOST_ASSERT(num_experts > 0 and num_experts <= layout::inference::MegaMoESignals::kNumMaxExperts);
+        DG_HOST_ASSERT(num_experts_per_rank <= layout::inference::MegaMoESignals::kNumMaxExpertsPerRank);
+        DG_HOST_ASSERT(num_max_tokens_per_rank >= 0 and num_max_tokens_per_rank <=
+                       layout::inference::MegaMoESignals::kNumMaxSharedL2Blocks * layout::inference::kMinCandidateBlockM);
+        DG_HOST_ASSERT(num_topk >= 0 and num_topk <= num_experts);
+        DG_HOST_ASSERT(intermediate_hidden > 0 and
+                       num_shared_experts <= std::numeric_limits<int>::max() / intermediate_hidden);
+        DG_HOST_ASSERT(hidden > 0 and hidden <= std::numeric_limits<int>::max() / 2);
+
+        const auto num_sms = get_num_sms_for_mega_moe_inference();
+        for (const auto& block_m: layout::inference::kCandidateBlockM) {
+            const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+            const auto num_live_pool_blocks = get_num_max_live_pool_blocks(
+                num_pool_blocks, num_sms, hidden, intermediate_hidden);
+            num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+        }
+        num_ring_tokens = math::align(num_ring_tokens, layout::inference::kLCMCandidateBlockM);
+
+        // A batch must not wait on its own unpublished tokens; cover the complete pool when batching.
+        if (std::get<1>(get_pull_config(hidden * num_mma_elem_bits / 8)) > 1) {
+            num_ring_tokens = std::max(num_ring_tokens, layout::inference::get_num_max_pool_tokens(
+                num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank));
+        }
+
+        // Reject unsupported capacity before the SF expansion multiplies the ring size.
+        DG_HOST_ASSERT(num_ring_tokens <=
+                       layout::inference::MegaMoESignals::kNumMaxRingBlocks * layout::inference::kMinCandidateBlockM);
+        if (with_sf) {
+            for (auto block_m: layout::inference::kCandidateBlockM) {
+                num_sf_ring_tokens = std::max(
+                    num_sf_ring_tokens, layout::inference::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+            }
         }
     }
 
     // All buffers
-    const auto mega_buffer = layout::MegaMoEBuffer(
-        nullptr, hidden, intermediate_hidden,
-        num_ranks, num_experts, num_max_tokens_per_rank,
-        num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        num_shared_experts, num_mma_elem_bits, sf_gran_k,
-        shared_num_mma_elem_bits
-    );
+    const auto make_buffer = [&]<typename buffer_t>() {
+        return buffer_t(
+            nullptr, hidden, intermediate_hidden,
+            num_ranks, num_experts, num_max_tokens_per_rank,
+            num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
+            num_shared_experts, num_mma_elem_bits, sf_gran_k,
+            shared_num_mma_elem_bits
+        );
+    };
 
     // Check SF buffer requirements
     if (with_sf) {
@@ -185,18 +229,24 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
     }
 
     SymmBufferLayoutInfo layout_info;
-    layout_info.num_bytes = mega_buffer.get_num_bytes();
-    layout_info.input_token_base = reinterpret_cast<int64_t>(mega_buffer.input_token_buffer.base);
-    layout_info.input_sf_base = reinterpret_cast<int64_t>(mega_buffer.input_sf_buffer.base);
-    layout_info.input_topk_idx_base = reinterpret_cast<int64_t>(mega_buffer.input_topk_idx_buffer.base);
-    layout_info.input_topk_weights_base = reinterpret_cast<int64_t>(mega_buffer.input_topk_weights_buffer.base);
-    layout_info.shared_l1_sf_base = reinterpret_cast<int64_t>(mega_buffer.shared_l1_sf_buffer.base);
-    layout_info.shared_l2_token_base = reinterpret_cast<int64_t>(mega_buffer.shared_l2_token_buffer.base);
-    layout_info.shared_l2_sf_base = reinterpret_cast<int64_t>(mega_buffer.shared_l2_sf_buffer.base);
-    layout_info.l1_token_base = reinterpret_cast<int64_t>(mega_buffer.l1_token_buffer.base);
-    layout_info.l1_sf_base = reinterpret_cast<int64_t>(mega_buffer.l1_sf_buffer.base);
-    layout_info.l2_token_base = reinterpret_cast<int64_t>(mega_buffer.l2_token_buffer.base);
-    layout_info.l2_sf_base = reinterpret_cast<int64_t>(mega_buffer.l2_sf_buffer.base);
+    const auto fill = [&](const auto& mega_buffer) {
+        layout_info.num_bytes = mega_buffer.get_num_bytes();
+        layout_info.input_token_base = reinterpret_cast<int64_t>(mega_buffer.input_token_buffer.base);
+        layout_info.input_sf_base = reinterpret_cast<int64_t>(mega_buffer.input_sf_buffer.base);
+        layout_info.input_topk_idx_base = reinterpret_cast<int64_t>(mega_buffer.input_topk_idx_buffer.base);
+        layout_info.input_topk_weights_base = reinterpret_cast<int64_t>(mega_buffer.input_topk_weights_buffer.base);
+        layout_info.shared_l1_sf_base = reinterpret_cast<int64_t>(mega_buffer.shared_l1_sf_buffer.base);
+        layout_info.shared_l2_token_base = reinterpret_cast<int64_t>(mega_buffer.shared_l2_token_buffer.base);
+        layout_info.shared_l2_sf_base = reinterpret_cast<int64_t>(mega_buffer.shared_l2_sf_buffer.base);
+        layout_info.l1_token_base = reinterpret_cast<int64_t>(mega_buffer.l1_token_buffer.base);
+        layout_info.l1_sf_base = reinterpret_cast<int64_t>(mega_buffer.l1_sf_buffer.base);
+        layout_info.l2_token_base = reinterpret_cast<int64_t>(mega_buffer.l2_token_buffer.base);
+        layout_info.l2_sf_base = reinterpret_cast<int64_t>(mega_buffer.l2_sf_buffer.base);
+    };
+    if (is_legacy_layout())
+        fill(make_buffer.template operator()<layout::MegaMoEBuffer>());
+    else
+        fill(make_buffer.template operator()<layout::inference::MegaMoEBuffer>());
     layout_info.with_sf = with_sf;
     layout_info.num_max_tokens_per_rank = num_max_tokens_per_rank;
     layout_info.num_topk = num_topk;
@@ -246,6 +296,9 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
         const int64_t sf_gran_k = get_mma_sf_gran_k(layout_info.mma_kind);
         const int64_t hidden_sf_cols = layout_info.hidden / (sf_gran_k * 4);
         const int64_t intermediate_sf_cols = layout_info.intermediate_hidden / (sf_gran_k * 4);
+        const int64_t num_max_shared_sf_tokens = is_legacy_layout() ?
+            layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank) :
+            layout::inference::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank);
 
         auto x = torch_compat::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.input_token_base),
@@ -267,8 +320,8 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
         auto shared_l1_acts = is_fp4 ? torch::stable::Tensor() : x;
         auto shared_l1_acts_sf = (shared_with_sf and layout_info.num_shared_experts > 0) ? torch::stable::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.shared_l1_sf_base),
-            {layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.hidden / 128},
-            {1, layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)},
+            {num_max_shared_sf_tokens, layout_info.hidden / 128},
+            {1, num_max_shared_sf_tokens},
             buffer.device(), act_sf_dtype) : torch::stable::Tensor();
         auto shared_l2_acts = layout_info.num_shared_experts > 0 ? torch_compat::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.shared_l2_token_base),
@@ -276,8 +329,8 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
             buffer.device(), shared_token_dtype) : torch::stable::Tensor();
         auto shared_l2_acts_sf = (shared_with_sf and layout_info.num_shared_experts > 0) ? torch::stable::from_blob(
             math::advance_ptr(buffer.mutable_data_ptr(), layout_info.shared_l2_sf_base),
-            {layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.shared_intermediate_hidden / 128},
-            {1, layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)},
+            {num_max_shared_sf_tokens, layout_info.shared_intermediate_hidden / 128},
+            {1, num_max_shared_sf_tokens},
             buffer.device(), act_sf_dtype) : torch::stable::Tensor();
 
         auto l1_acts = torch_compat::from_blob(
@@ -320,7 +373,9 @@ static void fp8_fp4_mega_moe(
     const bool& fast_math,
     const float& activation_alpha,
     const float& activation_beta,
-    const std::optional<int64_t>& num_tokens_for_block_m
+    const std::optional<int64_t>& num_tokens_for_block_m,
+    const std::optional<torch::stable::Tensor>& rms_weights,
+    const std::optional<float>& rms_eps
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -337,7 +392,7 @@ static void fp8_fp4_mega_moe(
     // Activation checks
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
-    DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(activation_clamp > 0);
     if (activation == "swiglustep") {
         DG_HOST_ASSERT(activation_alpha == 1.0f and activation_beta == 0.0f);
         DG_HOST_ASSERT(not shared_l1_weights_tuple_opt.has_value());
@@ -361,6 +416,18 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+
+    // Output: BF16, or on SM100 the FP32 combine accumulator; optional fused RMSNorm on SM100
+    DG_HOST_ASSERT((y.scalar_type() == torch::headeronly::ScalarType::BFloat16 or
+                    (arch_major == 10 and y.scalar_type() == torch::headeronly::ScalarType::Float)) and y.is_contiguous());
+    DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(y.data_ptr()) % (y.scalar_type() == torch::headeronly::ScalarType::Float ? 32 : 16) == 0);
+    if (rms_weights.has_value()) {
+        DG_HOST_ASSERT(arch_major == 10);
+        DG_HOST_ASSERT(rms_weights->dim() == 1 and rms_weights->size(0) == hidden);
+        DG_HOST_ASSERT(rms_weights->scalar_type() == y.scalar_type() and rms_weights->is_contiguous());
+        DG_HOST_ASSERT(rms_weights->device() == y.device());
+        DG_HOST_ASSERT(rms_eps.has_value() and std::isfinite(rms_eps.value()) and rms_eps.value() > 0);
+    }
 
     // SM90 FP8 routed weights take FP32 128x128 block scales `[E, N / 128, K / 128]` for all FP8 weights of the call
     const bool routed_fp8 = arch_major == 9 and weight_dtype == torch::headeronly::ScalarType::Float8_e4m3fn;
@@ -427,33 +494,27 @@ static void fp8_fp4_mega_moe(
     // Dispatch into different architectures
     if (arch_major == 10) {
         DG_HOST_ASSERT(not num_tokens_for_block_m.has_value());
-        const auto launch = [&](const auto kernel, const auto&... activation_args) {
-            kernel(y,
-                   l1_acts, l1_acts_sf,
-                   l2_acts, l2_acts_sf,
-                   shared_l1_acts, shared_l1_acts_sf,
-                   shared_l2_acts, shared_l2_acts_sf,
-                   l1_weights, l2_weights,
-                   l1_weights_sf, l2_weights_sf,
-                   shared_l1_weights, shared_l2_weights,
-                   shared_l1_weights_sf, shared_l2_weights_sf,
-                   locality_domain::get_balanced_sm_locality_domains(),
-                   cumulative_local_expert_recv_stats,
-                   sym_buffer_ptrs,
-                   rank_idx, num_max_tokens_per_rank,
-                   num_experts_per_rank,
-                   num_shared_experts,
-                   num_tokens, num_topk,
-                   hidden, intermediate_hidden,
-                   activation_args...);
-        };
-        if (activation == "situ") {
-            launch(sm100_fp8_fp4_mega_moe_situ,
-                   activation_alpha, activation_beta, fast_math);
-        } else {
-            launch(sm100_fp8_fp4_mega_moe,
-                   activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
-        }
+        sm100_fp8_fp4_mega_moe_inference(
+            y,
+            l1_acts, l1_acts_sf,
+            l2_acts, l2_acts_sf,
+            shared_l1_acts, shared_l1_acts_sf,
+            shared_l2_acts, shared_l2_acts_sf,
+            l1_weights, l2_weights,
+            l1_weights_sf, l2_weights_sf,
+            shared_l1_weights, shared_l2_weights,
+            shared_l1_weights_sf, shared_l2_weights_sf,
+            locality_domain::get_balanced_sm_locality_domains(),
+            cumulative_local_expert_recv_stats,
+            sym_buffer_ptrs,
+            rank_idx, num_max_tokens_per_rank,
+            num_experts_per_rank,
+            num_shared_experts,
+            num_tokens, num_topk,
+            hidden, intermediate_hidden,
+            activation, activation_clamp, activation_alpha, activation_beta,
+            fast_math, rms_weights, rms_eps.value_or(0.0f)
+        );
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(activation != "situ");
         // FP8 shared weights of FP4 kernels need one exponent per SF word, see `requantize_fp8_weights_for_sm90_mega_moe`
@@ -522,7 +583,7 @@ static void fp4_fp4_mega_moe(
     // Activation checks
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
-    DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(activation_clamp > 0);
 
     // Tensor checks
     // NOTES: the kernel addresses weights with 2D TMA descriptors, so locality-domain localized weights are not supported
@@ -711,7 +772,7 @@ static void bf16_mega_moe(
     // Activation checks
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
-    DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(activation_clamp > 0);
     if (activation == "swiglustep") {
         DG_HOST_ASSERT(activation_alpha == 1.0f and activation_beta == 0.0f);
         DG_HOST_ASSERT(not shared_l1_weights_opt.has_value());
@@ -806,7 +867,7 @@ static void bf16_mega_moe(
 
     // Dispatch into different architectures
     if (arch_major == 10) {
-        sm100_bf16_mega_moe<use_trtllm_weights>(y,
+        sm100_bf16_mega_moe_inference<use_trtllm_weights>(y,
                             l1_acts, l2_acts,
                             shared_l1_acts, shared_l2_acts,
                             l1_weights, l2_weights,
@@ -832,13 +893,13 @@ static void bf16_mega_moe(
         torch_compat::zero_(sym_buffer);
 }
 
-} // namespace deep_gemm::mega
+} // namespace deep_gemm::mega_moe::inference
 
 namespace deep_gemm::torch_registration {
 
 static std::tuple<int, int, int> checked_recipe(const std::vector<int64_t>& recipe) {
     DG_HOST_ASSERT(recipe.size() == 3);
-    return {mega::checked_int(recipe[0]), mega::checked_int(recipe[1]), mega::checked_int(recipe[2])};
+    return {mega_moe::inference::checked_int(recipe[0]), mega_moe::inference::checked_int(recipe[1]), mega_moe::inference::checked_int(recipe[2])};
 }
 
 static std::optional<std::tuple<torch::stable::Tensor, torch::stable::Tensor>> make_optional_tensor_pair(
@@ -852,7 +913,7 @@ static std::optional<std::tuple<torch::stable::Tensor, torch::stable::Tensor>> m
 }
 
 static int64_t get_token_alignment_for_mega_moe() {
-    return mega::get_token_alignment_for_mega_moe();
+    return mega_moe::inference::get_token_alignment_for_mega_moe();
 }
 
 static int64_t get_block_m_for_mega_moe(
@@ -862,10 +923,10 @@ static int64_t get_block_m_for_mega_moe(
     const int64_t& num_tokens,
     const int64_t& num_topk,
     const std::string& mma_type) {
-    return mega::get_block_m_for_mega_moe(
-        mega::checked_int(num_ranks), mega::checked_int(num_experts),
-        mega::checked_int(num_max_tokens_per_rank), mega::checked_int(num_tokens),
-        mega::checked_int(num_topk), mma_type);
+    return mega_moe::inference::get_block_m_for_mega_moe(
+        mega_moe::inference::checked_int(num_ranks), mega_moe::inference::checked_int(num_experts),
+        mega_moe::inference::checked_int(num_max_tokens_per_rank), mega_moe::inference::checked_int(num_tokens),
+        mega_moe::inference::checked_int(num_topk), mma_type);
 }
 
 static void fp8_fp4_mega_moe(
@@ -891,16 +952,19 @@ static void fp8_fp4_mega_moe(
     const bool& fast_math,
     const double& activation_alpha,
     const double& activation_beta,
-    const std::optional<int64_t>& num_tokens_for_block_m) {
-    mega::fp8_fp4_mega_moe(
+    const std::optional<int64_t>& num_tokens_for_block_m,
+    const std::optional<torch::stable::Tensor>& rms_weights,
+    const std::optional<double>& rms_eps) {
+    mega_moe::inference::fp8_fp4_mega_moe(
         y, {l1_weights_tuple, l1_weights_tuple_sf}, {l2_weights_tuple, l2_weights_tuple_sf},
         make_optional_tensor_pair(shared_l1_weights_tuple_opt, shared_l1_weights_tuple_opt_sf),
         make_optional_tensor_pair(shared_l2_weights_tuple_opt, shared_l2_weights_tuple_opt_sf),
         cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs,
-        mega::checked_int(rank_idx), mega::checked_int(num_max_tokens_per_rank),
-        mega::checked_int(num_experts), mega::checked_int(num_topk), checked_recipe(recipe),
+        mega_moe::inference::checked_int(rank_idx), mega_moe::inference::checked_int(num_max_tokens_per_rank),
+        mega_moe::inference::checked_int(num_experts), mega_moe::inference::checked_int(num_topk), checked_recipe(recipe),
         activation, activation_clamp_opt, fast_math,
-        static_cast<float>(activation_alpha), static_cast<float>(activation_beta), num_tokens_for_block_m);
+        static_cast<float>(activation_alpha), static_cast<float>(activation_beta), num_tokens_for_block_m,
+        rms_weights, rms_eps.has_value() ? std::optional<float>(static_cast<float>(rms_eps.value())) : std::nullopt);
 }
 
 template <bool use_trtllm_weights>
@@ -924,11 +988,11 @@ static void bf16_mega_moe(
     const double& activation_beta,
     const std::optional<torch::stable::Tensor>& post_expert_norm_gamma_opt,
     const double& post_expert_norm_eps) {
-    mega::bf16_mega_moe<use_trtllm_weights>(
+    mega_moe::inference::bf16_mega_moe<use_trtllm_weights>(
         y, l1_weights, l2_weights, shared_l1_weights_opt, shared_l2_weights_opt,
         cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs,
-        mega::checked_int(rank_idx), mega::checked_int(num_max_tokens_per_rank),
-        mega::checked_int(num_experts), mega::checked_int(num_topk), activation,
+        mega_moe::inference::checked_int(rank_idx), mega_moe::inference::checked_int(num_max_tokens_per_rank),
+        mega_moe::inference::checked_int(num_experts), mega_moe::inference::checked_int(num_topk), activation,
         activation_clamp_opt, fast_math,
         static_cast<float>(activation_alpha), static_cast<float>(activation_beta),
         post_expert_norm_gamma_opt, static_cast<float>(post_expert_norm_eps));
@@ -960,12 +1024,12 @@ static void fp4_fp4_mega_moe(
     const std::optional<torch::stable::Tensor>& a2_scales_opt,
     const std::optional<torch::stable::Tensor>& post_expert_norm_gamma_opt,
     const double& post_expert_norm_eps) {
-    mega::fp4_fp4_mega_moe<use_trtllm_weights>(
+    mega_moe::inference::fp4_fp4_mega_moe<use_trtllm_weights>(
         y, {l1_weights_tuple, l1_weights_tuple_sf}, {l2_weights_tuple, l2_weights_tuple_sf},
         shared_l1_weights_opt, shared_l2_weights_opt, x_bf16_opt,
         cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs,
-        mega::checked_int(rank_idx), mega::checked_int(num_max_tokens_per_rank),
-        mega::checked_int(num_experts), mega::checked_int(num_topk), checked_recipe(recipe),
+        mega_moe::inference::checked_int(rank_idx), mega_moe::inference::checked_int(num_max_tokens_per_rank),
+        mega_moe::inference::checked_int(num_experts), mega_moe::inference::checked_int(num_topk), checked_recipe(recipe),
         activation, activation_clamp_opt, fast_math,
         l1_alphas_opt, l2_alphas_opt, a2_scales_opt,
         post_expert_norm_gamma_opt, static_cast<float>(post_expert_norm_eps));
@@ -975,17 +1039,17 @@ static std::tuple<int64_t, std::vector<int64_t>> get_symm_buffer_size_for_mega_m
     int64_t num_ranks, int64_t num_experts, int64_t num_max_tokens_per_rank,
     int64_t num_topk, int64_t hidden, int64_t intermediate_hidden,
     const std::string& mma_type, const std::string& activation, int64_t num_shared_experts) {
-    return mega::get_symm_buffer_size_for_mega_moe(
-        mega::checked_int(num_ranks), mega::checked_int(num_experts),
-        mega::checked_int(num_max_tokens_per_rank), mega::checked_int(num_topk),
-        mega::checked_int(hidden), mega::checked_int(intermediate_hidden),
-        mma_type, activation, mega::checked_int(num_shared_experts));
+    return mega_moe::inference::get_symm_buffer_size_for_mega_moe(
+        mega_moe::inference::checked_int(num_ranks), mega_moe::inference::checked_int(num_experts),
+        mega_moe::inference::checked_int(num_max_tokens_per_rank), mega_moe::inference::checked_int(num_topk),
+        mega_moe::inference::checked_int(hidden), mega_moe::inference::checked_int(intermediate_hidden),
+        mma_type, activation, mega_moe::inference::checked_int(num_shared_experts));
 }
-static mega::SymmBufferSlice _slice_symm_buffer_for_mega_moe(
+static mega_moe::inference::SymmBufferSlice _slice_symm_buffer_for_mega_moe(
     const torch::stable::Tensor& buffer,
     const std::vector<int64_t>& layout_info) {
-    return mega::slice_symm_buffer_from_layout(
-        buffer, mega::SymmBufferLayoutInfo::from_int_list(layout_info));
+    return mega_moe::inference::slice_symm_buffer_from_layout(
+        buffer, mega_moe::inference::SymmBufferLayoutInfo::from_int_list(layout_info));
 }
 } // namespace deep_gemm::torch_registration
 
@@ -996,7 +1060,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts) -> (int, int[])");
     m.def("_slice_symm_buffer_for_mega_moe(Tensor(a) buffer, int[] layout_info) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
 
-    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, int? num_tokens_for_block_m) -> ()");
+    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, int? num_tokens_for_block_m, Tensor? rms_weights, float? rms_eps) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
     m.def("bf16_mega_moe_trtllm(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
     m.def("fp4_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");

@@ -257,6 +257,10 @@ def run(local_rank, local_world, args):
                     fn()
                     native_nv.assert_called_once()
                     native_mx.assert_not_called()
+                # The NVFP4 buffer is a shared symmetric buffer: views created with `base=` alias its allocation
+                assert isinstance(buf, deep_gemm.SymmetricBuffer)
+                alias = deep_gemm.NVFP4SymmBuffer(*buffer_args, base=buf, shared_dtype=buf.shared_dtype)
+                assert alias.buffer.data_ptr() == buf.buffer.data_ptr() and alias.x.data_ptr() == buf.x.data_ptr()
             else:
                 bad_calls.append(lambda: deep_gemm.nvfp4_mega_moe(y, *transformed, buf))
             for call in bad_calls:
@@ -317,11 +321,13 @@ def run(local_rank, local_world, args):
         'gpu_processes_at_end': gpu_process_snapshot() if local_rank == 0 else None,
     })
     if rank == 0 and args.output:
-        impl = 'nvfp4' if nv else 'fp8_fp4'
-        source_paths = ('csrc/jit_kernels/heuristics/mega_moe.hpp', 'csrc/apis/mega_moe.hpp',
-                        f'csrc/jit_kernels/impls/sm100_{impl}_mega_moe.hpp',
-                        f'deep_gemm/include/deep_gemm/impls/sm100_{impl}_mega_moe.cuh',
-                        'deep_gemm/include/deep_gemm/layout/mega_moe.cuh',
+        impl = 'nvfp4_mega_moe' if nv else 'fp8_fp4_mega_moe_inference'
+        source_paths = ('csrc/jit_kernels/heuristics/mega_moe.hpp', 'csrc/jit_kernels/heuristics/mega_moe_inference.hpp',
+                        'csrc/apis/mega_moe_inference.hpp',
+                        f'csrc/jit_kernels/impls/sm100_{impl}.hpp',
+                        f'deep_gemm/include/deep_gemm/impls/sm100_{impl}.cuh',
+                        'deep_gemm/include/deep_gemm/layout/mega_moe_inference.cuh',
+                        'deep_gemm/include/deep_gemm/scheduler/mega_moe/inference.cuh',
                         'deep_gemm/include/deep_gemm/ptx/tcgen05.cuh',
                         'tests/test_nvfp4_mega_moe.py')
         if nv:
@@ -329,7 +335,7 @@ def run(local_rank, local_world, args):
                              'csrc/jit_kernels/heuristics/nvfp4_mega_moe.hpp',
                              'deep_gemm/include/deep_gemm/layout/nvfp4_mega_moe.cuh',
                              'deep_gemm/include/deep_gemm/ptx/nvfp4.cuh',
-                             'deep_gemm/mega/nvfp4.py', 'deep_gemm/utils/nvfp4.py')
+                             'deep_gemm/mega_moe/nvfp4.py', 'deep_gemm/utils/nvfp4.py')
         payload = {'config': vars(args), 'gpu': torch.cuda.get_device_name(), 'sm_count': torch.cuda.get_device_properties(0).multi_processor_count,
                    'torch': torch.__version__, 'cuda': torch.version.cuda,
                    'started_utc': started_utc, 'completed_utc': datetime.now(timezone.utc).isoformat(),

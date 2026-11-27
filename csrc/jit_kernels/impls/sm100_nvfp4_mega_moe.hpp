@@ -6,6 +6,7 @@
 
 #include "../../utils/torch_compat.hpp"
 
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/layout/nvfp4_mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
@@ -167,6 +168,35 @@ static void sm100_nvfp4_mega_moe(
         1, 0, 0, false,
         config.block_k / 128) : tensor_map_l2_weights_sf;
 
+    // Partial activation maps follow the `BlockPhase` order (L1, L2, shared L1, shared L2); full blocks keep the maps above
+    auto partial_act_maps = layout::inference::MegaMoEPartialActMaps();
+    constexpr auto kRowStep = static_cast<int>(layout::inference::MegaMoEPartialActMaps::kRowStep);
+    for (int row_idx = 1; row_idx * kRowStep < config.load_block_m; ++ row_idx) {
+        const int num_rows = row_idx * kRowStep;
+        partial_act_maps.maps[0][row_idx - 1] = make_tma_2d_desc(
+            l1_acts, hidden, config.num_ring_tokens,
+            config.block_k, num_rows,
+            static_cast<int>(l1_acts.stride(-2)),
+            config.block_k / 2, 0, false, false);
+        partial_act_maps.maps[1][row_idx - 1] = make_tma_2d_desc(
+            l2_acts, intermediate_hidden, config.num_ring_tokens,
+            config.block_k, num_rows,
+            static_cast<int>(l2_acts.stride(-2)),
+            config.block_k / 2, 0, false, false);
+        if (num_shared_experts > 0) {
+            partial_act_maps.maps[2][row_idx - 1] = make_tma_2d_desc(
+                shared_l1_acts, hidden, num_max_tokens_per_rank,
+                shared_block_k, num_rows,
+                static_cast<int>(shared_l1_acts.stride(-2)),
+                config.swizzle_acts_mode);
+            partial_act_maps.maps[3][row_idx - 1] = make_tma_2d_desc(
+                shared_l2_acts, shared_intermediate_hidden, num_max_tokens_per_rank,
+                shared_block_k, num_rows,
+                static_cast<int>(shared_l2_acts.stride(-2)),
+                config.swizzle_acts_mode);
+        }
+    }
+
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
@@ -261,7 +291,8 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_acts,
         tensor_map_shared_l2_acts_sf,
         tensor_map_shared_l2_weights,
-        tensor_map_shared_l2_weights_sf);
+        tensor_map_shared_l2_weights_sf,
+        partial_act_maps);
 }
 
 } // namespace deep_gemm

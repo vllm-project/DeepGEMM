@@ -32,11 +32,11 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t, typename epilogue_operator_t,
-          uint64_t kTensorCoreUtilControl>
+          uint64_t kTensorCoreUtilControl, uint32_t kNumTMAStoreStages>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_gemm_impl(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                     const __grid_constant__ epilogue_operator_t epilogue_operator,
+                     const __grid_constant__ EpilogueOperatorArgs epilogue_args,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
@@ -54,10 +54,6 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
-
-    // The host launches the epilogue operator directly as a kernel argument
-    DG_STATIC_ASSERT(sizeof(epilogue_operator_t) == sizeof(EpilogueOperatorArgs),
-                     "Epilogue operators must not add state to `EpilogueOperatorArgs`");
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
@@ -79,7 +75,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     // Epilogue configs
     // Always enable pipeline for better performance
     constexpr uint32_t kNumEpilogueStages = 2;
-    constexpr uint32_t kNumTMAStoreStages = 2;
+    DG_STATIC_ASSERT(kNumTMAStoreStages == 1 or kNumTMAStoreStages == 2, "Invalid number of TMA store stages");
     // NOTES: To maximize epilogue threads utilization, process an entire BLOCK_N
     //        per store stage for swap-AB cases, and an entire BLOCK_M for non-swap cases
     constexpr uint32_t STORE_BLOCK_M =        kSwapAB ? 16      : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
@@ -102,6 +98,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto lane_idx = ptx::get_lane_idx();
+    const auto epilogue_warp_idx = warp_idx - kNumNonEpilogueThreads / 32;
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -157,6 +154,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     // NOTES: BF16 has no SF, so `kSFKSpan` is unused here; pass `kKAlignment` explicitly to avoid relying on the default.
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kKAlignment>(
         shape_m, shape_n, shape_k, grouped_layout);
+    typename epilogue::operators::OperatorForBlock<epilogue_operator_t, BLOCK_N>::type epilogue_operator(epilogue_args);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0, tensor_core_phase = 0;
@@ -350,9 +348,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
             smem.tmem_empty_barriers[iter_idx % kNumEpilogueStages].wait(accum_phase_idx);
         }
-    } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
+    } else if (epilogue_warp_idx < kNumUMMAStoreThreads / 32) {
         // Epilogue warp groups
-        const auto epilogue_warp_idx = warp_idx - (kNumNonEpilogueThreads / 32);
+        epilogue_operator.template init<kSwapAB, false>(scheduler, scheduler.num_blocks * kNumGroups,
+                                                       epilogue_warp_idx * 32 + lane_idx);
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
@@ -368,6 +367,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
 
             // Wait UMMA arrival
+            epilogue_operator.template prefetch<kSwapAB, false>(scheduler);
             smem.tmem_full_barriers[accum_stage_idx].wait(accum_phase_idx);
             ptx::tcgen05_after_thread_sync();
 
@@ -383,9 +383,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             if constexpr (kSwapAB) {
                 const auto effective_m = scheduler.get_aligned_effective_m_in_block(m_block_idx);
                 epilogue::sm100_store_cd_swap_ab<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
-                    kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
-                    0,
-                    kGemmType, kWithAccumulation>
+                                                 kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                                                 0,
+                                                 kGemmType, kWithAccumulation>
                 (smem, tma_stage_idx, tmem_base_addr,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  is_empty_group,
@@ -398,9 +398,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                  tensor_map_cd);
             } else {
                 epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
-                    kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
-                    0,
-                    kGemmType, kWithAccumulation>
+                                         kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                                         0,
+                                         kGemmType, kWithAccumulation>
                 (smem, tma_stage_idx, tmem_base_addr,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  is_empty_group,
@@ -420,6 +420,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     // Deallocate tensor memory
     if (warp_idx == 0)
         Allocator().free(0, kNumTmemCols);
+
+    // Finalize the epilogue while the other warp deallocates tensor memory.
+    if (epilogue_warp_idx < kNumUMMAStoreThreads / 32)
+        epilogue_operator.finalize();
 
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
