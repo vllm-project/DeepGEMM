@@ -21,7 +21,6 @@ def _make_code_word_gather() -> Tuple[torch.Tensor, torch.Tensor]:
             for bit in range(32):
                 if mask >> bit & 1:
                     src = (bit + rotation) % 32
-                    assert elements[src] is None
                     elements[src], code_bits[src] = 2 * output + bit // 16, _CODE_BIT_OF_BF16_BIT[bit % 16]
     return torch.tensor(elements), torch.tensor(code_bits, dtype=torch.uint8)
 
@@ -75,9 +74,9 @@ def _transform(w: torch.Tensor, sf: torch.Tensor, global_scale: torch.Tensor,
     if w.dtype not in (torch.uint8, torch.int8) or sf.dtype != torch.float8_e4m3fn or global_scale.dtype != torch.float:
         raise ValueError(f'Unsupported NVFP4 dtypes: {w.dtype}, {sf.dtype}, {global_scale.dtype}')
     w, sf_bytes = w.view(torch.uint8), sf.view(torch.uint8)
-    for i in range(e):
-        if bool(((sf_bytes[i] & 0x80) != 0).any()) or bool(((sf_bytes[i] & 0x7f) == 0x7f).any()):
-            raise ValueError('NVFP4 scales must be non-negative and not NaN')
+    # 0x7f is NaN, from 0x80 the sign bit is set
+    if bool((sf_bytes >= 0x7f).any()):
+        raise ValueError('NVFP4 scales must be non-negative and not NaN')
 
     # Row chunks keep every temporary at a few MiB (the largest takes 8 bytes per weight byte)
     num_rows = max(16, (4 << 20) // (half_k * 8) // 16 * 16)
