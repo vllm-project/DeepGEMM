@@ -37,7 +37,7 @@ static void sm90_fp8_fp4_mega_moe(
     const float& activation_beta,
     const bool& fast_math,
     const bool& routed_fp8,
-    const MegaMoEActivation& activation = MegaMoEActivation::SwiGLU,
+    const MegaMoEActivation& activation = MegaMoEActivation::kSwiGLU,
     const std::optional<std::pair<torch::stable::Tensor, torch::stable::Tensor>>& nvfp4_global_scales = std::nullopt
 ) {
     const bool routed_nvfp4 = nvfp4_global_scales.has_value();
@@ -178,7 +178,7 @@ static void __instantiate_kernel() {{
         config.num_bytes_per_pull,
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
-        activation == MegaMoEActivation::SiTU ? "MegaMoEActivation::SiTU" : "MegaMoEActivation::SwiGLU",
+        activation == MegaMoEActivation::kSiTU ? "MegaMoEActivation::kSiTU" : "MegaMoEActivation::kSwiGLU",
         to_string(activation_clamp),
         clamp_after_silu ? "true" : "false",
         to_string(activation_alpha),

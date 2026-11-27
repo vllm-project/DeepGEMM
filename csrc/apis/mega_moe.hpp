@@ -569,7 +569,7 @@ static void bf16_nvfp4_mega_moe(
                           hidden, intermediate_hidden,
                           std::numeric_limits<float>::infinity(), false, activation_alpha, activation_beta, false,
                           false,
-                          activation == "situ" ? MegaMoEActivation::SiTU : MegaMoEActivation::SwiGLU,
+                          activation == "situ" ? MegaMoEActivation::kSiTU : MegaMoEActivation::kSwiGLU,
                           std::make_pair(l1_global_scales, l2_global_scales));
 
     // Zero the entire symmetric buffer for debug mode

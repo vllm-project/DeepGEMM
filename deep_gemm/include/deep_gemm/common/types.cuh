@@ -4,9 +4,9 @@
 
 namespace deep_gemm {
 
-enum class MegaMoEActivation {
-    SwiGLU  = 0,
-    SiTU    = 1,
+enum class MegaMoEActivation : uint32_t {
+    kSwiGLU,
+    kSiTU,
 };
 
 enum class MmaKind {

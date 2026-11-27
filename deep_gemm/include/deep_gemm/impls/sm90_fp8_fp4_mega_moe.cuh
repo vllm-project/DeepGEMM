@@ -197,8 +197,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                 (kPingPong ? BLOCK_M <= 32 : BLOCK_M <= 64 and BLOCK_N == 192)), "Invalid number of math threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(not kRoutedNVFP4 or (not kRoutedFP8 and not kHasShared), "NVFP4 routed weights have no FP8 or shared expert variant");
-    DG_STATIC_ASSERT(kActivation == MegaMoEActivation::SwiGLU or kRoutedNVFP4, "SiTU needs NVFP4 routed weights");
-    DG_STATIC_ASSERT(kActivation == MegaMoEActivation::SwiGLU or (kActivationClamp == cute::numeric_limits<float>::infinity() and not kClampAfterSilu),
+    DG_STATIC_ASSERT(kActivation == MegaMoEActivation::kSwiGLU or kRoutedNVFP4, "SiTU needs NVFP4 routed weights");
+    DG_STATIC_ASSERT(kActivation == MegaMoEActivation::kSwiGLU or (kActivationClamp == cute::numeric_limits<float>::infinity() and not kClampAfterSilu),
                      "SiTU does not support activation clamping");
 
     // Thread indices
@@ -1382,7 +1382,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 const auto apply_swiglu = [&](const float2& gate_accum, const float2& up_accum, const float2& weights) {
                     auto bf16_gate = __float22bfloat162_rn(gate_accum);
                     auto bf16_up = __float22bfloat162_rn(up_accum);
-                    if constexpr (kActivation == MegaMoEActivation::SiTU) {
+                    if constexpr (kActivation == MegaMoEActivation::kSiTU) {
                         const auto gate = __bfloat1622float2(bf16_gate), up = __bfloat1622float2(bf16_up);
                         return float2{situ<kActivationAlpha, kActivationBeta>(gate.x, up.x, weights.x),
                                       situ<kActivationAlpha, kActivationBeta>(gate.y, up.y, weights.y)};
