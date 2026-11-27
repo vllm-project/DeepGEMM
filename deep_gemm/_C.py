@@ -542,6 +542,46 @@ def fp8_fp4_mega_moe(
     )
 
 
+def bf16_nvfp4_mega_moe(
+    y,
+    l1_weights_tuple,
+    l2_weights_tuple,
+    l1_global_scales,
+    l2_global_scales,
+    cumulative_local_expert_recv_stats,
+    sym_buffer,
+    sym_buffer_ptrs,
+    rank_idx,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    activation,
+    activation_alpha,
+    activation_beta,
+    num_tokens_for_block_m=None,
+):
+    return _torch_ops.bf16_nvfp4_mega_moe(
+        y,
+        l1_weights_tuple[0],
+        l1_weights_tuple[1],
+        l2_weights_tuple[0],
+        l2_weights_tuple[1],
+        l1_global_scales,
+        l2_global_scales,
+        cumulative_local_expert_recv_stats,
+        sym_buffer,
+        sym_buffer_ptrs,
+        rank_idx,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        activation,
+        activation_alpha,
+        activation_beta,
+        num_tokens_for_block_m,
+    )
+
+
 def bf16_mega_moe(
     y,
     l1_weights,
@@ -912,6 +952,7 @@ _PUBLIC_API = [
     'get_block_m_for_mega_moe',
     'get_symm_buffer_size_for_mega_moe',
     'fp8_fp4_mega_moe', 'bf16_mega_moe', 'bf16_mega_moe_trtllm', 'fp4_fp4_mega_moe',
+    'bf16_nvfp4_mega_moe',
     'get_token_alignment_for_nvfp4_mega_moe',
     'get_block_m_for_nvfp4_mega_moe',
     'get_symm_buffer_size_for_nvfp4_mega_moe',

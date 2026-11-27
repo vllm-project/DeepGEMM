@@ -57,15 +57,15 @@ CUTLASS_HOST_DEVICE constexpr int get_num_max_live_pool_blocks(
     const int& num_sms,
     const int& hidden,
     const int& intermediate_hidden,
-    const int& num_task_group_m_blocks = 1) {
-    constexpr int kMegaMoEBlockN = 128;
+    const int& num_task_group_m_blocks = 1,
+    const int& block_n = 128) {
     constexpr int kNumCTAsPerCluster = 2;
 
-    DG_UNIFIED_ASSERT((intermediate_hidden * 2) % (kNumCTAsPerCluster * kMegaMoEBlockN) == 0);
-    DG_UNIFIED_ASSERT(hidden % (kNumCTAsPerCluster * kMegaMoEBlockN) == 0);
+    DG_UNIFIED_ASSERT((intermediate_hidden * 2) % (kNumCTAsPerCluster * block_n) == 0);
+    DG_UNIFIED_ASSERT(hidden % (kNumCTAsPerCluster * block_n) == 0);
     const int num_clusters = num_sms / kNumCTAsPerCluster;
-    const int num_l1_n_clusters = intermediate_hidden * 2 / (kNumCTAsPerCluster * kMegaMoEBlockN);
-    const int num_l2_n_clusters = hidden / (kNumCTAsPerCluster * kMegaMoEBlockN);
+    const int num_l1_n_clusters = intermediate_hidden * 2 / (kNumCTAsPerCluster * block_n);
+    const int num_l2_n_clusters = hidden / (kNumCTAsPerCluster * block_n);
     const int num_l1_clusters = num_total_m_blocks * num_l1_n_clusters;
     const int num_l1_waves = math::constexpr_ceil_div(num_l1_clusters, num_clusters);
     const int num_min_l1_warmup_waves = get_num_l1_warmup_waves(
@@ -185,6 +185,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           bool kDecodeShaped = false,
           bool kPingPong = false,
           uint32_t kNumTaskGroupMBlocks = 1,
+          uint32_t kNumScheduleStages = 2,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -217,7 +218,7 @@ struct MegaMoEScheduler {
 
     // Scheduler configs
     // With ping-pong, each math warpgroup has its own schedule stage, and `sched_phase` holds one phase bit per stage
-    static constexpr uint32_t kNumScheduleStages = 2;
+    DG_STATIC_ASSERT(kNumScheduleStages == 2 or (kPingPong and kNumScheduleStages <= 32), "Invalid schedule stages");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     uint32_t sched_stage_idx = 0;
     uint32_t sched_phase = 0;
@@ -258,7 +259,6 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE void advance_sched_pipeline() {
-        DG_STATIC_ASSERT(kNumScheduleStages == 2, "Invalid stages");
         if constexpr (kPingPong) {
             sched_phase ^= 1u << sched_stage_idx;
         } else {
@@ -275,9 +275,9 @@ struct MegaMoEScheduler {
     // Wait for an empty schedule stage: the next one in order, or with ping-pong the first released one
     CUTLASS_DEVICE void wait_empty_sched_stage() {
         if constexpr (kPingPong) {
-            // Probe the other stage first, and choose with lane 0's observation so that the warp agrees
+            // Probe the other stages in turn, and choose with lane 0's observation so that the warp agrees
             do {
-                sched_stage_idx ^= 1;
+                sched_stage_idx = kNumScheduleStages == 2 ? sched_stage_idx ^ 1 : (sched_stage_idx + 1) % kNumScheduleStages;
             } while (not __shfl_sync(0xffffffff, task_info_empty_barriers[sched_stage_idx].test_wait(get_sched_phase() ^ 1), 0));
         }
         task_info_empty_barriers[sched_stage_idx].wait(get_sched_phase() ^ 1);
@@ -315,6 +315,33 @@ struct MegaMoEScheduler {
                 num_blocks += math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
         }
         return __reduce_add_sync(0xffffffff, num_blocks);
+    }
+
+    // The expert of the `token_idx`-th received token (in expert order), its token range and pool block offset, by one warp-wide scan;
+    // `expert_idx` is `kNumExpertsPerRank` past the last token
+    CUTLASS_DEVICE void find_expert_of_token(const uint32_t& token_idx, int& expert_idx, uint32_t& start_idx, uint32_t& end_idx,
+                                             uint32_t& pool_block_offset) const {
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        uint32_t token_offset = 0, block_offset = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const uint32_t num_tokens = stored_num_tokens_per_expert[i];
+            const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
+            const uint32_t inclusive_num_tokens = math::warp_inclusive_sum(num_tokens, lane_idx);
+            const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
+            const uint32_t owner_mask = __ballot_sync(0xffffffff, token_idx < token_offset + inclusive_num_tokens);
+            if (owner_mask) {
+                const uint32_t owner_lane_idx = static_cast<uint32_t>(__ffs(owner_mask) - 1);
+                expert_idx = static_cast<int>(i * 32 + owner_lane_idx);
+                end_idx = token_offset + ptx::exchange(inclusive_num_tokens, owner_lane_idx);
+                start_idx = end_idx - ptx::exchange(num_tokens, owner_lane_idx);
+                pool_block_offset = block_offset + ptx::exchange(inclusive_num_m_blocks - num_m_blocks, owner_lane_idx);
+                return;
+            }
+            token_offset += ptx::exchange(inclusive_num_tokens, 31);
+            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
+        }
+        expert_idx = static_cast<int>(kNumExpertsPerRank);
     }
 
     CUTLASS_DEVICE uint32_t get_num_total_pool_blocks() const {

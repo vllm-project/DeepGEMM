@@ -20,6 +20,9 @@ static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 1920;
 
+// SM90 NVFP4 loads and stores the tokens of a block in TMA boxes of 16 rows, only those holding valid tokens
+static constexpr uint32_t kNumSM90NVFP4TokenGroupRows = 16;
+
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_tokens_per_rank, T num_topk,

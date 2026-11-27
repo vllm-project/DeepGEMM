@@ -4,6 +4,11 @@
 
 namespace deep_gemm {
 
+enum class MegaMoEActivation : uint32_t {
+    kSwiGLU,
+    kSiTU,
+};
+
 enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,

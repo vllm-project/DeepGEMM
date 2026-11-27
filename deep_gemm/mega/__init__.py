@@ -13,6 +13,7 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+from .nvfp4_sm90 import transform_nvfp4_weights_for_sm90_mega_moe
 
 
 _SUPPORTED_ACTIVATIONS = ('swiglu', 'swiglustep', 'situ')
@@ -327,6 +328,33 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         activation_alpha, activation_beta,
+        num_tokens_for_block_m
+    )
+
+def bf16_nvfp4_mega_moe(y: torch.Tensor,
+                        l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                        l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                        sym_buffer: SymmBuffer,
+                        l1_global_scales: torch.Tensor,
+                        l2_global_scales: torch.Tensor,
+                        activation: str = 'swiglu',
+                        activation_alpha: float = 1.0,
+                        activation_beta: float = 0.0,
+                        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                        num_tokens_for_block_m: Optional[int] = None):
+    """SM90 NVFP4 routed experts with BF16 tokens (`mma_type='bf16xnvfp4'` buffer), weights and scales from
+    `transform_nvfp4_weights_for_sm90_mega_moe`. SiTU takes the gate and up softcaps (0 for none) as `activation_alpha` and `activation_beta`."""
+    _C.bf16_nvfp4_mega_moe(
+        y,
+        tuple(t.view(dtype) for t, dtype in zip(l1_weights, (torch.int8, torch.int32))),
+        tuple(t.view(dtype) for t, dtype in zip(l2_weights, (torch.int8, torch.int32))),
+        l1_global_scales, l2_global_scales,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        activation, activation_alpha, activation_beta,
         num_tokens_for_block_m
     )
 
