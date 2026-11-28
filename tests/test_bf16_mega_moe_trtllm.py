@@ -48,14 +48,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_experts_per_rank = num_experts // num_ranks
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
 
-    buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    buffer = deep_gemm.get_symm_buffer_for_mega_moe_inference(
         group, num_experts, num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden, mma_type='bf16xbf16')
+        hidden, intermediate_hidden, mma_type='bf16xbf16', activation=args.activation)
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: bf16xbf16, native vs TRT-LLM weight layout', once_in_node=True)
     dist_print(f' > Hidden: {hidden}, intermediate: {intermediate_hidden}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}, max tokens per rank: {num_max_tokens_per_rank}', once_in_node=True)
+    dist_print(f' > Activation: {args.activation}, clamp: {args.activation_clamp}, '
+               f'alpha: {args.activation_alpha}, beta: {args.activation_beta}', once_in_node=True)
     dist_print(f' > Post-expert norm: {bool(args.post_expert_norm)}', once_in_node=True)
     dist_print(once_in_node=True)
 
@@ -63,12 +65,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                              dtype=torch.bfloat16, device='cuda') / hidden ** 0.5
     l2_weights = torch.randn((num_experts_per_rank, hidden, intermediate_hidden),
                              dtype=torch.bfloat16, device='cuda') / intermediate_hidden ** 0.5
-    native_l1, native_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights.clone(), l2_weights.clone())
+    native_l1, native_l2 = deep_gemm.transform_weights_for_mega_moe_inference(
+        l1_weights.clone(), l2_weights.clone(), activation=args.activation)
     trtllm_l1 = _to_trtllm_block_layout(l1_weights, is_l1=True)
     trtllm_l2 = _to_trtllm_block_layout(l2_weights, is_l1=False)
     norm_kwargs = dict(
         post_expert_norm_gamma=1.0 + 0.1 * torch.randn((hidden, ), dtype=torch.float, device='cuda'),
         post_expert_norm_eps=1e-8) if args.post_expert_norm else {}
+    activation_kwargs = dict(
+        activation=args.activation, activation_clamp=args.activation_clamp,
+        activation_alpha=args.activation_alpha, activation_beta=args.activation_beta)
 
     # Each case uses new tokens and routing, so the previous launch's ring
     # contents cannot hide rows that the kernel failed to write
@@ -89,7 +95,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             buffer.topk_idx[:num_tokens].copy_(topk_idx)
             buffer.topk_weights[:num_tokens].copy_(topk_weights)
             y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-            deep_gemm.bf16_mega_moe(y, l1, l2, buffer, weight_layout=layout, **norm_kwargs)
+            deep_gemm.bf16_mega_moe_inference(y, l1, l2, buffer, weight_layout=layout, **activation_kwargs, **norm_kwargs)
             outputs[layout] = y
 
         equal = torch.tensor([int(torch.equal(outputs['native'], outputs['trtllm']))], device='cuda')
@@ -116,5 +122,9 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=8, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--post-expert-norm', type=int, default=1, help='Fuse the post-expert RMSNorm (0 or 1)')
+    parser.add_argument('--activation', type=str, default='swiglu', choices=('swiglu', 'swiglustep'), help='Activation')
+    parser.add_argument('--activation-clamp', type=float, default=None, help='Activation clamp (none if unset)')
+    parser.add_argument('--activation-alpha', type=float, default=1.0, help='SwiGLU alpha')
+    parser.add_argument('--activation-beta', type=float, default=0.0, help='SwiGLU beta')
     args = parser.parse_args()
     torch.multiprocessing.spawn(test, args=(args.num_processes, args), nprocs=args.num_processes)

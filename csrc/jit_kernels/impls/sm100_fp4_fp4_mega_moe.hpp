@@ -4,12 +4,12 @@
 #include <torch/csrc/stable/ops.h>
 #include "../../utils/torch_compat.hpp"
 
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../heuristics/mega_moe.hpp"
+#include "../heuristics/mega_moe_inference.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -104,13 +104,11 @@ static void sm100_fp4_fp4_mega_moe(
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Heuristics
-    const auto config = get_mega_moe_config(
+    const auto config = get_mega_moe_inference_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
         MmaKind::NVFP4);
-    // The NVFP4 kernel has a single store block size for both layers
-    DG_HOST_ASSERT(config.store_block_m_l1 == config.store_block_m_l2);
     if constexpr (use_trtllm_weights) {
         // The shuffled TMA boxes and L1 output packing below use exactly 128 rows.
         DG_HOST_ASSERT(num_shared_experts == 0);
@@ -156,7 +154,7 @@ static void sm100_fp4_fp4_mega_moe(
     // bytes per input tile); the store box is small, so no swizzling is applied
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden / 2, config.num_ring_tokens,
-                                                       config.block_n / 4, config.store_block_m_l1,
+                                                       config.block_n / 4, config.store_block_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
                                                        0);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
@@ -203,7 +201,7 @@ static void sm100_fp4_fp4_mega_moe(
     const auto tensor_map_shared_l1_output = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
         shared_intermediate_hidden, num_max_tokens_per_rank,
-        config.block_n / 2, config.store_block_m_l1,
+        config.block_n / 2, config.store_block_m,
         static_cast<int>(shared_l2_acts.stride(-2)),
         config.swizzle_acts_mode) : tensor_map_l1_output;
     const auto tensor_map_shared_l2_acts = num_shared_experts > 0 ? make_tma_2d_desc(
@@ -219,12 +217,34 @@ static void sm100_fp4_fp4_mega_moe(
         static_cast<int>(shared_l2_weights.stride(-2)),
         config.swizzle_weights_mode) : tensor_map_l2_weights;
 
+    // Partial-row activation maps, indexed by `BlockPhase - 1` and the row count in `kRowStep` units.
+    // Each keeps its full map's tensor, K box and swizzle; only the box rows shrink
+    // NOTES: the caller's BF16 `x` keeps its real row count, so TMA still zero-fills its last block
+    auto partial_act_maps = layout::inference::MegaMoEPartialActMaps();
+    constexpr auto kRowStep = layout::inference::MegaMoEPartialActMaps::kRowStep;
+    const auto make_partial_act_maps = [&](const int& phase_idx, const torch::stable::Tensor& t,
+                                           const int& inner_dim, const int& outer_dim, const int& block_k_elems) {
+        for (int row_idx = 1; row_idx * static_cast<int>(kRowStep) < config.load_block_m; ++ row_idx) {
+            partial_act_maps.maps[phase_idx][row_idx - 1] = make_tma_2d_desc(
+                t, inner_dim, outer_dim,
+                block_k_elems, row_idx * static_cast<int>(kRowStep),
+                static_cast<int>(t.stride(-2)),
+                config.swizzle_acts_mode);
+        }
+    };
+    make_partial_act_maps(0, l1_acts, hidden / 2, config.num_ring_tokens, block_k_bytes);
+    make_partial_act_maps(1, l2_acts, intermediate_hidden / 2, config.num_ring_tokens, block_k_bytes);
+    if (num_shared_experts > 0) {
+        make_partial_act_maps(2, shared_l1_acts, hidden, static_cast<int>(shared_l1_acts.size(0)), shared_block_k);
+        make_partial_act_maps(3, shared_l2_acts, shared_intermediate_hidden, num_max_tokens_per_rank, shared_block_k);
+    }
+
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->mutable_data_ptr<int>();
 
-    const auto num_sms = get_num_sms_for_mega_moe();
+    const auto num_sms = get_num_sms_for_mega_moe_inference();
 
     // Compile
     const auto kernel = jit->compile("sm100_fp4_fp4_mega_moe", std::format(R"(
@@ -244,7 +264,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
+        {}, {},
         {}, {}, {},
         {}, {},
         {},
@@ -258,12 +278,12 @@ static void __instantiate_kernel() {{
         num_experts, num_shared_experts,
         num_topk,
         config.block_m, config.block_n, config.block_k,
-        config.store_block_m_l1,
+        config.store_block_m,
         config.sf_block_m, config.sf_block_n,
         config.num_ring_tokens,
         config.num_sf_ring_tokens,
         config.num_stages,
-        config.num_bytes_per_pull,
+        config.num_bytes_per_pull, config.num_pull_tokens,
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
         to_string(activation_clamp),
@@ -299,6 +319,7 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l1_output,
         tensor_map_shared_l2_acts,
         tensor_map_shared_l2_weights,
+        partial_act_maps,
         sm_locality_domains.mutable_data_ptr<uint8_t>());
 }
 

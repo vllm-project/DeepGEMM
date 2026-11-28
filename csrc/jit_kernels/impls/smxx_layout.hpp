@@ -27,10 +27,10 @@ static torch::stable::Tensor deep_gemm_arange_int64(int64_t end, torch::stable::
     constexpr int max_blocks = 4096;
     const auto required_blocks = 1 + (end - 1) / threads_per_block;
     const auto blocks = static_cast<unsigned int>(std::min<int64_t>(required_blocks, max_blocks));
-    const auto kernel = jit->compile("deep_gemm_arange_int64", R"(
+    const auto kernel = jit->compile("arange_int64", R"(
 #include <cstdint>
 
-extern "C" __global__ void deep_gemm_arange_int64_kernel(std::int64_t* output, std::int64_t end) {
+extern "C" __global__ void dg_arange_int64_kernel(std::int64_t* output, std::int64_t end) {
     const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = index; i < end; i += stride)

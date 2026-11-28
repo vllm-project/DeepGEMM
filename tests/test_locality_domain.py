@@ -155,7 +155,7 @@ def test_without_mlopart() -> None:
         result = subprocess.run([sys.executable, '-c', script], env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}'}, stderr=subprocess.PIPE, text=True)
     assert result.returncode == 0, result.stderr
     assert 'Traceback' not in result.stderr, result.stderr
-    assert 'MLOPartUnavailable' not in result.stderr, result.stderr
+    assert '1 MLOPart devices' in result.stderr, result.stderr
     print(' > detected, `localize` refused, SM table available')
     print()
 

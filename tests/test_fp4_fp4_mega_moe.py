@@ -11,6 +11,27 @@ from deep_gemm.utils.dist import dist_print, init_dist
 from deep_gemm.testing import bench_kineto, calc_diff
 
 
+def _get_num_signal_bytes(buffer) -> int:
+    # `MegaMoESignals` is followed by the pool's `TokenSrcMetadata` (12 bytes each), then
+    # the whole workspace is 16-byte aligned; the signal struct itself is 128-byte aligned
+    num_ranks = buffer.group.size()
+    num_experts_per_rank = buffer.num_experts // num_ranks
+    num_pool_tokens = num_ranks * buffer.num_max_tokens_per_rank * min(buffer.num_topk, num_experts_per_rank) + \
+                      num_experts_per_rank * (240 - 1)
+    num_pool_tokens = (num_pool_tokens + 1919) // 1920 * 1920
+    num_workspace_bytes = buffer.x.data_ptr() - buffer.buffer.data_ptr()
+    return (num_workspace_bytes - num_pool_tokens * 12) // 128 * 128
+
+
+def _check_signals_clean(buffer, rank_idx: int):
+    # Every view of a shared allocation relies on all signals (past the persistent
+    # grid-sync/NVLink barrier counters) being zero again once a launch has finished
+    num_barrier_bytes = 28
+    signals = buffer.buffer[num_barrier_bytes:_get_num_signal_bytes(buffer)]
+    num_dirty = signals.count_nonzero().item()
+    assert num_dirty == 0, f'Rank {rank_idx}: {num_dirty} signal bytes are not cleaned after the launch'
+
+
 def _quantize_weights_to_nvfp4(bf16_weights: torch.Tensor) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     # Cast per-expert weights into packed E2M1 with per-16-element E4M3 SF.
     # Returns `((packed_weights, mn_major_packed_sf), dequantized_weights)`
@@ -94,12 +115,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Allocate symmetric memory
     num_shared_experts = args.num_shared_experts
+    # Optionally alias a larger BF16 allocation, as vLLM's Muse Spark shares one buffer between both views
+    base_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+        group, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        num_shared_experts=num_shared_experts,
+        mma_type='bf16xbf16'
+    ) if args.share_bf16_base else None
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
-        mma_type='fp4xfp4'
+        mma_type='fp4xfp4',
+        base=base_buffer
     )
 
     dist_print('Config:', once_in_node=True)
@@ -110,7 +140,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
     dist_print(f' > Alphas: {"per-expert" if args.per_expert_alphas else "none"}', once_in_node=True)
     dist_print(f' > Shared experts: {num_shared_experts} (BF16)', once_in_node=True)
-    dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
+    dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB'
+               f'{" (shared with a BF16 view)" if base_buffer is not None else ""}', once_in_node=True)
     dist_print(once_in_node=True)
 
     # Create inputs
@@ -291,6 +322,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist_print(' > Done, exiting', once_in_node=True)
         dist.barrier()
         buffer.destroy()
+        if base_buffer is not None:
+            base_buffer.destroy()
         dist.destroy_process_group()
         return
 
@@ -319,19 +352,39 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 print(f'DBG rank {rank_idx}: token {t} bad cols {bad_cols.numel()}/{hidden}, '
                       f'first {bad_cols[:16].tolist()}', flush=True)
         assert diff < 1e-3, f'Rank {rank_idx}: diff {diff} is too large (max abs {max_abs_diff})'
+        torch.cuda.synchronize()
         dist.barrier()
+        _check_signals_clean(buffer, rank_idx)
         if i == 0:
             dist_print(f' > Output diff: {diff:.3e} (max abs diff: {max_abs_diff:.3e})')
 
-    # Check cumulative stats: `num_correctness_tests` accumulations over the initial values
-    expected_stats = cumulative_stats_initial + args.num_correctness_tests * num_recv_per_expert
+    # CUDA graph replays: no state may survive a launch
+    num_graph_replays = args.num_graph_replays
+    if num_graph_replays > 0:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            y_graph = run_fused()
+        dist.barrier()
+        for _ in range(num_graph_replays):
+            graph.replay()
+            diff = calc_diff(y_graph, y_ref)
+            assert diff < 1e-3, f'Rank {rank_idx}: CUDA graph replay diff {diff} is too large'
+            torch.cuda.synchronize()
+            dist.barrier()
+            _check_signals_clean(buffer, rank_idx)
+        del graph
+        dist_print(f' > {num_graph_replays} CUDA graph replays passed', once_in_node=True)
+
+    # Check cumulative stats: one accumulation per launch over the initial values
+    expected_stats = cumulative_stats_initial + (args.num_correctness_tests + num_graph_replays) * num_recv_per_expert
     assert torch.equal(cumulative_local_expert_recv_stats_fused, expected_stats), \
         f'Rank {rank_idx}: cumulative stats mismatch'
     dist_print(' > All correctness tests passed', once_in_node=True)
     dist_print(once_in_node=True)
 
     # Benchmark
-    t_fused = bench_kineto(run_fused, 'mega_moe', barrier=lambda: dist.barrier())
+    # A device-side all-reduce aligns the ranks' GPU timelines right before each timed launch
+    t_fused = bench_kineto(run_fused, 'mega_moe', barrier=lambda: dist.all_reduce(torch.empty(1, device='cuda')))
 
     # Count locally received tokens for FLOP statistics
     num_recv_tokens = num_recv_per_expert.sum().item()
@@ -343,6 +396,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Exit
     dist.barrier()
     buffer.destroy()
+    if base_buffer is not None:
+        base_buffer.destroy()
     dist.destroy_process_group()
 
 
@@ -373,9 +428,12 @@ if __name__ == '__main__':
                         help='Fuse per-expert RMSNorm before the top-k reduction (0 or 1)')
     parser.add_argument('--num-shared-experts', type=int, default=0,
                         help='Number of fused BF16 shared experts (0 disables)')
+    parser.add_argument('--share-bf16-base', type=int, default=0,
+                        help='Alias the FP4 x FP4 view onto a BF16 MegaMoE allocation, like vLLM (0 or 1)')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=4, help='Number of correctness test rounds')
+    parser.add_argument('--num-graph-replays', type=int, default=2, help='Number of CUDA graph replay checks (0 disables)')
     parser.add_argument('--ncu-profile-only', action='store_true', help='Only run profiling without correctness test')
     parser.add_argument('--local-rank-idx', type=int, default=None,
                         help='Run as a single process with this local rank (e.g. under NCU)')

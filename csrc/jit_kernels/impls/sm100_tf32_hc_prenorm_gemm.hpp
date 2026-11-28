@@ -34,8 +34,7 @@ static void sm100_tf32_hc_prenorm_gemm(const torch::stable::Tensor& a,
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
                                               block_m, block_k,
                                               static_cast<int>(a.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
-                                              get_swizzle_mode(block_k, a.element_size()), 0,
-                                              true);
+                                              get_swizzle_mode(block_k, a.element_size()));
     const auto tensor_map_b = make_tma_b_desc(cute::UMMA::Major::K, b, n, k,
                                               block_n, block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
@@ -45,16 +44,16 @@ static void sm100_tf32_hc_prenorm_gemm(const torch::stable::Tensor& a,
                                                                  block_m, block_n,
                                                                  static_cast<int>(d.stride(-2)), 1,
                                                                  swizzle_cd_mode)
-                                               : make_tma_3d_desc(d, n, m, num_splits,
-                                                                  block_n, block_m, 1,
-                                                                  static_cast<int>(d.stride(-2)),
-                                                                  static_cast<int>(d.stride(-3)),
-                                                                  swizzle_cd_mode);
+                                              : make_tma_3d_desc(d, n, m, num_splits,
+                                                                 block_n, block_m, 1,
+                                                                 static_cast<int>(d.stride(-2)),
+                                                                 static_cast<int>(d.stride(-3)),
+                                                                 swizzle_cd_mode);
 
     // Calculate stages
     int num_stages = 12, smem_size = 0;
     while (num_stages > 0) {
-        const int smem_a_per_stage = block_m * block_k * static_cast<int>(sizeof(nv_bfloat16));
+        const int smem_a_per_stage = block_m * block_k * static_cast<int>(a.element_size());
         const int smem_b_per_stage = block_n * block_k * static_cast<int>(sizeof(float));
         const int smem_cd = block_m * swizzle_cd_mode;
         const int smem_barriers = (num_stages * 4 + 1) * 8;
@@ -90,7 +89,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}, {}
+        {}, {},
+        {}
     >);
 }};
 )",
@@ -99,7 +99,8 @@ static void __instantiate_kernel() {{
         num_splits,
         swizzle_cd_mode,
         num_stages,
-        num_mma_threads, num_cast_and_reduce_threads));
+        num_mma_threads, num_cast_and_reduce_threads,
+        a.scalar_type() != torch::headeronly::ScalarType::BFloat16 ? to_string(a.scalar_type()) : "nv_bfloat16"));
 
     // Launch
     jit->launch(

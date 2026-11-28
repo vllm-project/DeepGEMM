@@ -11,8 +11,9 @@
 #include <vector>
 
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/layout/nvfp4_mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe/inference.cuh>
 
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_nvfp4_mega_moe.hpp"
@@ -27,7 +28,7 @@ static int checked_int(const int64_t value) {
 }
 
 static int get_token_alignment_for_nvfp4_mega_moe() {
-    return layout::kLCMCandidateBlockM;
+    return layout::inference::kLCMCandidateBlockM;
 }
 
 static int get_block_m_for_nvfp4_mega_moe(
@@ -111,13 +112,25 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_shared_experts = 0, const bool shared_bf16 = false) {
+    DG_HOST_ASSERT(num_ranks > 0 and num_ranks <= layout::kNumMaxRanks);
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
+    // Reject unsupported capacity before any size arithmetic; the layout itself checks the signal limits again
+    const auto num_experts_per_rank = num_experts / num_ranks;
+    DG_HOST_ASSERT(num_experts > 0 and num_experts <= layout::inference::MegaMoESignals::kNumMaxExperts);
+    DG_HOST_ASSERT(num_experts_per_rank <= layout::inference::MegaMoESignals::kNumMaxExpertsPerRank);
+    DG_HOST_ASSERT(num_max_tokens_per_rank >= 0 and num_max_tokens_per_rank <=
+                   layout::inference::MegaMoESignals::kNumMaxSharedL2Blocks * layout::inference::kMinCandidateBlockM);
+    DG_HOST_ASSERT(num_topk >= 0 and num_topk <= num_experts);
+    DG_HOST_ASSERT(intermediate_hidden > 0 and
+                   num_shared_experts <= std::numeric_limits<int>::max() / intermediate_hidden);
+    DG_HOST_ASSERT(hidden > 0 and hidden <= std::numeric_limits<int>::max() / 2);
+
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
+    // NOTES: dispatch pulls one token at a time, so the ring never needs to cover the complete pool
     // TODO: we temporarily assume the SM count is consistent with the runtime value
     const auto num_sms = runtime->get_num_sms();
-    const auto num_experts_per_rank = num_experts / num_ranks;
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
     const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
 
@@ -126,25 +139,29 @@ static SymmBufferLayoutInfo build_symm_buffer_layout(
 
     // Iterate all block candidates to get the maximum ring size
     int num_ring_tokens = 0;
-    for (const auto& block_m: layout::kCandidateBlockM) {
+    for (const auto& block_m: layout::inference::kCandidateBlockM) {
         const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+        const auto num_live_pool_blocks = mega_moe::inference::get_num_max_live_pool_blocks(
             num_pool_blocks, num_sms, hidden, intermediate_hidden);
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+    num_ring_tokens = math::align(num_ring_tokens, layout::inference::kLCMCandidateBlockM);
+
+    // Reject unsupported capacity before the SF expansion multiplies the ring size
+    DG_HOST_ASSERT(num_ring_tokens <=
+                   layout::inference::MegaMoESignals::kNumMaxRingBlocks * layout::inference::kMinCandidateBlockM);
 
     const bool shared_with_sf = not shared_bf16;
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
-    for (auto block_m: layout::kCandidateBlockM) {
+    for (auto block_m: layout::inference::kCandidateBlockM) {
         num_sf_ring_tokens = std::max(
             num_sf_ring_tokens,
-            layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+            layout::inference::get_num_sf_ring_tokens(num_ring_tokens, block_m));
     }
 
     // All buffers
-    const auto mega_buffer = layout::NVFP4MegaMoEBuffer(
+    const auto mega_buffer = layout::inference::NVFP4MegaMoEBuffer(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens,
@@ -229,8 +246,8 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
     auto shared_l1_acts_sf = (layout_info.shared_with_sf and layout_info.num_shared_experts > 0)
         ? torch::stable::from_blob(
             math::advance_ptr(buffer_data, layout_info.shared_l1_sf_base),
-            {layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.hidden / 128},
-            {1, layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)}, device,
+            {layout::inference::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.hidden / 128},
+            {1, layout::inference::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)}, device,
             torch::headeronly::ScalarType::Int) : torch::stable::Tensor();
     auto shared_l2_acts = layout_info.num_shared_experts > 0 ? torch_compat::from_blob(
         math::advance_ptr(buffer_data, layout_info.shared_l2_token_base),
@@ -240,8 +257,8 @@ static SymmBufferSlice slice_symm_buffer_from_layout(
     auto shared_l2_acts_sf = (layout_info.shared_with_sf and layout_info.num_shared_experts > 0)
         ? torch::stable::from_blob(
             math::advance_ptr(buffer_data, layout_info.shared_l2_sf_base),
-            {layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.shared_intermediate_hidden / 128},
-            {1, layout::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)}, device,
+            {layout::inference::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank), layout_info.shared_intermediate_hidden / 128},
+            {1, layout::inference::get_num_max_shared_sf_tokens(layout_info.num_max_tokens_per_rank)}, device,
             torch::headeronly::ScalarType::Int) : torch::stable::Tensor();
 
     auto l1_acts = torch_compat::from_blob(

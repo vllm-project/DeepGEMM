@@ -475,7 +475,7 @@ static torch::stable::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<to
                    head_dim_with_sf == (is_fp4 ? head_dim / 2 : head_dim) + static_cast<int>(sizeof(int)));
     DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::headeronly::ScalarType::Byte and fused_kv_cache.stride(1) == head_dim_with_sf and
                    fused_kv_cache.stride(3) == 1 and fused_kv_cache.stride(0) <= std::numeric_limits<int>::max() and
-                   fused_kv_cache.stride(0) % 256 == 0);
+                   fused_kv_cache.stride(0) % 128 == 0);
     // The kernel copies KV and SF with 16-byte `cp.async`, so the page base must be aligned as well
     DG_HOST_ASSERT(reinterpret_cast<std::uintptr_t>(fused_kv_cache.mutable_data_ptr()) % 16 == 0);
 

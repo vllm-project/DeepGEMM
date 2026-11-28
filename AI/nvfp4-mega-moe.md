@@ -160,9 +160,10 @@ footprint; it does not change arithmetic precision or the layer operation.
 
 Each launch also selects three kernel variants. None changes the output bits:
 
-- Compact dispatch: with at most 32 ranks and 32 local experts, one per warp
-  lane, the dispatch count exchange skips zero-count atomics, sums receive
-  counts locally, and reads them from shared memory. Used at every token count.
+- Compact dispatch: only the SMs that own input tokens take part in the
+  barrier-free count exchange (`max(1, ceil(num_tokens / tokens_per_SM))` of
+  them; SM 0 always joins, so empty launches still publish zero counts). Once
+  every SM owns tokens it is the full exchange. Used at every token count.
 - Batched scale-factor pulls: each token's scale factors are pulled in one
   remote round trip. Used for decode-shaped launches, and for larger launches
   when `intermediate_hidden` is at most 2048, where the token pulls stay on the

@@ -4,7 +4,6 @@
 
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
 
 namespace deep_gemm::comm {
 
@@ -32,15 +31,15 @@ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     cute::cluster_wait();
 }
 
-template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t>
-CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
+template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename workspace_t, typename sync_scope_t>
+CUTLASS_DEVICE void grid_sync(const workspace_t& workspace,
                               const uint32_t& sm_idx, const uint32_t& thread_idx,
                               const sync_scope_t& sync_scope) {
     // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
     static constexpr uint32_t kFinishSumTag = 0x80000000u;
     sync_scope();
     if (thread_idx == 0) {
-        const auto count_ptr = workspace.get_grid_sync_count_ptr<kGridSyncIndex>();
+        const auto count_ptr = workspace.template get_grid_sync_count_ptr<kGridSyncIndex>();
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
@@ -52,8 +51,9 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
     sync_scope();
 }
 
-template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
-CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag,
+          typename workspace_t, typename sync_scope_t>
+CUTLASS_DEVICE void nvlink_barrier(const workspace_t& workspace,
                                    const layout::SymBuffer<kNumRanks>& sym_buffer,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
@@ -67,10 +67,10 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
 
     // NVLink cross-rank barrier, only SM 0 participates
     if (sm_idx == 0) {
-        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+        const auto counter_ptr = workspace.get_nvl_barrier_counter_ptr();
         const auto status = (*counter_ptr) & 3;
         const auto signal_phase = status & 1, signal_sign = status >> 1;
-        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+        const auto signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
 
         // Send signals to remote ranks
         if (thread_idx < kNumRanks)
@@ -86,6 +86,8 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
                        sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
             });
         }
+        if (not sync_epilogue)
+            sync_scope();
     }
 
     // Grid sync after NVLink completion
@@ -95,16 +97,16 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
 
 
 template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads,
-          uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
-CUTLASS_DEVICE void nvlink_barrier_all_ctas(const layout::Workspace& workspace,
+          uint32_t kGridSyncIndex, uint32_t kTag, typename workspace_t, typename sync_scope_t>
+CUTLASS_DEVICE void nvlink_barrier_all_ctas(const workspace_t& workspace,
                                            const layout::SymBuffer<kNumRanks>& sym_buffer,
                                            const uint32_t& sm_idx, const uint32_t& thread_idx,
                                            const sync_scope_t& sync_scope) {
-    auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+    const auto counter_ptr = workspace.get_nvl_barrier_counter_ptr();
     // Every CTA must snapshot the phase before CTA 0 can advance it.
     const auto status = (*counter_ptr) & 3;
     const auto signal_phase = status & 1, signal_sign = status >> 1;
-    auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+    const auto signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
     grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 
     if (sm_idx == 0) {

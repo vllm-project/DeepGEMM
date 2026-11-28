@@ -23,7 +23,8 @@ namespace deep_gemm::gemm {
 
 static bool early_return(const int& m, const int &n, const int& k,
                          const torch::stable::Tensor& d, const std::optional<torch::stable::Tensor>& c,
-                         const std::optional<torch::stable::Tensor>& sfd = std::nullopt) {
+                         const std::optional<torch::stable::Tensor>& sfd = std::nullopt,
+                         const bool& allow_bias = false) {
     // Do nothing if the problem is empty
     if (m == 0 or n == 0)
         return true;
@@ -54,7 +55,7 @@ static bool early_return(const int& m, const int &n, const int& k,
     }
 
     // With accumulation, do copy before GEMM (assuming the GEMM kernel does not support different C/D)
-    if (c.has_value() and not is_cd_same)
+    if (c.has_value() and not is_cd_same and not (allow_bias and c->dim() == 2 and c->size(0) == 1))
         torch_compat::copy_(d, c.value());
     return false;
 }
@@ -113,7 +114,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::stable::Tensor, torch::stable
     DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16 or d.scalar_type() == torch::headeronly::ScalarType::Float);
 
     // Early return for trivial cases
-    if (early_return(m, n, k, d, c))
+    // NOTES: a distinct `[1, N]` C is a bias only on SM100, see `resolve_epilogue_class`
+    if (early_return(m, n, k, d, c, std::nullopt, arch_major == 10))
         return;
 
     // SM120 owns its whole pipeline: the AB-swap decision must precede the SF transform
@@ -124,6 +126,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::stable::Tensor, torch::stable
                                disable_ue8m0_cast, major_a, major_b, m, n, k);
         return;
     }
+
+    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d, alpha);
 
     // Transform SFA and SFB into compute-required layout
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
@@ -142,7 +146,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::stable::Tensor, torch::stable
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::headeronly::ScalarType::Int) {
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
+                                major_a, major_b, compiled_dims, resolved_epilogue_class);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -384,7 +388,8 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::stable::Tens
     DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
 
     // Early return for trivial cases
-    if (early_return(m, n, sum_k, d, c))
+    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d);
+    if (early_return(m, n, sum_k, d, c, resolved_epilogue_class->output_sfd()))
         return;
 
     // Dispatch implementation
@@ -394,7 +399,7 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::stable::Tens
         const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, grouped_layout, gran_k, k_alignment,
                                       cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout,
-                                      resolve_epilogue_class(epilogue_class, c, d));
+                                      resolved_epilogue_class);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
@@ -520,7 +525,8 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::stable::Tens
     DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
 
     // Early return for trivial cases
-    if (early_return(m, n, sum_k, d, c))
+    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d);
+    if (early_return(m, n, sum_k, d, c, resolved_epilogue_class->output_sfd()))
         return;
 
     // Transform SF with padding
@@ -531,7 +537,7 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::stable::Tens
     if (arch_major == 10) {
         sm100_k_grouped_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, sum_k, grouped_layout,
                                       k_alignment, major_a, major_b, compiled_dims, use_psum_layout,
-                                      resolve_epilogue_class(epilogue_class, c, d));
+                                      resolved_epilogue_class);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -560,7 +566,9 @@ static void bf16_gemm_nt(const torch::stable::Tensor& a,
     DG_HOST_ASSERT(d.scalar_type() == torch::headeronly::ScalarType::BFloat16 or d.scalar_type() == torch::headeronly::ScalarType::Float);
 
     // Early return for trivial cases
-    if (early_return(m, n, k, d, c))
+    // NOTES: a distinct `[1, N]` C is a bias only on SM100, see `resolve_epilogue_class`
+    const auto arch_major = jit->device.get_arch_major();
+    if (early_return(m, n, k, d, c, std::nullopt, arch_major == 10))
         return;
 
     const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d, alpha);
@@ -573,7 +581,6 @@ static void bf16_gemm_nt(const torch::stable::Tensor& a,
         return;
     }
 
-    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         DG_HOST_ASSERT(not alpha.has_value() and "BF16 GEMM alpha requires SM100");
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
@@ -919,10 +926,11 @@ static void fp8_fp4_gemm_nt(const torch::stable::Tensor& a, const torch::stable:
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::fp8_fp4_gemm_nt({a, sfa}, {b, sfb}, d, c,
                           list_to_recipe3(recipe), list_to_recipe2(recipe_a), list_to_recipe2(recipe_b),
-                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void fp8_fp4_gemm_nn(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -935,10 +943,11 @@ static void fp8_fp4_gemm_nn(const torch::stable::Tensor& a, const torch::stable:
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::fp8_fp4_gemm_nn({a, sfa}, {b, sfb}, d, c,
                           list_to_recipe3(recipe), list_to_recipe2(recipe_a), list_to_recipe2(recipe_b),
-                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void fp8_fp4_gemm_tn(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -951,10 +960,11 @@ static void fp8_fp4_gemm_tn(const torch::stable::Tensor& a, const torch::stable:
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::fp8_fp4_gemm_tn({a, sfa}, {b, sfb}, d, c,
                           list_to_recipe3(recipe), list_to_recipe2(recipe_a), list_to_recipe2(recipe_b),
-                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void fp8_fp4_gemm_tt(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -967,10 +977,11 @@ static void fp8_fp4_gemm_tt(const torch::stable::Tensor& a, const torch::stable:
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::fp8_fp4_gemm_tt({a, sfa}, {b, sfb}, d, c,
                           list_to_recipe3(recipe), list_to_recipe2(recipe_a), list_to_recipe2(recipe_b),
-                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+                          compiled_dims, disable_ue8m0_cast, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -984,14 +995,15 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const torch::stable::Tensor& a,
     const std::optional<int64_t>& expected_m_for_psum_layout,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::m_grouped_fp8_fp4_gemm_nt_contiguous(
         {a, sfa}, {b, sfb}, d, grouped_layout,
         list_to_recipe3(recipe), list_to_recipe2(recipe_a), list_to_recipe2(recipe_b),
         compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding,
         expected_m_for_psum_layout.has_value()
             ? std::make_optional(static_cast<int>(expected_m_for_psum_layout.value()))
-            : std::nullopt, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+            : std::nullopt, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void m_grouped_fp8_fp4_gemm_nn_contiguous(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -1004,11 +1016,12 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const torch::stable::Tensor& a,
     const bool& use_psum_layout, const bool& ensure_zero_padding,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::m_grouped_fp8_fp4_gemm_nn_contiguous(
         {a, sfa}, {b, sfb}, d, grouped_layout,
         list_to_recipe3(recipe), list_to_recipe2(recipe_a), list_to_recipe2(recipe_b),
-        compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+        compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_masked(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -1021,11 +1034,12 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const torch::stable::Tensor& a, con
     const std::string& compiled_dims, const bool& disable_ue8m0_cast,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::m_grouped_fp8_fp4_gemm_nt_masked(
         {a, sfa}, {b, sfb}, d, masked_m, static_cast<int>(expected_m),
         list_to_recipe3(recipe), list_to_recipe2(recipe_a), list_to_recipe2(recipe_b),
-        compiled_dims, disable_ue8m0_cast, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+        compiled_dims, disable_ue8m0_cast, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void k_grouped_fp8_gemm_tn_contiguous(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -1038,11 +1052,12 @@ static void k_grouped_fp8_gemm_tn_contiguous(const torch::stable::Tensor& a, con
     const std::string& compiled_dims, const bool& use_psum_layout,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::k_grouped_fp8_gemm_tn_contiguous(
         {a, sfa}, {b, sfb}, d,
         list_to_optional_vector_int(ks_cpu), grouped_layout, c,
-        list_to_tuple3(recipe), compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+        list_to_tuple3(recipe), compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void k_grouped_fp8_gemm_nt_contiguous(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
@@ -1055,11 +1070,12 @@ static void k_grouped_fp8_gemm_nt_contiguous(const torch::stable::Tensor& a, con
     const std::string& compiled_dims, const bool& use_psum_layout,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::k_grouped_fp8_gemm_nt_contiguous(
         {a, sfa}, {b, sfb}, d,
         list_to_optional_vector_int(ks_cpu), grouped_layout, c,
-        list_to_tuple3(recipe), compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+        list_to_tuple3(recipe), compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void k_grouped_fp4_gemm_nt_contiguous(const torch::stable::Tensor& a,
@@ -1075,9 +1091,10 @@ static void k_grouped_fp4_gemm_nt_contiguous(const torch::stable::Tensor& a,
     const bool& use_psum_layout,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::k_grouped_fp4_gemm_nt_contiguous(
-        {a, sfa}, {b, sfb}, d, list_to_optional_vector_int(ks_cpu), grouped_layout, c, list_to_tuple3(recipe), compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+        {a, sfa}, {b, sfb}, d, list_to_optional_vector_int(ks_cpu), grouped_layout, c, list_to_tuple3(recipe), compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void bf16_gemm_nt(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
@@ -1085,8 +1102,9 @@ static void bf16_gemm_nt(const torch::stable::Tensor& a, const torch::stable::Te
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
-    gemm::bf16_gemm_nt(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
+    gemm::bf16_gemm_nt(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void bf16_gemm_nn(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
@@ -1094,8 +1112,9 @@ static void bf16_gemm_nn(const torch::stable::Tensor& a, const torch::stable::Te
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
-    gemm::bf16_gemm_nn(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
+    gemm::bf16_gemm_nn(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void bf16_gemm_tn(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
@@ -1103,8 +1122,9 @@ static void bf16_gemm_tn(const torch::stable::Tensor& a, const torch::stable::Te
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
-    gemm::bf16_gemm_tn(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
+    gemm::bf16_gemm_tn(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void bf16_gemm_tt(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
@@ -1112,8 +1132,9 @@ static void bf16_gemm_tt(const torch::stable::Tensor& a, const torch::stable::Te
     const std::optional<double>& alpha,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
-    gemm::bf16_gemm_tt(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
+    gemm::bf16_gemm_tt(a, b, d, c, compiled_dims, alpha, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void m_grouped_bf16_gemm_nt_contiguous(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
@@ -1122,13 +1143,14 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::stable::Tensor& a, co
     const std::optional<int64_t>& expected_m_for_psum_layout,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::m_grouped_bf16_gemm_nt_contiguous(
         a, b, d, grouped_layout, compiled_dims,
         use_psum_layout, ensure_zero_padding,
         expected_m_for_psum_layout.has_value()
             ? std::make_optional(static_cast<int>(expected_m_for_psum_layout.value()))
-            : std::nullopt, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+            : std::nullopt, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void m_grouped_bf16_gemm_nt_masked(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
@@ -1136,8 +1158,9 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::stable::Tensor& a, const 
     const std::string& compiled_dims,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
-    gemm::m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, static_cast<int>(expected_m), compiled_dims, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
+    gemm::m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, static_cast<int>(expected_m), compiled_dims, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void k_grouped_bf16_gemm_tn_contiguous(const torch::stable::Tensor& a, const torch::stable::Tensor& b, const torch::stable::Tensor& d,
@@ -1147,10 +1170,11 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::stable::Tensor& a, co
     const std::string& compiled_dims, const bool& use_psum_layout,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::k_grouped_bf16_gemm_tn_contiguous(
         a, b, d, list_to_optional_vector_int(ks_cpu),
-        grouped_layout, c, compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+        grouped_layout, c, compiled_dims, use_psum_layout, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 
 static void cublaslt_nvfp4_gemm_nt(
@@ -1170,51 +1194,52 @@ static void m_grouped_bf16_gemm_nn_contiguous(
     const bool& use_psum_layout, const bool& ensure_zero_padding,
     const int64_t& epilogue_kind,
     const std::optional<double>& epilogue_alpha,
-    const std::optional<torch::stable::Tensor>& epilogue_sfd) {
+    const std::optional<torch::stable::Tensor>& epilogue_sfd,
+    const std::optional<torch::stable::Tensor>& epilogue_aux) {
     gemm::m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims,
-                                            use_psum_layout, ensure_zero_padding, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd));
+                                            use_psum_layout, ensure_zero_padding, epilogue_class::unwrap(epilogue_kind, epilogue_alpha, epilogue_sfd, epilogue_aux));
 }
 } // namespace deep_gemm::torch_registration
 
 STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     // GEMM — FP8/FP4
     m.def(
-        "fp8_fp4_gemm_nt(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "fp8_fp4_gemm_nt(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "fp8_fp4_gemm_nn(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "fp8_fp4_gemm_nn(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "fp8_fp4_gemm_tn(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='mn', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "fp8_fp4_gemm_tn(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='mn', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "fp8_fp4_gemm_tt(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='mn', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "fp8_fp4_gemm_tt(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='mn', bool disable_ue8m0_cast=False, float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "m_grouped_fp8_fp4_gemm_nt_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor grouped_layout, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, bool use_psum_layout=False, bool ensure_zero_padding=True, int? expected_m_for_psum_layout=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "m_grouped_fp8_fp4_gemm_nt_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor grouped_layout, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, bool use_psum_layout=False, bool ensure_zero_padding=True, int? expected_m_for_psum_layout=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "m_grouped_fp8_fp4_gemm_nn_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor grouped_layout, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, bool use_psum_layout=False, bool ensure_zero_padding=True, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "m_grouped_fp8_fp4_gemm_nn_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor grouped_layout, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, bool use_psum_layout=False, bool ensure_zero_padding=True, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "m_grouped_fp8_fp4_gemm_nt_masked(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor masked_m, int expected_m, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "m_grouped_fp8_fp4_gemm_nt_masked(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor masked_m, int expected_m, int[3]? recipe=None, int[2]? recipe_a=None, int[2]? recipe_b=None, str compiled_dims='nk', bool disable_ue8m0_cast=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "k_grouped_fp8_gemm_tn_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, int[3] recipe, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "k_grouped_fp8_gemm_tn_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, int[3] recipe, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "k_grouped_fp8_gemm_nt_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, int[3] recipe, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
-    m.def("k_grouped_fp4_gemm_nt_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(a!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, int[3] recipe, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "k_grouped_fp8_gemm_nt_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, int[3] recipe, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
+    m.def("k_grouped_fp4_gemm_nt_contiguous(Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(a!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, int[3] recipe, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
 
     // GEMM — BF16
     m.def(
-        "bf16_gemm_nt(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='nk', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "bf16_gemm_nt(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='nk', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "bf16_gemm_nn(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='nk', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "bf16_gemm_nn(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='nk', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "bf16_gemm_tn(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='mn', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "bf16_gemm_tn(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='mn', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "bf16_gemm_tt(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='mn', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "bf16_gemm_tt(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, str compiled_dims='mn', float? alpha=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "m_grouped_bf16_gemm_nt_contiguous(Tensor a, Tensor b, Tensor(d!) d, Tensor grouped_layout, str compiled_dims='nk', bool use_psum_layout=False, bool ensure_zero_padding=True, int? expected_m_for_psum_layout=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "m_grouped_bf16_gemm_nt_contiguous(Tensor a, Tensor b, Tensor(d!) d, Tensor grouped_layout, str compiled_dims='nk', bool use_psum_layout=False, bool ensure_zero_padding=True, int? expected_m_for_psum_layout=None, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "m_grouped_bf16_gemm_nn_contiguous(Tensor a, Tensor b, Tensor(d!) d, Tensor grouped_layout, str compiled_dims='nk', bool use_psum_layout=False, bool ensure_zero_padding=True, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "m_grouped_bf16_gemm_nn_contiguous(Tensor a, Tensor b, Tensor(d!) d, Tensor grouped_layout, str compiled_dims='nk', bool use_psum_layout=False, bool ensure_zero_padding=True, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "m_grouped_bf16_gemm_nt_masked(Tensor a, Tensor b, Tensor(d!) d, Tensor masked_m, int expected_m, str compiled_dims='nk', int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "m_grouped_bf16_gemm_nt_masked(Tensor a, Tensor b, Tensor(d!) d, Tensor masked_m, int expected_m, str compiled_dims='nk', int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
     m.def(
-        "k_grouped_bf16_gemm_tn_contiguous(Tensor a, Tensor b, Tensor(d!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None) -> ()");
+        "k_grouped_bf16_gemm_tn_contiguous(Tensor a, Tensor b, Tensor(d!) d, int[]? ks_cpu, Tensor grouped_layout, Tensor? c=None, str compiled_dims='mn', bool use_psum_layout=False, int epilogue_kind=0, float? epilogue_alpha=None, Tensor? epilogue_sfd=None, Tensor? epilogue_aux=None) -> ()");
 
     // GEMM — cuBLASLt
     m.def("cublaslt_gemm_nt(Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None) -> ()");

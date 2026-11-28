@@ -12,13 +12,14 @@
 #include "apis/epilogue_class.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
+#include "apis/experimental.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/locality_domain.hpp"
-#include "apis/mega_moe.hpp"
+#include "apis/mega_moe_inference.hpp"
 #include "apis/nvfp4_mega_moe.hpp"
-#include "apis/mega_mhc.hpp"
+#include "apis/mega_mhc_inference.hpp"
 #include "apis/mega_gate.hpp"
 
 namespace deep_gemm {
